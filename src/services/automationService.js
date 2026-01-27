@@ -14,6 +14,7 @@ import { config } from '../config.js';
 import { logError } from '../utils/logger.js';
 import { Api } from 'telegram/tl/index.js';
 import { getInputUser } from 'telegram/Utils.js';
+import { isFloodWaitError, extractWaitTime } from '../utils/floodWaitHandler.js';
 
 class AutomationService {
   constructor() {
@@ -21,6 +22,429 @@ class AutomationService {
     // This allows multiple broadcasts to run simultaneously (one per account)
     this.activeBroadcasts = new Map(); // "userId_accountId" -> { timeouts, isRunning, message, accountId, messageCount }
     this.pendingStarts = new Set(); // Track broadcast starts in progress to prevent race conditions
+    
+    // Anti-freeze tracking: accountId -> { rateLimitCount, lastRateLimitTime }
+    this.antiFreezeTracking = new Map();
+    
+    // Global rate limiting tracking: accountId -> { messages: [{timestamp}], lastMessageTime }
+    this.globalRateLimitTracking = new Map();
+    
+    // Per-group cooldown tracking: accountId -> { groupId: lastMessageTime }
+    this.perGroupCooldownTracking = new Map();
+    
+    // CRITICAL: Circuit breaker for ban prevention
+    // accountId -> { floodWaitCount, consecutiveFloodWaits, lastFloodWaitTime, isCircuitOpen, circuitOpenUntil }
+    this.circuitBreakers = new Map();
+    
+    // CRITICAL: Ban risk tracking
+    // accountId -> { errorRate, blockedUserCount, lastErrorTime, consecutiveErrors }
+    this.banRiskTracking = new Map();
+    
+    // CRITICAL: Users who have blocked the bot (for admin broadcasts)
+    // userId -> { blocked: true, lastChecked }
+    this.blockedUsers = new Map();
+  }
+  
+  /**
+   * Get random delay between messages for anti-freeze protection
+   * Fixed delays - no automatic increases to maintain consistent timing
+   * @param {number} accountId - Account ID
+   * @returns {number} Delay in milliseconds
+   */
+  getRandomDelay(accountId) {
+    const { minDelayBetweenMessages, maxDelayBetweenMessages } = config.antiFreeze;
+    
+    // Fixed random delay - no adaptive increases
+    // This ensures consistent delays throughout the broadcast
+    const baseDelay = minDelayBetweenMessages + Math.random() * (maxDelayBetweenMessages - minDelayBetweenMessages);
+    
+    return Math.round(baseDelay);
+  }
+  
+  /**
+   * Get global rate limit tracking for an account
+   * @param {number} accountId - Account ID
+   * @returns {Object} Tracking object
+   */
+  getGlobalRateLimitTracking(accountId) {
+    let tracking = this.globalRateLimitTracking.get(accountId);
+    if (!tracking) {
+      tracking = {
+        messages: [],
+        lastMessageTime: null
+      };
+      this.globalRateLimitTracking.set(accountId, tracking);
+    }
+    
+    // Clean up old messages (older than 1 hour)
+    const oneHourAgo = Date.now() - 3600000;
+    tracking.messages = tracking.messages.filter(ts => ts > oneHourAgo);
+    
+    return tracking;
+  }
+  
+  /**
+   * Record a message sent for global rate limiting
+   * @param {number} accountId - Account ID
+   */
+  recordMessageSent(accountId) {
+    const tracking = this.getGlobalRateLimitTracking(accountId);
+    const now = Date.now();
+    tracking.messages.push(now);
+    tracking.lastMessageTime = now;
+    
+    // Keep only last 1000 message timestamps
+    if (tracking.messages.length > 1000) {
+      tracking.messages = tracking.messages.slice(-1000);
+    }
+  }
+  
+  /**
+   * Check if we can send a message based on global rate limits
+   * @param {number} accountId - Account ID
+   * @returns {Object} { canSend: boolean, waitTime: number, reason: string }
+   */
+  checkGlobalRateLimit(accountId) {
+    const { maxMessagesPerMinute, maxMessagesPerHour } = config.antiFreeze;
+    const tracking = this.getGlobalRateLimitTracking(accountId);
+    const now = Date.now();
+    
+    // Enhanced validation
+    if (!accountId || isNaN(accountId)) {
+      return { canSend: false, waitTime: 0, reason: 'Invalid account ID' };
+    }
+    
+    // Check messages per minute with improved calculation
+    const messagesLastMinute = tracking.messages.filter(ts => now - ts < 60000);
+    if (messagesLastMinute.length >= maxMessagesPerMinute) {
+      // Calculate wait time more accurately
+      if (messagesLastMinute.length > 0) {
+        const oldestMessageInMinute = Math.min(...messagesLastMinute);
+        const waitTime = Math.max(60000 - (now - oldestMessageInMinute) + 2000, 2000); // Add 2 second buffer
+        return {
+          canSend: false,
+          waitTime: waitTime,
+          reason: `Rate limit: ${messagesLastMinute.length}/${maxMessagesPerMinute} messages per minute`
+        };
+      } else {
+        // Fallback if array is somehow empty
+        return {
+          canSend: false,
+          waitTime: 60000,
+          reason: `Rate limit: ${maxMessagesPerMinute} messages per minute exceeded`
+        };
+      }
+    }
+    
+    // Check messages per hour with improved calculation
+    const messagesLastHour = tracking.messages.filter(ts => now - ts < 3600000);
+    if (messagesLastHour.length >= maxMessagesPerHour) {
+      // Calculate wait time more accurately
+      if (messagesLastHour.length > 0) {
+        const oldestMessageInHour = Math.min(...messagesLastHour);
+        const waitTime = Math.max(3600000 - (now - oldestMessageInHour) + 2000, 2000); // Add 2 second buffer
+        return {
+          canSend: false,
+          waitTime: waitTime,
+          reason: `Rate limit: ${messagesLastHour.length}/${maxMessagesPerHour} messages per hour`
+        };
+      } else {
+        // Fallback if array is somehow empty
+        return {
+          canSend: false,
+          waitTime: 3600000,
+          reason: `Rate limit: ${maxMessagesPerHour} messages per hour exceeded`
+        };
+      }
+    }
+    
+    return { canSend: true, waitTime: 0, reason: null };
+  }
+  
+  /**
+   * Check if we can send to a specific group (per-group cooldown)
+   * @param {number} accountId - Account ID
+   * @param {string|number} groupId - Group ID
+   * @returns {Object} { canSend: boolean, waitTime: number }
+   */
+  checkPerGroupCooldown(accountId, groupId) {
+    const { perGroupCooldown } = config.antiFreeze;
+    const groupIdStr = groupId.toString();
+    
+    let tracking = this.perGroupCooldownTracking.get(accountId);
+    if (!tracking) {
+      tracking = {};
+      this.perGroupCooldownTracking.set(accountId, tracking);
+    }
+    
+    const lastMessageTime = tracking[groupIdStr];
+    if (!lastMessageTime) {
+      return { canSend: true, waitTime: 0 };
+    }
+    
+    const timeSinceLastMessage = Date.now() - lastMessageTime;
+    if (timeSinceLastMessage < perGroupCooldown) {
+      const waitTime = perGroupCooldown - timeSinceLastMessage;
+      return {
+        canSend: false,
+        waitTime: waitTime
+      };
+    }
+    
+    return { canSend: true, waitTime: 0 };
+  }
+  
+  /**
+   * Record a message sent to a specific group
+   * @param {number} accountId - Account ID
+   * @param {string|number} groupId - Group ID
+   */
+  recordGroupMessageSent(accountId, groupId) {
+    const groupIdStr = groupId.toString();
+    let tracking = this.perGroupCooldownTracking.get(accountId);
+    if (!tracking) {
+      tracking = {};
+      this.perGroupCooldownTracking.set(accountId, tracking);
+    }
+    tracking[groupIdStr] = Date.now();
+    
+    // Clean up old entries (older than 24 hours) to prevent memory leak
+    const oneDayAgo = Date.now() - 86400000;
+    Object.keys(tracking).forEach(gid => {
+      if (tracking[gid] < oneDayAgo) {
+        delete tracking[gid];
+      }
+    });
+  }
+  
+  /**
+   * Initialize or get anti-freeze tracking for rate limits only
+   * @param {number} accountId - Account ID
+   */
+  getAntiFreezeTracking(accountId) {
+    let tracking = this.antiFreezeTracking.get(accountId);
+    if (!tracking) {
+      tracking = {
+        rateLimitCount: 0,
+        lastRateLimitTime: null
+      };
+      this.antiFreezeTracking.set(accountId, tracking);
+    }
+    
+    // Decay rate limit count over time (reduce by 1 every 10 minutes)
+    if (tracking.lastRateLimitTime) {
+      const now = new Date();
+      const minutesSinceRateLimit = (now - tracking.lastRateLimitTime) / (1000 * 60);
+      if (minutesSinceRateLimit >= 10) {
+        tracking.rateLimitCount = Math.max(0, tracking.rateLimitCount - Math.floor(minutesSinceRateLimit / 10));
+        if (tracking.rateLimitCount === 0) {
+          tracking.lastRateLimitTime = null;
+        }
+      }
+    }
+    
+    return tracking;
+  }
+  
+  /**
+   * Record rate limit event for progressive delay
+   * @param {number} accountId - Account ID
+   */
+  recordRateLimit(accountId) {
+    // Prevent Map from growing too large (limit to 1000 entries)
+    if (this.antiFreezeTracking.size > 1000) {
+      console.warn(`[MEMORY] Anti-freeze tracking Map is large (${this.antiFreezeTracking.size} entries), cleaning up...`);
+      this.cleanupAntiFreezeTracking();
+    }
+    
+    const tracking = this.getAntiFreezeTracking(accountId);
+    
+    tracking.rateLimitCount++;
+    tracking.lastRateLimitTime = new Date();
+    this.antiFreezeTracking.set(accountId, tracking);
+    
+    console.log(`[ANTI-FREEZE] Rate limit recorded for account ${accountId}, delay multiplier: ${tracking.rateLimitCount}`);
+    
+    // CRITICAL: Track flood waits for circuit breaker
+    this.recordFloodWait(accountId);
+  }
+  
+  /**
+   * CRITICAL: Record flood wait for circuit breaker pattern
+   * Automatically stops broadcast if too many flood waits occur
+   * @param {number} accountId - Account ID
+   */
+  recordFloodWait(accountId) {
+    let circuitBreaker = this.circuitBreakers.get(accountId);
+    if (!circuitBreaker) {
+      circuitBreaker = {
+        floodWaitCount: 0,
+        consecutiveFloodWaits: 0,
+        lastFloodWaitTime: null,
+        isCircuitOpen: false,
+        circuitOpenUntil: null
+      };
+      this.circuitBreakers.set(accountId, circuitBreaker);
+    }
+    
+    const now = Date.now();
+    circuitBreaker.floodWaitCount++;
+    circuitBreaker.consecutiveFloodWaits++;
+    circuitBreaker.lastFloodWaitTime = now;
+    
+    // CRITICAL: Open circuit if 5 consecutive flood waits in 10 minutes
+    // This prevents the bot from getting banned due to repeated rate limit violations
+    if (circuitBreaker.consecutiveFloodWaits >= 5) {
+      circuitBreaker.isCircuitOpen = true;
+      // Keep circuit open for 30 minutes to let things cool down
+      circuitBreaker.circuitOpenUntil = now + (30 * 60 * 1000);
+      console.error(`[CIRCUIT_BREAKER] ⚠️ CRITICAL: Circuit opened for account ${accountId} due to ${circuitBreaker.consecutiveFloodWaits} consecutive flood waits. Broadcast will be paused for 30 minutes to prevent ban.`);
+      
+      // Automatically stop all broadcasts for this account
+      this.stopAllBroadcastsForAccount(accountId);
+    }
+    
+    this.circuitBreakers.set(accountId, circuitBreaker);
+  }
+  
+  /**
+   * CRITICAL: Check if circuit breaker is open (too many flood waits)
+   * @param {number} accountId - Account ID
+   * @returns {Object} { isOpen: boolean, canProceed: boolean, reason: string }
+   */
+  checkCircuitBreaker(accountId) {
+    const circuitBreaker = this.circuitBreakers.get(accountId);
+    if (!circuitBreaker) {
+      return { isOpen: false, canProceed: true, reason: null };
+    }
+    
+    const now = Date.now();
+    
+    // Reset consecutive count if last flood wait was more than 10 minutes ago
+    if (circuitBreaker.lastFloodWaitTime && (now - circuitBreaker.lastFloodWaitTime) > (10 * 60 * 1000)) {
+      circuitBreaker.consecutiveFloodWaits = 0;
+      this.circuitBreakers.set(accountId, circuitBreaker);
+    }
+    
+    // Check if circuit is open
+    if (circuitBreaker.isCircuitOpen) {
+      if (circuitBreaker.circuitOpenUntil && now < circuitBreaker.circuitOpenUntil) {
+        const remainingMinutes = Math.ceil((circuitBreaker.circuitOpenUntil - now) / (60 * 1000));
+        return {
+          isOpen: true,
+          canProceed: false,
+          reason: `Circuit breaker open: Too many flood waits. Paused for ${remainingMinutes} more minutes to prevent ban.`
+        };
+      } else {
+        // Circuit breaker timeout expired, close it
+        circuitBreaker.isCircuitOpen = false;
+        circuitBreaker.circuitOpenUntil = null;
+        circuitBreaker.consecutiveFloodWaits = 0;
+        this.circuitBreakers.set(accountId, circuitBreaker);
+        console.log(`[CIRCUIT_BREAKER] Circuit closed for account ${accountId} - can proceed`);
+        return { isOpen: false, canProceed: true, reason: null };
+      }
+    }
+    
+    return { isOpen: false, canProceed: true, reason: null };
+  }
+  
+  /**
+   * CRITICAL: Reset circuit breaker on successful message (no flood wait)
+   * @param {number} accountId - Account ID
+   */
+  resetCircuitBreakerOnSuccess(accountId) {
+    const circuitBreaker = this.circuitBreakers.get(accountId);
+    if (circuitBreaker) {
+      // Reset consecutive flood waits on successful send
+      circuitBreaker.consecutiveFloodWaits = 0;
+      this.circuitBreakers.set(accountId, circuitBreaker);
+    }
+  }
+  
+  /**
+   * CRITICAL: Stop all broadcasts for an account (used by circuit breaker)
+   * @param {number} accountId - Account ID
+   */
+  async stopAllBroadcastsForAccount(accountId) {
+    try {
+      // Find all broadcasts for this account
+      for (const [broadcastKey, broadcast] of this.activeBroadcasts.entries()) {
+        if (broadcast.accountId === accountId && broadcast.isRunning) {
+          const userId = broadcast.userId;
+          console.log(`[CIRCUIT_BREAKER] Stopping broadcast ${broadcastKey} due to circuit breaker`);
+          await this.stopBroadcast(userId, accountId);
+        }
+      }
+    } catch (error) {
+      logError(`[CIRCUIT_BREAKER ERROR] Error stopping broadcasts:`, error);
+    }
+  }
+  
+  /**
+   * CRITICAL: Record ban risk indicators
+   * @param {number} accountId - Account ID
+   * @param {string} errorType - Type of error (blocked, banned, etc.)
+   */
+  recordBanRisk(accountId, errorType) {
+    let riskTracking = this.banRiskTracking.get(accountId);
+    if (!riskTracking) {
+      riskTracking = {
+        errorRate: 0,
+        blockedUserCount: 0,
+        lastErrorTime: null,
+        consecutiveErrors: 0,
+        totalErrors: 0
+      };
+      this.banRiskTracking.set(accountId, riskTracking);
+    }
+    
+    const now = Date.now();
+    riskTracking.totalErrors++;
+    riskTracking.consecutiveErrors++;
+    riskTracking.lastErrorTime = now;
+    
+    if (errorType === 'blocked' || errorType === 'banned') {
+      riskTracking.blockedUserCount++;
+    }
+    
+    // CRITICAL: If error rate exceeds 50% in last 100 messages, pause broadcast
+    // This prevents continued sending when many users have blocked
+    if (riskTracking.totalErrors > 100) {
+      const errorRate = (riskTracking.totalErrors / (riskTracking.totalErrors + 100)) * 100;
+      riskTracking.errorRate = errorRate;
+      
+      if (errorRate > 50 && riskTracking.consecutiveErrors >= 10) {
+        console.error(`[BAN_RISK] ⚠️ CRITICAL: High error rate (${errorRate.toFixed(1)}%) for account ${accountId}. Pausing broadcast to prevent ban.`);
+        this.stopAllBroadcastsForAccount(accountId);
+      }
+    }
+    
+    this.banRiskTracking.set(accountId, riskTracking);
+  }
+  
+  /**
+   * CRITICAL: Reset ban risk tracking on successful sends
+   * @param {number} accountId - Account ID
+   */
+  resetBanRiskOnSuccess(accountId) {
+    const riskTracking = this.banRiskTracking.get(accountId);
+    if (riskTracking) {
+      // Reset consecutive errors on successful send
+      riskTracking.consecutiveErrors = 0;
+      this.banRiskTracking.set(accountId, riskTracking);
+    }
+  }
+  
+  /**
+   * Add random jitter to cycle timing to avoid patterns
+   * @param {number} baseIntervalMs - Base interval in milliseconds
+   * @returns {number} Interval with jitter
+   */
+  addCycleJitter(baseIntervalMs) {
+    const { cycleJitterPercent } = config.antiFreeze;
+    const jitter = (Math.random() * 2 - 1) * (cycleJitterPercent / 100); // -10% to +10%
+    return Math.round(baseIntervalMs * (1 + jitter));
   }
   
   /**
@@ -30,27 +454,43 @@ class AutomationService {
     return `${userId}_${accountId}`;
   }
 
-  // Generate random intervals for 5 messages across 1 hour (spread evenly with randomness)
-  generateRandomIntervals() {
-    const intervals = [];
-    const hourInMs = 60 * 60 * 1000; // 1 hour in milliseconds
-    const messagesPerHour = 5;
+  /**
+   * Get custom interval for broadcast cycle (in milliseconds)
+   * Default interval is 15 minutes (900000 ms)
+   * Minimum interval is 11 minutes (660000 ms)
+   * @param {number} accountId - Account ID
+   * @returns {Promise<number>} Interval in milliseconds
+   */
+  async getCustomInterval(accountId) {
+    try {
+      const settings = await configService.getAccountSettings(accountId);
+      const intervalMinutes = settings?.manualInterval;
     
-    // Divide hour into 5 segments and add randomness
-    for (let i = 0; i < messagesPerHour; i++) {
-      const baseInterval = (hourInMs / messagesPerHour) * (i + 1);
-      // Add randomness: ±20% of segment size
-      const segmentSize = hourInMs / messagesPerHour;
-      const randomOffset = (Math.random() - 0.5) * segmentSize * 0.4; // ±20% randomness
-      const interval = Math.max(60000, Math.min(hourInMs, baseInterval + randomOffset)); // Min 1 min, max 1 hour
-      intervals.push(Math.round(interval));
+      // Default to 15 minutes if not set
+      const defaultIntervalMinutes = 15;
+      const minIntervalMinutes = 11;
+      
+      let finalIntervalMinutes;
+      if (intervalMinutes === null || intervalMinutes === undefined) {
+        finalIntervalMinutes = defaultIntervalMinutes;
+        console.log(`[BROADCAST] Using default interval: ${defaultIntervalMinutes} minutes`);
+      } else {
+        // Ensure minimum 11 minutes
+        finalIntervalMinutes = Math.max(minIntervalMinutes, intervalMinutes);
+        if (intervalMinutes < minIntervalMinutes) {
+          console.log(`[BROADCAST] Interval ${intervalMinutes} minutes is below minimum (${minIntervalMinutes} min), using ${minIntervalMinutes} minutes`);
+        } else {
+          console.log(`[BROADCAST] Using custom interval: ${finalIntervalMinutes} minutes`);
+        }
+      }
+      
+      const intervalMs = finalIntervalMinutes * 60 * 1000;
+      return intervalMs;
+    } catch (error) {
+      logError(`[BROADCAST] Error getting custom interval:`, error);
+      // Return default 15 minutes on error
+      return 15 * 60 * 1000;
     }
-    
-    // Sort intervals to ensure they're in order
-    intervals.sort((a, b) => a - b);
-    
-    console.log(`[BROADCAST] Generated intervals (minutes): ${intervals.map(ms => (ms / 60000).toFixed(1)).join(', ')}`);
-    return intervals;
   }
 
   async startBroadcast(userId, message) {
@@ -102,22 +542,45 @@ class AutomationService {
     let useSavedTemplate = false;
     let savedTemplateData = null;
     
+    // Validate message if provided (check for empty/whitespace)
+    if (broadcastMessage && typeof broadcastMessage === 'string' && broadcastMessage.trim().length === 0) {
+      console.log(`[BROADCAST] Provided message is empty/whitespace, treating as null`);
+      broadcastMessage = null;
+    }
+    
     if (!broadcastMessage) {
-      const settings = await configService.getAccountSettings(accountId);
+      let settings;
+      try {
+        settings = await configService.getAccountSettings(accountId);
+        if (!settings) {
+          console.log(`[BROADCAST] Failed to get account settings, using defaults`);
+          settings = {};
+        }
+      } catch (settingsError) {
+        logError(`[BROADCAST ERROR] Error getting account settings:`, settingsError);
+        console.log(`[BROADCAST] Error getting settings, using defaults`);
+        settings = {};
+      }
+      
       const savedTemplateSlot = settings?.savedTemplateSlot;
       
       console.log(`[BROADCAST] Checking saved template slot for account ${accountId}: ${savedTemplateSlot === null ? 'null (none)' : savedTemplateSlot}`);
       
       // Check if saved template slot is active (must be explicitly 1, 2, or 3, not null/undefined)
       if (savedTemplateSlot !== null && savedTemplateSlot !== undefined && [1, 2, 3].includes(savedTemplateSlot)) {
-        const template = await savedTemplatesService.getSavedTemplate(accountId, savedTemplateSlot);
-        if (template && template.messageId) {
-          useSavedTemplate = true;
-          savedTemplateData = template;
-          console.log(`[BROADCAST] Using saved template slot ${savedTemplateSlot} for account ${accountId}`);
-          // For saved templates, we'll forward the message (handled in sendSingleMessageToAllGroups)
-        } else {
-          console.log(`[BROADCAST] Saved template slot ${savedTemplateSlot} is set but template not found, falling back to normal message`);
+        try {
+          const template = await savedTemplatesService.getSavedTemplate(accountId, savedTemplateSlot);
+          if (template && template.messageId) {
+            useSavedTemplate = true;
+            savedTemplateData = template;
+            console.log(`[BROADCAST] Using saved template slot ${savedTemplateSlot} for account ${accountId}`);
+            // For saved templates, we'll forward the message (handled in sendSingleMessageToAllGroups)
+          } else {
+            console.log(`[BROADCAST] Saved template slot ${savedTemplateSlot} is set but template not found, falling back to normal message`);
+          }
+        } catch (templateError) {
+          logError(`[BROADCAST ERROR] Error getting saved template:`, templateError);
+          console.log(`[BROADCAST] Error retrieving template slot ${savedTemplateSlot}, falling back to normal message`);
         }
       } else {
         console.log(`[BROADCAST] No saved template slot active (value: ${savedTemplateSlot}), using normal message`);
@@ -132,32 +595,55 @@ class AutomationService {
       
       // If not using saved template, get A/B variant
       if (!useSavedTemplate) {
-        const abMode = settings?.abMode || false;
-        const abModeType = settings?.abModeType || 'single';
-        const abLastVariant = settings?.abLastVariant || 'A';
-        
-        broadcastMessage = await messageService.selectMessageVariant(
-          accountId,
-          abMode,
-          abModeType,
-          abLastVariant
-        );
-        
-        // Update last variant if using rotate mode
-        if (abMode && abModeType === 'rotate' && broadcastMessage) {
-          const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
-          await configService.updateABLastVariant(accountId, nextVariant);
+        try {
+          const abMode = settings?.abMode || false;
+          const abModeType = settings?.abModeType || 'single';
+          const abLastVariant = settings?.abLastVariant || 'A';
+          
+          broadcastMessage = await messageService.selectMessageVariant(
+            accountId,
+            abMode,
+            abModeType,
+            abLastVariant
+          );
+          
+          // Validate message (check for empty/whitespace)
+          if (broadcastMessage && typeof broadcastMessage === 'string' && broadcastMessage.trim().length === 0) {
+            console.log(`[BROADCAST] Selected message variant is empty/whitespace, treating as null`);
+            broadcastMessage = null;
+          }
+          
+          // Update last variant if using rotate mode
+          if (abMode && abModeType === 'rotate' && broadcastMessage) {
+            try {
+              const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
+              await configService.updateABLastVariant(accountId, nextVariant);
+            } catch (variantError) {
+              logError(`[BROADCAST ERROR] Error updating AB variant:`, variantError);
+              // Non-critical error, continue
+            }
+          }
+        } catch (messageError) {
+          logError(`[BROADCAST ERROR] Error getting message variant:`, messageError);
+          broadcastMessage = null;
         }
         
         if (!broadcastMessage && !useSavedTemplate) {
+          this.pendingStarts.delete(broadcastKey);
           return { success: false, error: 'No message set. Please set a message first.' };
         }
       }
     }
     
-    // Create broadcast data FIRST before sending initial message
-    const intervals = this.generateRandomIntervals();
-    const timeouts = [];
+    // Final validation: ensure we have either a message or saved template
+    if (!broadcastMessage && !useSavedTemplate) {
+      this.pendingStarts.delete(broadcastKey);
+      return { success: false, error: 'No message or saved template available. Please set a message or select a saved template first.' };
+    }
+    
+    // Get custom interval for broadcast cycles (minimum 11 minutes)
+    const customIntervalMs = await this.getCustomInterval(accountId);
+    const customIntervalMinutes = customIntervalMs / (60 * 1000);
     
     // broadcastKey is already declared above (line 66)
     const broadcastData = {
@@ -170,95 +656,83 @@ class AutomationService {
       userId,
       messageCount: 0,
       manuallyStarted: true, // Track if broadcast was manually started by user (bypasses schedule)
+      customIntervalMs, // Store custom interval for next cycle
     };
 
     // Set broadcast data BEFORE sending initial message (so sendSingleMessageToAllGroups can find it)
     this.activeBroadcasts.set(broadcastKey, broadcastData);
-    
-    // Schedule 5 messages across the hour at random intervals
-    intervals.forEach((intervalMs, index) => {
-      const timeoutId = setTimeout(async () => {
-        const broadcast = this.activeBroadcasts.get(broadcastKey);
-        if (!broadcast || !broadcast.isRunning) {
-          return;
-        }
-        
-        console.log(`[BROADCAST] Scheduled message ${index + 1}/5 triggered for account ${accountId} (user ${userId}) after ${(intervalMs / 60000).toFixed(1)} minutes`);
-        
-        // Get message with A/B variant selection and saved template for this send
-        const settings = await configService.getAccountSettings(broadcast.accountId);
-        const savedTemplateSlot = settings?.savedTemplateSlot;
-        let messageToSend = null;
-        let useTemplate = false;
-        let templateData = null;
-        
-        console.log(`[BROADCAST] Scheduled message check - saved template slot: ${savedTemplateSlot === null ? 'null (none)' : savedTemplateSlot}`);
-        
-        // Check if saved template slot is active (must be explicitly 1, 2, or 3, not null/undefined)
-        if (savedTemplateSlot !== null && savedTemplateSlot !== undefined && [1, 2, 3].includes(savedTemplateSlot)) {
-          const template = await savedTemplatesService.getSavedTemplate(broadcast.accountId, savedTemplateSlot);
-          if (template && template.messageId) {
-            useTemplate = true;
-            templateData = template;
-            console.log(`[BROADCAST] Scheduled message using saved template slot ${savedTemplateSlot}`);
-          } else {
-            console.log(`[BROADCAST] Scheduled message - saved template slot ${savedTemplateSlot} set but template not found, using normal message`);
-          }
-        } else {
-          console.log(`[BROADCAST] Scheduled message - no saved template slot active, using normal message`);
-        }
-        
-        // If not using saved template, get A/B variant
-        if (!useTemplate) {
-          const abMode = settings?.abMode || false;
-          const abModeType = settings?.abModeType || 'single';
-          const abLastVariant = settings?.abLastVariant || 'A';
-          
-          messageToSend = await messageService.selectMessageVariant(
-            broadcast.accountId,
-            abMode,
-            abModeType,
-            abLastVariant
-          );
-          
-          // Update last variant if using rotate mode
-          if (abMode && abModeType === 'rotate' && messageToSend) {
-            const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
-            await configService.updateABLastVariant(broadcast.accountId, nextVariant);
-          }
-        }
-        
-        if (useTemplate || messageToSend) {
-          await this.sendSingleMessageToAllGroups(userId, broadcast.accountId, messageToSend, useTemplate, templateData);
-        }
-        
-        // Schedule next hour's messages (check again if broadcast is still running)
-        const stillRunning = this.activeBroadcasts.get(broadcastKey);
-        if (stillRunning && stillRunning.isRunning) {
-          await this.scheduleNextHourMessages(userId, accountId);
-        }
-      }, intervalMs);
-      
-      timeouts.push(timeoutId);
-    });
-
-    // Update broadcast data with timeouts atomically (check broadcast still exists)
-    const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
-    if (currentBroadcast && currentBroadcast.isRunning) {
-      currentBroadcast.timeouts = timeouts;
-      this.activeBroadcasts.set(broadcastKey, currentBroadcast);
-    } else {
-      // Broadcast was stopped before we could set timeouts, clear them
-      timeouts.forEach(timeoutId => clearTimeout(timeoutId));
-      console.log(`[BROADCAST] Broadcast stopped before scheduling completed, cleared ${timeouts.length} timeouts for account ${accountId}`);
-    }
 
       // Send initial 1 message to all groups AFTER broadcast data is set
       // Initial message is sent regardless of schedule (user explicitly started broadcast)
-      console.log(`[BROADCAST] Starting broadcast for user ${userId}, sending initial 1 message`);
-      await this.sendSingleMessageToAllGroups(userId, accountId, broadcastMessage, useSavedTemplate, savedTemplateData, true);
+      // Schedule next cycle IMMEDIATELY (before sending) to maintain consistent timing
+      console.log(`[BROADCAST] Starting broadcast for user ${userId}, sending initial message`);
+      
+      // Schedule next cycle BEFORE sending initial message to maintain consistent intervals
+      const timeoutId = setTimeout(async () => {
+        const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
+        if (!currentBroadcast || !currentBroadcast.isRunning) {
+          return;
+        }
+        
+        console.log(`[BROADCAST] First scheduled cycle triggered for account ${accountId} (user ${userId}) after ${customIntervalMinutes} minutes`);
+        await this.sendAndScheduleNextCycle(userId, accountId);
+      }, customIntervalMs);
+      
+      // Store timeout immediately
+      const updatedBroadcast = this.activeBroadcasts.get(broadcastKey);
+      if (updatedBroadcast && updatedBroadcast.isRunning) {
+        updatedBroadcast.timeouts = [timeoutId];
+        this.activeBroadcasts.set(broadcastKey, updatedBroadcast);
+        console.log(`[BROADCAST] Scheduled next cycle in ${customIntervalMinutes} minutes for account ${accountId} (scheduled BEFORE initial send)`);
+      } else {
+        // Broadcast was stopped before we could set timeout, clear it
+        clearTimeout(timeoutId);
+        console.log(`[BROADCAST] Broadcast stopped before scheduling completed, cleared timeout for account ${accountId}`);
+        return;
+      }
+      
+      // NOW send initial message (this may take time, but next cycle is already scheduled)
+      // Validate we have something to send before starting
+      if (!broadcastMessage && !useSavedTemplate) {
+        console.log(`[BROADCAST] No message or template available, stopping broadcast`);
+        this.pendingStarts.delete(broadcastKey);
+        const broadcast = this.activeBroadcasts.get(broadcastKey);
+        if (broadcast) {
+          if (broadcast.timeouts) {
+            broadcast.timeouts.forEach(timeoutId => clearTimeout(timeoutId));
+          }
+          this.activeBroadcasts.delete(broadcastKey);
+        }
+        return { success: false, error: 'No message or saved template available' };
+      }
+      
+      this.sendSingleMessageToAllGroups(userId, accountId, broadcastMessage, useSavedTemplate, savedTemplateData, true)
+        .then(() => {
+          console.log(`[BROADCAST] Initial message send completed for user ${userId}, account ${accountId}`);
+        })
+        .catch((error) => {
+          logError(`[BROADCAST ERROR] Error in initial message send for user ${userId}:`, error);
+          console.log(`[BROADCAST] Initial message send failed for user ${userId}, account ${accountId}: ${error?.message || 'Unknown error'}`);
+          // Check if broadcast should be stopped due to critical error
+          const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
+          if (currentBroadcast && currentBroadcast.isRunning) {
+            // Only stop if it's a critical error (client unavailable, account deleted, etc.)
+            if (error?.message && (
+              error.message.includes('not found') || 
+              error.message.includes('Account') ||
+              error.message.includes('SESSION_REVOKED') ||
+              error.message.includes('Client not available')
+            )) {
+              console.log(`[BROADCAST] Critical error detected, stopping broadcast`);
+              this.stopBroadcast(userId, accountId).catch(stopError => {
+                logError(`[BROADCAST ERROR] Error stopping broadcast after critical error:`, stopError);
+              });
+            }
+            // Otherwise, next cycle is already scheduled, so broadcast will continue
+          }
+        });
 
-      console.log(`[BROADCAST] Scheduled ${intervals.length} messages across the hour for user ${userId}`);
+      console.log(`[BROADCAST] Broadcast started with custom interval: ${customIntervalMinutes} minutes per cycle for user ${userId}`);
       this.pendingStarts.delete(broadcastKey);
       return { success: true };
     } catch (error) {
@@ -277,63 +751,104 @@ class AutomationService {
     }
   }
 
-  scheduleNextHourMessages(userId, accountId) {
+  /**
+   * Send message and schedule next cycle with custom interval
+   * @param {number} userId - User ID
+   * @param {number} accountId - Account ID
+   */
+  async sendAndScheduleNextCycle(userId, accountId) {
     const broadcastKey = this._getBroadcastKey(userId, accountId);
     const broadcast = this.activeBroadcasts.get(broadcastKey);
     if (!broadcast || !broadcast.isRunning) {
+      console.log(`[BROADCAST] Broadcast not running, skipping cycle for account ${accountId}`);
       return;
     }
 
-    // Clear old timeouts
-    if (broadcast.timeouts) {
-      broadcast.timeouts.forEach(timeoutId => clearTimeout(timeoutId));
-    }
+    try {
+      // CRITICAL: Schedule next cycle FIRST (before sending) to maintain consistent timing
+      // This ensures intervals are consistent regardless of how long sending takes
+      let customIntervalMs = await this.getCustomInterval(accountId);
+      
+      // Add random jitter to avoid patterns (anti-freeze)
+      customIntervalMs = this.addCycleJitter(customIntervalMs);
+      
+      const customIntervalMinutes = customIntervalMs / (60 * 1000);
+      
+      // Double-check broadcast is still running before scheduling next cycle
+      const stillRunning = this.activeBroadcasts.get(broadcastKey);
+      if (!stillRunning || !stillRunning.isRunning) {
+        console.log(`[BROADCAST] Broadcast stopped, not scheduling next cycle for account ${accountId}`);
+        return;
+      }
+      
+      // Clear old timeout if exists
+      if (stillRunning.timeouts && stillRunning.timeouts.length > 0) {
+        stillRunning.timeouts.forEach(timeoutId => clearTimeout(timeoutId));
+      }
 
-    // Double-check broadcast is still running after clearing timeouts (race condition protection)
-    const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
-    if (!currentBroadcast || !currentBroadcast.isRunning) {
-      console.log(`[BROADCAST] Broadcast stopped while scheduling next hour's messages for account ${accountId}`);
-      return;
-    }
-
-    // Generate new random intervals for next hour
-    const intervals = this.generateRandomIntervals();
-    const timeouts = [];
-    
-    intervals.forEach((intervalMs, index) => {
+      // Schedule next cycle IMMEDIATELY (before sending messages)
       const timeoutId = setTimeout(async () => {
-        const broadcast = this.activeBroadcasts.get(broadcastKey);
-        if (!broadcast || !broadcast.isRunning) {
+        // Double-check broadcast is still running
+        const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
+        if (!currentBroadcast || !currentBroadcast.isRunning) {
+          console.log(`[BROADCAST] Broadcast stopped before cycle could run for account ${accountId}`);
           return;
         }
         
-        console.log(`[BROADCAST] Scheduled message ${index + 1}/5 triggered for account ${accountId} (user ${userId}) after ${(intervalMs / 60000).toFixed(1)} minutes`);
+        console.log(`[BROADCAST] Next cycle triggered for account ${accountId} (user ${userId}) after ${customIntervalMinutes} minutes`);
+        await this.sendAndScheduleNextCycle(userId, accountId);
+      }, customIntervalMs);
+      
+      // Update broadcast with new timeout immediately
+      stillRunning.timeouts = [timeoutId];
+      stillRunning.customIntervalMs = customIntervalMs;
+      this.activeBroadcasts.set(broadcastKey, stillRunning);
+      
+      console.log(`[BROADCAST] Scheduled next cycle in ${customIntervalMinutes} minutes for account ${accountId} (scheduled BEFORE sending)`);
+
+      // NOW send messages (this may take time, but next cycle is already scheduled)
+      // Get message with A/B variant selection and saved template for this cycle
+      let settings;
+      try {
+        settings = await configService.getAccountSettings(broadcast.accountId);
+        if (!settings) {
+          console.log(`[BROADCAST] Failed to get account settings, using defaults`);
+          settings = {};
+        }
+      } catch (settingsError) {
+        logError(`[BROADCAST ERROR] Error getting account settings in cycle:`, settingsError);
+        settings = {};
+      }
+      
+      const savedTemplateSlot = settings?.savedTemplateSlot;
+      let messageToSend = null;
+      let useTemplate = false;
+      let templateData = null;
+      
+      console.log(`[BROADCAST] Cycle check - saved template slot: ${savedTemplateSlot === null ? 'null (none)' : savedTemplateSlot}`);
         
-        // Get message with A/B variant selection and saved template for this send
-        const settings = await configService.getAccountSettings(broadcast.accountId);
-        const savedTemplateSlot = settings?.savedTemplateSlot;
-        let messageToSend = null;
-        let useTemplate = false;
-        let templateData = null;
-        
-        console.log(`[BROADCAST] Scheduled message check - saved template slot: ${savedTemplateSlot === null ? 'null (none)' : savedTemplateSlot}`);
-        
-        // Check if saved template slot is active (must be explicitly 1, 2, or 3, not null/undefined)
-        if (savedTemplateSlot !== null && savedTemplateSlot !== undefined && [1, 2, 3].includes(savedTemplateSlot)) {
+      // Check if saved template slot is active (must be explicitly 1, 2, or 3, not null/undefined)
+      if (savedTemplateSlot !== null && savedTemplateSlot !== undefined && [1, 2, 3].includes(savedTemplateSlot)) {
+        try {
           const template = await savedTemplatesService.getSavedTemplate(broadcast.accountId, savedTemplateSlot);
           if (template && template.messageId) {
             useTemplate = true;
             templateData = template;
-            console.log(`[BROADCAST] Scheduled message using saved template slot ${savedTemplateSlot}`);
+            console.log(`[BROADCAST] Cycle using saved template slot ${savedTemplateSlot}`);
           } else {
-            console.log(`[BROADCAST] Scheduled message - saved template slot ${savedTemplateSlot} set but template not found, using normal message`);
+            console.log(`[BROADCAST] Cycle - saved template slot ${savedTemplateSlot} set but template not found, using normal message`);
           }
-        } else {
-          console.log(`[BROADCAST] Scheduled message - no saved template slot active, using normal message`);
+        } catch (templateError) {
+          logError(`[BROADCAST ERROR] Error getting saved template in cycle:`, templateError);
+          console.log(`[BROADCAST] Error retrieving template slot ${savedTemplateSlot}, using normal message`);
         }
+      } else {
+        console.log(`[BROADCAST] Cycle - no saved template slot active, using normal message`);
+      }
         
-        // If not using saved template, get A/B variant
-        if (!useTemplate) {
+      // If not using saved template, get A/B variant
+      if (!useTemplate) {
+        try {
           const abMode = settings?.abMode || false;
           const abModeType = settings?.abModeType || 'single';
           const abLastVariant = settings?.abLastVariant || 'A';
@@ -345,80 +860,160 @@ class AutomationService {
             abLastVariant
           );
           
+          // Validate message (check for empty/whitespace)
+          if (messageToSend && typeof messageToSend === 'string' && messageToSend.trim().length === 0) {
+            console.log(`[BROADCAST] Selected message variant is empty/whitespace, treating as null`);
+            messageToSend = null;
+          }
+          
           // Update last variant if using rotate mode
           if (abMode && abModeType === 'rotate' && messageToSend) {
-            const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
-            await configService.updateABLastVariant(broadcast.accountId, nextVariant);
+            try {
+              const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
+              await configService.updateABLastVariant(broadcast.accountId, nextVariant);
+            } catch (variantError) {
+              logError(`[BROADCAST ERROR] Error updating AB variant in cycle:`, variantError);
+              // Non-critical error, continue
+            }
           }
+        } catch (messageError) {
+          logError(`[BROADCAST ERROR] Error getting message variant in cycle:`, messageError);
+          messageToSend = null;
         }
+      }
         
-        if (useTemplate || messageToSend) {
-          await this.sendSingleMessageToAllGroups(userId, broadcast.accountId, messageToSend, useTemplate, templateData);
-        }
-        
-        // Schedule next hour's messages (check again if broadcast is still running)
-        const stillRunning = this.activeBroadcasts.get(broadcastKey);
-        if (stillRunning && stillRunning.isRunning) {
-          await this.scheduleNextHourMessages(userId, accountId);
-        }
-      }, intervalMs);
+      // Send message if we have one (this may take time, but next cycle is already scheduled)
+      if (useTemplate || (messageToSend && messageToSend.trim().length > 0)) {
+        const sendStartTime = Date.now();
+        await this.sendSingleMessageToAllGroups(userId, broadcast.accountId, messageToSend, useTemplate, templateData);
+        const sendDuration = ((Date.now() - sendStartTime) / 1000 / 60).toFixed(2);
+        console.log(`[BROADCAST] Cycle send completed for account ${accountId} in ${sendDuration} minutes`);
+      } else {
+        console.log(`[BROADCAST] ⚠️ No message or template available for cycle, skipping send but keeping broadcast running`);
+        loggingService.logBroadcast(broadcast.accountId, `Cycle skipped - no message or template available`, 'warning');
+      }
+    } catch (error) {
+      logError(`[BROADCAST ERROR] Error in sendAndScheduleNextCycle for account ${accountId}:`, error);
+      console.log(`[BROADCAST] Error in cycle: ${error?.message || 'Unknown error'}, will retry next cycle if broadcast still running`);
       
-      timeouts.push(timeoutId);
-    });
-
-    // Update timeouts atomically
-    const finalBroadcast = this.activeBroadcasts.get(broadcastKey);
-    if (finalBroadcast && finalBroadcast.isRunning) {
-      finalBroadcast.timeouts = timeouts;
-      console.log(`[BROADCAST] Scheduled next hour's ${intervals.length} messages for account ${accountId}`);
-    } else {
-      // Broadcast was stopped, clear the timeouts we just created
-      timeouts.forEach(timeoutId => clearTimeout(timeoutId));
-      console.log(`[BROADCAST] Broadcast stopped while scheduling, cleared ${timeouts.length} timeouts for account ${accountId}`);
+      // Check if it's a critical error that should stop the broadcast
+      const errorMessage = error?.message || '';
+      const isCriticalError = errorMessage.includes('not found') || 
+                              errorMessage.includes('Account') ||
+                              errorMessage.includes('SESSION_REVOKED') ||
+                              errorMessage.includes('Client not available') ||
+                              errorMessage.includes('not linked');
+      
+      if (isCriticalError) {
+        console.log(`[BROADCAST] Critical error detected, stopping broadcast for account ${accountId}`);
+        await this.stopBroadcast(userId, accountId);
+        return;
+      }
+      
+      // Even on error, try to schedule next cycle (but with a delay to avoid rapid retries)
+      const stillRunning = this.activeBroadcasts.get(broadcastKey);
+      if (stillRunning && stillRunning.isRunning) {
+        try {
+          const customIntervalMs = await this.getCustomInterval(accountId);
+          const customIntervalMinutes = customIntervalMs / (60 * 1000);
+          
+          const timeoutId = setTimeout(async () => {
+            await this.sendAndScheduleNextCycle(userId, accountId);
+          }, customIntervalMs);
+          
+          stillRunning.timeouts = [timeoutId];
+          this.activeBroadcasts.set(broadcastKey, stillRunning);
+          console.log(`[BROADCAST] Scheduled retry cycle in ${customIntervalMinutes} minutes for account ${accountId}`);
+        } catch (scheduleError) {
+          logError(`[BROADCAST ERROR] Error scheduling retry cycle:`, scheduleError);
+          // If we can't schedule, stop the broadcast
+          await this.stopBroadcast(userId, accountId);
+        }
+      }
     }
   }
 
   async stopBroadcast(userId, accountId = null) {
-    // If accountId is not provided, get the active account's broadcast
-    if (!accountId) {
-      accountId = accountLinker.getActiveAccountId(userId);
-    }
-    
-    if (!accountId) {
-      return { success: false, error: 'No active account found' };
-    }
-    
-    const broadcastKey = this._getBroadcastKey(userId, accountId);
-    const broadcast = this.activeBroadcasts.get(broadcastKey);
-    if (!broadcast) {
-      return { success: false, error: 'No active broadcast found for this account' };
-    }
-
-    // Check if account has required tags before allowing stop
-    if (accountId) {
-      const tagsCheck = await accountLinker.checkAccountTags(accountId);
-      if (!tagsCheck.hasTags) {
-        return { 
-          success: false, 
-          error: 'TAGS_REQUIRED',
-          tagsCheck 
-        };
+    try {
+      // Validate userId
+      if (!userId && userId !== 0) {
+        console.log(`[BROADCAST] Invalid userId provided to stopBroadcast: ${userId}`);
+        return { success: false, error: 'Invalid user ID' };
       }
+      
+      // If accountId is not provided, get the active account's broadcast
+      if (!accountId && accountId !== 0) {
+        accountId = accountLinker.getActiveAccountId(userId);
+      }
+      
+      if (!accountId && accountId !== 0) {
+        return { success: false, error: 'No active account found' };
+      }
+      
+      const broadcastKey = this._getBroadcastKey(userId, accountId);
+      const broadcast = this.activeBroadcasts.get(broadcastKey);
+      if (!broadcast) {
+        console.log(`[BROADCAST] No active broadcast found for account ${accountId} (user ${userId})`);
+        return { success: false, error: 'No active broadcast found for this account' };
+      }
+
+      // Check if account has required tags before allowing stop (non-blocking if check fails)
+      if (accountId) {
+        try {
+          const tagsCheck = await accountLinker.checkAccountTags(accountId);
+          if (!tagsCheck.hasTags) {
+            console.log(`[BROADCAST] Tags required but not present, stopping anyway`);
+            // Continue to stop broadcast even if tags check fails
+          }
+        } catch (tagsError) {
+          logError(`[BROADCAST ERROR] Error checking tags during stop:`, tagsError);
+          // Non-critical error, continue to stop broadcast
+        }
+      }
+
+      // Clear all scheduled timeouts
+      if (broadcast.timeouts && Array.isArray(broadcast.timeouts) && broadcast.timeouts.length > 0) {
+        broadcast.timeouts.forEach(timeoutId => {
+          try {
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+            }
+          } catch (timeoutError) {
+            console.log(`[BROADCAST] Error clearing timeout: ${timeoutError?.message || 'Unknown'}`);
+          }
+        });
+        console.log(`[BROADCAST] Cleared ${broadcast.timeouts.length} scheduled messages for user ${userId}`);
+      }
+
+      broadcast.isRunning = false;
+      this.activeBroadcasts.delete(broadcastKey);
+
+      console.log(`[BROADCAST] Broadcast stopped for account ${accountId} (user ${userId})`);
+      return { success: true };
+    } catch (error) {
+      logError(`[BROADCAST ERROR] Error in stopBroadcast:`, error);
+      // Try to clean up anyway
+      try {
+        if (accountId) {
+          const broadcastKey = this._getBroadcastKey(userId, accountId);
+          const broadcast = this.activeBroadcasts.get(broadcastKey);
+          if (broadcast) {
+            if (broadcast.timeouts && Array.isArray(broadcast.timeouts)) {
+              broadcast.timeouts.forEach(timeoutId => {
+                try {
+                  if (timeoutId) clearTimeout(timeoutId);
+                } catch (e) {}
+              });
+            }
+            broadcast.isRunning = false;
+            this.activeBroadcasts.delete(broadcastKey);
+          }
+        }
+      } catch (cleanupError) {
+        logError(`[BROADCAST ERROR] Error during cleanup in stopBroadcast:`, cleanupError);
+      }
+      return { success: false, error: `Error stopping broadcast: ${error?.message || 'Unknown error'}` };
     }
-
-    // Clear all scheduled timeouts
-    if (broadcast.timeouts && broadcast.timeouts.length > 0) {
-      broadcast.timeouts.forEach(timeoutId => {
-        clearTimeout(timeoutId);
-      });
-      console.log(`[BROADCAST] Cleared ${broadcast.timeouts.length} scheduled messages for user ${userId}`);
-    }
-
-    broadcast.isRunning = false;
-    this.activeBroadcasts.delete(broadcastKey);
-
-    console.log(`[BROADCAST] Broadcast stopped for account ${accountId} (user ${userId})`);
-    return { success: true };
   }
 
   /**
@@ -439,50 +1034,172 @@ class AutomationService {
     }
   }
 
+  /**
+   * CRITICAL: Cleanup blocked users list (remove entries older than 7 days)
+   * This allows re-checking if users unblock the bot
+   */
+  cleanupBlockedUsers() {
+    const now = Date.now();
+    const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+    let cleanedCount = 0;
+    
+    for (const [userId, info] of this.blockedUsers.entries()) {
+      if (info.lastChecked && (now - info.lastChecked) > maxAge) {
+        this.blockedUsers.delete(userId);
+        cleanedCount++;
+      }
+    }
+    
+    if (cleanedCount > 0) {
+      console.log(`[CLEANUP] Cleaned up ${cleanedCount} old blocked user entries`);
+    }
+  }
+  
+  /**
+   * Cleanup old anti-freeze tracking data to prevent memory leaks
+   * Removes tracking for accounts that haven't been rate limited in 24 hours
+   */
+  cleanupAntiFreezeTracking() {
+    const now = Date.now();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+    let cleanedCount = 0;
+    
+    for (const [accountId, tracking] of this.antiFreezeTracking.entries()) {
+      // If no rate limit recorded or last rate limit was more than 24 hours ago
+      if (!tracking.lastRateLimitTime) {
+        // No rate limit recorded, remove if count is 0
+        if (tracking.rateLimitCount === 0) {
+          this.antiFreezeTracking.delete(accountId);
+          cleanedCount++;
+        }
+      } else {
+        // Convert Date to timestamp for comparison
+        const lastRateLimitTime = tracking.lastRateLimitTime instanceof Date 
+          ? tracking.lastRateLimitTime.getTime() 
+          : tracking.lastRateLimitTime;
+        if ((now - lastRateLimitTime) > maxAge && tracking.rateLimitCount === 0) {
+          this.antiFreezeTracking.delete(accountId);
+          cleanedCount++;
+        }
+      }
+    }
+    
+    if (cleanedCount > 0) {
+      console.log(`[CLEANUP] Cleaned up ${cleanedCount} old anti-freeze tracking entries`);
+    }
+    
+    // Log current memory usage
+    const memUsage = process.memoryUsage();
+    const memUsageMB = {
+      rss: Math.round(memUsage.rss / 1024 / 1024),
+      heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+      external: Math.round(memUsage.external / 1024 / 1024)
+    };
+    
+    console.log(`[MEMORY] Current usage - RSS: ${memUsageMB.rss}MB, Heap: ${memUsageMB.heapUsed}/${memUsageMB.heapTotal}MB, External: ${memUsageMB.external}MB`);
+    console.log(`[MEMORY] Active broadcasts: ${this.activeBroadcasts.size}, Anti-freeze tracking: ${this.antiFreezeTracking.size}, Pending starts: ${this.pendingStarts.size}`);
+    
+    // Warn if memory usage is high
+    if (memUsageMB.rss > 2500) { // Warn if using more than 2.5GB
+      console.warn(`[MEMORY WARNING] High memory usage detected: ${memUsageMB.rss}MB RSS. Consider restarting the bot.`);
+    }
+  }
+
   async checkAndResetDailyCap(accountId) {
     try {
+      if (!accountId && accountId !== 0) {
+        console.log(`[CAP] Invalid accountId provided: ${accountId}`);
+        const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+        return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
+      }
+      
       const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
+      if (isNaN(accountIdNum)) {
+        console.log(`[CAP] Could not parse accountId: ${accountId}`);
+        const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+        return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
+      }
+      
       const result = await db.query(
         'SELECT daily_sent, daily_cap, cap_reset_date FROM accounts WHERE account_id = $1',
         [accountIdNum]
       );
       
-      if (result.rows.length === 0) return { canSend: true, dailySent: 0, dailyCap: 50 };
+      if (!result || !result.rows || result.rows.length === 0) {
+        console.log(`[CAP] Account ${accountIdNum} not found in database`);
+        const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+        return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
+      }
       
       const account = result.rows[0];
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD in IST
+      if (!account) {
+        const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+        return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
+      }
+      
+      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
       const capResetDate = account.cap_reset_date ? new Date(account.cap_reset_date).toISOString().split('T')[0] : null;
       
       // Reset if it's a new day
       if (capResetDate !== today) {
-        await db.query(
-          'UPDATE accounts SET daily_sent = 0, cap_reset_date = CURRENT_DATE WHERE account_id = $1',
-          [accountIdNum]
-        );
-        loggingService.logInfo(accountIdNum, `Daily cap reset - new day started`, null);
-        return { canSend: true, dailySent: 0, dailyCap: account.daily_cap || 50 };
+        try {
+          await db.query(
+            'UPDATE accounts SET daily_sent = 0, cap_reset_date = CURRENT_DATE WHERE account_id = $1',
+            [accountIdNum]
+          );
+          loggingService.logInfo(accountIdNum, `Daily cap reset - new day started`, null);
+          // Use account's daily_cap or default from config
+          const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+          const accountDailyCap = parseInt(account.daily_cap) || defaultDailyCap;
+          return { canSend: true, dailySent: 0, dailyCap: accountDailyCap };
+        } catch (updateError) {
+          logError(`[CAP ERROR] Error resetting daily cap:`, updateError);
+          // Continue with current values if reset fails
+        }
       }
       
       const dailySent = parseInt(account.daily_sent) || 0;
-      const dailyCap = parseInt(account.daily_cap) || 50;
+      // Use account's daily_cap or default from config, with maximum safety limit
+      const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+      const accountDailyCap = parseInt(account.daily_cap) || defaultDailyCap;
+      const maxAllowedCap = Math.max(defaultDailyCap, 2000); // Safety maximum
+      const dailyCap = Math.min(accountDailyCap, maxAllowedCap);
       const canSend = dailySent < dailyCap;
+      
+      if (!canSend) {
+        console.log(`[DAILY_CAP] ⚠️ Daily limit reached for account ${accountId}: ${dailySent}/${dailyCap} messages`);
+      }
       
       return { canSend, dailySent, dailyCap };
     } catch (error) {
       logError(`[CAP ERROR] Error checking daily cap for account ${accountId}:`, error);
-      return { canSend: true, dailySent: 0, dailyCap: 50 }; // Default to allowing sends on error
+      // Use configurable default on error
+      const defaultDailyCap = config.antiFreeze.maxMessagesPerDay || 1500;
+      return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
     }
   }
 
   async incrementDailySent(accountId) {
     try {
+      if (!accountId && accountId !== 0) {
+        console.log(`[CAP] Invalid accountId provided for increment: ${accountId}`);
+        return;
+      }
+      
       const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
+      if (isNaN(accountIdNum)) {
+        console.log(`[CAP] Could not parse accountId for increment: ${accountId}`);
+        return;
+      }
+      
       await db.query(
         'UPDATE accounts SET daily_sent = daily_sent + 1 WHERE account_id = $1',
         [accountIdNum]
       );
     } catch (error) {
       logError(`[CAP ERROR] Error incrementing daily sent for account ${accountId}:`, error);
+      // Non-critical error, don't throw - broadcast should continue
     }
   }
 
@@ -508,6 +1225,13 @@ class AutomationService {
       }
     } else {
       console.log(`[BROADCAST] Bypassing schedule check (manually started broadcast or initial message) for account ${accountId}`);
+    }
+
+    // Check quiet hours (always enforced, even for manually started broadcasts)
+    const isWithinQuietHours = await configService.isWithinQuietHours(accountId);
+    if (isWithinQuietHours) {
+      console.log(`[BROADCAST] Current time is within quiet hours for account ${accountId}, skipping send`);
+      return; // Skip this send, but keep broadcast running for next scheduled time
     }
 
     // Verify account still exists and is linked
@@ -569,56 +1293,189 @@ class AutomationService {
         }
       }
 
-      // Get all dialogs (chats)
-      const dialogs = await client.getDialogs();
-      console.log(`[BROADCAST] Retrieved ${dialogs.length} total dialogs for account ${accountId}`);
+      // Get all dialogs (chats) with error handling
+      let dialogs = [];
+      try {
+        dialogs = await client.getDialogs();
+        if (!Array.isArray(dialogs)) {
+          console.log(`[BROADCAST] getDialogs returned non-array, defaulting to empty array`);
+          dialogs = [];
+        }
+        console.log(`[BROADCAST] Retrieved ${dialogs.length} total dialogs for account ${accountId}`);
+      } catch (dialogsError) {
+        logError(`[BROADCAST ERROR] Failed to get dialogs for account ${accountId}:`, dialogsError);
+        console.log(`[BROADCAST] Error getting dialogs: ${dialogsError.message}, stopping broadcast`);
+        await this.stopBroadcast(userId, accountId);
+        return;
+      }
       
-      // Filter only groups and channels (exclude private chats)
+      // Filter only groups (exclude channels and private chats)
       // dialog.isGroup = true for regular groups and supergroups
-      // dialog.isChannel = true for channels (both broadcast and megagroup channels)
+      // dialog.isChannel = true for channels (both broadcast and megagroup channels) - EXCLUDED
       const groups = dialogs.filter((dialog) => {
+        if (!dialog) return false;
+        
         const isGroup = dialog.isGroup || false;
-        const isChannel = dialog.isChannel || false;
         
         // Primary filter: use dialog properties (most reliable)
-        if (isGroup || isChannel) {
+        // Only include groups, exclude channels
+        if (isGroup) {
           const entity = dialog.entity;
-          const groupType = isGroup ? 'Group' : 'Channel';
+          // Skip if entity is missing or invalid
+          if (!entity || (!entity.id && entity.id !== 0)) {
+            console.log(`[BROADCAST] ⚠️ Skipping group with missing entity: ${dialog.name || 'Unknown'}`);
+            return false;
+          }
+          
           const entityType = entity?.className || 'Unknown';
           const groupId = entity?.id?.toString() || entity?.id || 'unknown';
           const groupName = dialog.name || 'Unknown';
           
           // Log each group being included for transparency
-          console.log(`[BROADCAST] ✅ Including ${groupType}: "${groupName}" (Entity: ${entityType}, ID: ${groupId})`);
+          console.log(`[BROADCAST] ✅ Including Group: "${groupName}" (Entity: ${entityType}, ID: ${groupId})`);
           return true;
         }
         
         return false;
       });
 
-      console.log(`[BROADCAST] ✅ Filtered ${groups.length} groups/channels from ${dialogs.length} dialogs for user ${userId}`);
-      console.log(`[BROADCAST] Starting to send 1 message to each of ${groups.length} groups...`);
+      console.log(`[BROADCAST] ✅ Filtered ${groups.length} groups from ${dialogs.length} dialogs for user ${userId}`);
+      
+      // Edge case: No groups to send to
+      if (groups.length === 0) {
+        console.log(`[BROADCAST] ⚠️ No groups found for account ${accountId}, skipping send cycle`);
+        loggingService.logBroadcast(accountId, `No groups found - skipping send cycle`, 'warning');
+        // Don't stop broadcast - it might be temporary (user might add groups later)
+        return;
+      }
+      
+      // Randomize group order to avoid patterns (anti-freeze)
+      let groupsToSend = [...groups];
+      if (config.antiFreeze.randomizeOrder && groupsToSend.length > 1) {
+        // Fisher-Yates shuffle
+        for (let i = groupsToSend.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [groupsToSend[i], groupsToSend[j]] = [groupsToSend[j], groupsToSend[i]];
+        }
+        console.log(`[ANTI-FREEZE] Randomized order of ${groupsToSend.length} groups`);
+      }
+      
+      console.log(`[BROADCAST] Starting to send 1 message to each of ${groupsToSend.length} groups...`);
 
       let successCount = 0;
       let errorCount = 0;
+      let rateLimited = false;
 
-      // Send 1 message to each group with delays to avoid spam detection
-      for (let i = 0; i < groups.length; i++) {
-        const group = groups[i];
+      // Cache getMe() result to avoid calling it for every group when mentions are enabled
+      let cachedExcludeUserId = null;
+      let meCached = false;
+
+      // Send 1 message to each group with random delays to avoid spam detection (anti-freeze)
+      const { batchSize, batchBreakDuration } = config.antiFreeze;
+      
+      // Track failed groups with reasons for debugging
+      const failedGroups = [];
+      
+      for (let i = 0; i < groupsToSend.length; i++) {
+        const group = groupsToSend[i];
+        
+        // Take a break after every batch (anti-freeze)
+        if (i > 0 && i % batchSize === 0) {
+          console.log(`[ANTI-FREEZE] Batch of ${batchSize} groups completed, taking ${batchBreakDuration / 1000}s break...`);
+          await new Promise(resolve => setTimeout(resolve, batchBreakDuration));
+        }
+        // Validate group entity before processing
+        if (!group || !group.entity) {
+          console.log(`[BROADCAST] ⚠️ Skipping group ${i + 1}/${groupsToSend.length}: missing entity`);
+          errorCount++;
+          failedGroups.push({ name: group?.name || 'Unknown', reason: 'Missing entity', id: 'unknown' });
+          continue;
+        }
+        
         const groupName = group.name || 'Unknown Group';
         const groupId = group.entity?.id?.toString() || group.entity?.id || 'unknown';
         const groupType = group.isGroup ? 'Group' : (group.isChannel ? 'Channel' : 'Unknown');
         
-        console.log(`[BROADCAST] [${i + 1}/${groups.length}] Processing ${groupType}: "${groupName}" (ID: ${groupId})`);
+        console.log(`[BROADCAST] [${i + 1}/${groupsToSend.length}] Processing ${groupType}: "${groupName}" (ID: ${groupId})`);
         
-        if (!broadcast.isRunning) {
-          console.log(`[BROADCAST] ⚠️ Broadcast stopped by user, aborting send. Processed ${i}/${groups.length} groups.`);
+        // Re-check broadcast status and client connection before each send
+        const currentBroadcastCheck = this.activeBroadcasts.get(broadcastKey);
+        if (!currentBroadcastCheck || !currentBroadcastCheck.isRunning) {
+          console.log(`[BROADCAST] ⚠️ Broadcast stopped by user, aborting send. Processed ${i}/${groupsToSend.length} groups.`);
           break;
+        }
+        
+        // Check if client is still connected
+        if (!client || !client.connected) {
+          console.log(`[BROADCAST] ⚠️ Client disconnected, attempting to reconnect...`);
+          try {
+            client = await accountLinker.getClientAndConnect(userId, accountId);
+            if (!client || !client.connected) {
+              console.log(`[BROADCAST] ⚠️ Failed to reconnect client, stopping broadcast`);
+              await this.stopBroadcast(userId, accountId);
+              break;
+            }
+            console.log(`[BROADCAST] ✅ Client reconnected successfully`);
+          } catch (reconnectError) {
+            logError(`[BROADCAST ERROR] Failed to reconnect client:`, reconnectError);
+            await this.stopBroadcast(userId, accountId);
+            break;
+          }
         }
 
         try {
-          console.log(`[BROADCAST] Attempting to send message to group ${i + 1}/${groups.length}: "${groupName}"`);
+          console.log(`[BROADCAST] Attempting to send message to group ${i + 1}/${groupsToSend.length}: "${groupName}"`);
+          
+          // CRITICAL: Check circuit breaker first - stop if too many flood waits
+          const circuitCheck = this.checkCircuitBreaker(accountId);
+          if (!circuitCheck.canProceed) {
+            console.error(`[CIRCUIT_BREAKER] ⚠️ CRITICAL: ${circuitCheck.reason}`);
+            logError(`[CIRCUIT_BREAKER] Broadcast stopped for account ${accountId}: ${circuitCheck.reason}`);
+            await this.stopBroadcast(userId, accountId);
+            break; // Stop sending immediately
+          }
+          
+          // CRITICAL: Check daily message limit to prevent excessive sending
+          const dailyCapCheck = await this.checkAndResetDailyCap(accountId);
+          if (!dailyCapCheck.canSend) {
+            console.log(`[DAILY_CAP] ⚠️ Daily message limit reached for account ${accountId}: ${dailyCapCheck.dailySent}/${dailyCapCheck.dailyCap}. Skipping remaining groups.`);
+            // Don't stop broadcast, just skip this cycle - will resume tomorrow
+            break;
+          }
+          
+          // SAFETY CHECK: Check global rate limits before sending
+          const globalRateLimitCheck = this.checkGlobalRateLimit(accountId);
+          if (!globalRateLimitCheck.canSend) {
+            console.log(`[RATE_LIMIT] ⚠️ Global rate limit reached: ${globalRateLimitCheck.reason}. Waiting ${(globalRateLimitCheck.waitTime / 1000).toFixed(1)}s...`);
+            await new Promise((resolve) => setTimeout(resolve, globalRateLimitCheck.waitTime));
+            // Re-check after waiting
+            const recheck = this.checkGlobalRateLimit(accountId);
+            if (!recheck.canSend) {
+              console.log(`[RATE_LIMIT] ⚠️ Still rate limited after wait. Skipping remaining groups in this cycle.`);
+              // Stop this cycle but keep broadcast running for next cycle
+              break;
+            }
+          }
+          
+          // SAFETY CHECK: Check per-group cooldown
+          const groupCooldownCheck = this.checkPerGroupCooldown(accountId, groupId);
+          if (!groupCooldownCheck.canSend) {
+            console.log(`[RATE_LIMIT] ⚠️ Group "${groupName}" is in cooldown. Last message sent ${(groupCooldownCheck.waitTime / 1000 / 60).toFixed(1)} minutes ago. Skipping and continuing to next group...`);
+            continue; // Skip this group and continue with next group instead of waiting
+          }
+          
           if (useSavedTemplate && savedTemplateData && savedMessagesEntity) {
+            // Validate before forwarding
+            if (!group.entity) {
+              throw new Error('Group entity is missing');
+            }
+            if (!savedTemplateData.messageId) {
+              throw new Error('Saved template message ID is missing');
+            }
+            if (!savedMessagesEntity) {
+              throw new Error('Saved Messages entity is missing');
+            }
+            
             // Forward message from Saved Messages (preserves premium emoji and entities)
             // Note: Mentions cannot be added to forwarded messages
             console.log(`[BROADCAST] Forwarding saved template - mentions not supported for forwarded messages`);
@@ -626,10 +1483,24 @@ class AutomationService {
               messages: [savedTemplateData.messageId],
               fromPeer: savedMessagesEntity,
             });
-            console.log(`[BROADCAST] Forwarded saved template (slot ${savedTemplateData.slot}) to group ${i + 1}/${groups.length}: ${group.name}`);
-          } else if (message) {
+            console.log(`[BROADCAST] Forwarded saved template (slot ${savedTemplateData.slot}) to group ${i + 1}/${groupsToSend.length}: ${group.name || 'Unknown'}`);
+            
+            // Record message sent for rate limiting tracking
+            this.recordMessageSent(accountId);
+            this.recordGroupMessageSent(accountId, groupId);
+          } else if (message && message.trim().length > 0) {
             // Check if auto-mention is enabled
-            const settings = await configService.getAccountSettings(accountId);
+            let settings;
+            try {
+              settings = await configService.getAccountSettings(accountId);
+              if (!settings) {
+                settings = {};
+              }
+            } catch (settingsError) {
+              logError(`[BROADCAST ERROR] Error getting settings for group ${groupName}:`, settingsError);
+              settings = {};
+            }
+            
             const autoMention = settings?.autoMention || false;
             // Ensure mentionCount is valid (1, 3, or 5), default to 5
             let mentionCount = settings?.mentionCount || 5;
@@ -647,34 +1518,50 @@ class AutomationService {
             if (autoMention) {
               console.log(`[BROADCAST] Auto-mention is ENABLED, attempting to add mentions...`);
               try {
-                // Get the account's own user ID to exclude it from mentions
-                let excludeUserId = null;
+                // Get the account's own user ID to exclude it from mentions (cache it)
+                let excludeUserId = cachedExcludeUserId;
+                if (!meCached) {
                 try {
                   const me = await client.getMe();
                   if (me && me.id) {
                     excludeUserId = typeof me.id === 'object' && me.id.value ? Number(me.id.value) :
                                    typeof me.id === 'number' ? me.id :
                                    typeof me.id === 'bigint' ? Number(me.id) : parseInt(me.id);
-                    console.log(`[BROADCAST] Excluding own user ID from mentions: ${excludeUserId}`);
+                      cachedExcludeUserId = excludeUserId; // Cache for next groups
+                      meCached = true;
+                      console.log(`[BROADCAST] Cached own user ID for mentions: ${excludeUserId}`);
                   }
                 } catch (meError) {
                   console.log(`[BROADCAST] Could not get own user ID: ${meError.message}`);
+                    meCached = true; // Mark as cached even if failed to avoid retrying
+                  }
+                } else {
+                  console.log(`[BROADCAST] Using cached exclude user ID: ${excludeUserId}`);
                 }
                 
-                const mentionResult = await mentionService.addMentionsToMessage(
+                // Add timeout to mention fetching to prevent it from slowing down broadcasts too much
+                // Maximum 3 seconds to fetch mentions, otherwise send without mentions
+                const mentionPromise = mentionService.addMentionsToMessage(
                   client,
                   group.entity,
                   message,
                   mentionCount,
-                  excludeUserId // Pass account's own user ID to exclude
+                  excludeUserId
                 );
+                
+                const timeoutPromise = new Promise((_, reject) => {
+                  setTimeout(() => reject(new Error('Mention fetch timeout (3s)')), 3000);
+                });
+                
+                const mentionResult = await Promise.race([mentionPromise, timeoutPromise]);
                 messageToSend = mentionResult.message;
                 entities = mentionResult.entities || [];
                 console.log(`[BROADCAST] Added ${entities.length} mentions to message for group ${group.name}`);
               } catch (error) {
-                console.log(`[BROADCAST] Failed to add mentions, sending without mentions: ${error.message}`);
-                console.log(`[BROADCAST] Mention error stack:`, error.stack);
-                // Continue with original message if mention fails
+                console.log(`[BROADCAST] Failed to add mentions (timeout or error), sending without mentions: ${error.message}`);
+                // Continue with original message if mention fails or times out
+                messageToSend = message;
+                entities = [];
               }
             } else {
               console.log(`[BROADCAST] Auto-mention is DISABLED for group ${group.name}`);
@@ -726,27 +1613,32 @@ class AutomationService {
                 console.log(`[BROADCAST] HTML message length: ${htmlMessage.length}`);
                 
                 try {
+                  // Validate group entity before sending
+                  if (!group.entity) {
+                    throw new Error('Group entity is missing');
+                  }
+                  
                   const result = await client.sendMessage(group.entity, { 
                     message: htmlMessage,
                     parseMode: 'html' // Use HTML parsing mode
                   });
                   
-                  console.log(`[BROADCAST] Message sent successfully with HTML mentions. Message ID: ${result.id}`);
+                  console.log(`[BROADCAST] Message sent successfully with HTML mentions. Message ID: ${result?.id || 'unknown'}`);
                   
                   // Check if entities were actually included in the sent message
-                  const resultEntities = result.entities || result._entities || [];
+                  const resultEntities = result?.entities || result?._entities || [];
                   if (resultEntities.length > 0) {
                     console.log(`[BROADCAST] ✅ Entities confirmed in sent message: ${resultEntities.length} entities`);
                     resultEntities.forEach((ent, idx) => {
-                      console.log(`[BROADCAST] Entity ${idx}: ${ent.className || ent.constructor?.name}, offset=${ent.offset}, length=${ent.length}`);
-                      if (ent.url) {
+                      console.log(`[BROADCAST] Entity ${idx}: ${ent?.className || ent?.constructor?.name || 'Unknown'}, offset=${ent?.offset || 'N/A'}, length=${ent?.length || 'N/A'}`);
+                      if (ent?.url) {
                         console.log(`[BROADCAST] Entity ${idx} URL: ${ent.url}`);
                       }
                     });
                   } else {
                     console.log(`[BROADCAST] ⚠️ WARNING: No entities found in sent message result!`);
-                    console.log(`[BROADCAST] result.entities:`, result.entities);
-                    console.log(`[BROADCAST] result._entities:`, result._entities);
+                    console.log(`[BROADCAST] result.entities:`, result?.entities);
+                    console.log(`[BROADCAST] result._entities:`, result?._entities);
                     console.log(`[BROADCAST] ⚠️ Telegram rejected the HTML mentions. Possible reasons:`);
                     console.log(`[BROADCAST]   1. User privacy settings prevent mentions`);
                     console.log(`[BROADCAST]   2. User hasn't interacted with the account`);
@@ -754,28 +1646,69 @@ class AutomationService {
                     console.log(`[BROADCAST]   4. tg://user?id= may not work in groups via MTProto`);
                   }
                 } catch (sendError) {
-                  console.log(`[BROADCAST] Error sending message with HTML: ${sendError.message}`);
+                  console.log(`[BROADCAST] Error sending message with HTML: ${sendError?.message || 'Unknown error'}`);
                   console.log(`[BROADCAST] Send error details:`, sendError);
                   // Fallback: send without mentions
                   console.log(`[BROADCAST] Falling back to sending without mentions`);
-                  await client.sendMessage(group.entity, { message: messageToSend });
+                  try {
+                    if (group.entity && messageToSend && messageToSend.trim().length > 0) {
+                      await client.sendMessage(group.entity, { message: messageToSend });
+                    } else {
+                      throw new Error('Cannot fallback: missing entity or message');
+                    }
+                  } catch (fallbackError) {
+                    console.log(`[BROADCAST] Fallback send also failed: ${fallbackError?.message || 'Unknown error'}`);
+                    throw fallbackError; // Re-throw to be handled by outer error handler
+                  }
                 }
               } catch (htmlError) {
-                console.log(`[BROADCAST] Error creating HTML message: ${htmlError.message}`);
+                console.log(`[BROADCAST] Error creating HTML message: ${htmlError?.message || 'Unknown error'}`);
                 console.log(`[BROADCAST] HTML error details:`, htmlError);
                 // Fallback: send without mentions
-                await client.sendMessage(group.entity, { message: messageToSend });
+                try {
+                  if (group.entity && messageToSend && messageToSend.trim().length > 0) {
+                    await client.sendMessage(group.entity, { message: messageToSend });
+                  } else {
+                    throw new Error('Cannot send: missing entity or message');
+                  }
+                } catch (fallbackError) {
+                  console.log(`[BROADCAST] Fallback send failed: ${fallbackError?.message || 'Unknown error'}`);
+                  throw fallbackError; // Re-throw to be handled by outer error handler
+                }
               }
             } else {
-              await client.sendMessage(group.entity, { message: messageToSend });
+              // Validate message and entity before sending
+              if (!group.entity) {
+                console.log(`[BROADCAST] ⚠️ Group entity missing, skipping group "${groupName}"`);
+                errorCount++;
+                continue;
+              }
+              if (messageToSend && messageToSend.trim().length > 0) {
+                await client.sendMessage(group.entity, { message: messageToSend });
+              } else {
+                console.log(`[BROADCAST] ⚠️ Message is empty, skipping group "${groupName}"`);
+                continue;
+              }
             }
-            console.log(`[BROADCAST] ✅ Successfully sent message to group ${i + 1}/${groups.length}: "${groupName}" (ID: ${groupId})`);
+            console.log(`[BROADCAST] ✅ Successfully sent message to group ${i + 1}/${groupsToSend.length}: "${groupName}" (ID: ${groupId})`);
           } else {
             console.log(`[BROADCAST] ⚠️ No message available, skipping group "${groupName}" (ID: ${groupId})`);
             continue;
           }
           
           successCount++;
+          
+          // CRITICAL: Reset circuit breaker and ban risk on successful send
+          this.resetCircuitBreakerOnSuccess(accountId);
+          this.resetBanRiskOnSuccess(accountId);
+          
+          // Record message sent for rate limiting tracking
+          this.recordMessageSent(accountId);
+          this.recordGroupMessageSent(accountId, groupId);
+          
+          // CRITICAL: Increment daily sent counter
+          await this.incrementDailySent(accountId);
+          
           loggingService.logBroadcast(accountId, `Sent message to group: ${groupName}`, 'success');
           
           // Record analytics
@@ -783,16 +1716,132 @@ class AutomationService {
             console.log(`[SILENT_FAIL] Analytics recording failed: ${err.message}`);
           });
           
-          // Random delay between groups: 3-8 seconds to avoid spam detection
-          const baseDelay = 3000; // 3 seconds base
-          const randomDelay = Math.random() * 5000; // 0-5 seconds random
-          const delay = Math.round(baseDelay + randomDelay);
-          
+          // Random delay between groups for anti-freeze protection (not fixed)
           // Don't delay after last group
-          if (i < groups.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, delay));
+          if (i < groupsToSend.length - 1) {
+            const delayMs = this.getRandomDelay(accountId);
+            console.log(`[ANTI-FREEZE] Waiting ${(delayMs / 1000).toFixed(2)} seconds before sending to next group...`);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
           }
         } catch (error) {
+          // Check if it's a recoverable MTProto BinaryReader error
+          const errorMsg = error?.message || error?.toString() || '';
+          const errorStack = error?.stack || '';
+          if (errorMsg.includes('readUInt32LE') || 
+              errorMsg.includes('BinaryReader') || 
+              errorMsg.includes('Cannot read properties of undefined') ||
+              errorStack.includes('BinaryReader')) {
+            console.log(`[BROADCAST] Recoverable MTProto BinaryReader error for group "${groupName}", retrying...`);
+            // Wait a bit and retry this group
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            try {
+              // Validate group entity still exists before retry
+              if (!group || !group.entity) {
+                console.log(`[BROADCAST] Group entity missing during retry, skipping`);
+                errorCount++;
+                continue;
+              }
+              
+              // Retry sending to this group
+              if (useSavedTemplate && savedTemplateData && savedMessagesEntity) {
+                await client.forwardMessages(group.entity, {
+                  messages: [savedTemplateData.messageId],
+                  fromPeer: savedMessagesEntity,
+                });
+                console.log(`[BROADCAST] ✅ Retry successful: Forwarded to group "${groupName}"`);
+                successCount++;
+                this.recordMessageSent(accountId);
+                this.recordGroupMessageSent(accountId, groupId);
+                continue; // Successfully retried, move to next group
+              } else if (message && message.trim().length > 0) {
+                let settings;
+                try {
+                  settings = await configService.getAccountSettings(accountId);
+                  if (!settings) settings = {};
+                } catch (settingsError) {
+                  settings = {};
+                }
+                
+                const autoMention = settings?.autoMention || false;
+                let mentionCount = settings?.mentionCount || 5;
+                if (![1, 3, 5].includes(mentionCount)) mentionCount = 5;
+                
+                let messageToSend = message;
+                let entities = [];
+                
+                if (autoMention) {
+                  try {
+                    const mentions = await mentionService.getRandomMentions(client, group.entity, mentionCount, cachedExcludeUserId);
+                    if (mentions && mentions.length > 0) {
+                      messageToSend = message + '\n\n' + mentions.map(m => `@${m}`).join(' ');
+                      entities = mentions.map((username, idx) => ({
+                        _: 'MessageEntityMention',
+                        offset: message.length + 2 + (idx > 0 ? mentions.slice(0, idx).join(' ').length + idx : 0) + 1,
+                        length: username.length + 1,
+                      }));
+                    }
+                  } catch (mentionError) {
+                    // Continue with original message if mention fails
+                    messageToSend = message;
+                    entities = [];
+                  }
+                }
+                
+                if (messageToSend && messageToSend.trim().length > 0) {
+                  await client.sendMessage(group.entity, { message: messageToSend, entities });
+                  console.log(`[BROADCAST] ✅ Retry successful: Sent to group "${groupName}"`);
+                  successCount++;
+                  this.recordMessageSent(accountId);
+                  this.recordGroupMessageSent(accountId, groupId);
+                  continue; // Successfully retried, move to next group
+                } else {
+                  console.log(`[BROADCAST] Retry message is empty, treating as error`);
+                  errorCount++;
+                  // Continue to error handling below
+                }
+              } else {
+                console.log(`[BROADCAST] No message available for retry`);
+                errorCount++;
+                // Continue to error handling below
+              }
+            } catch (retryError) {
+              // Check if it's a MESSAGE_ID_INVALID error during retry
+              const retryErrorMessage = retryError.message || retryError.toString() || '';
+              const retryErrorCode = retryError.code || retryError.errorCode || 'N/A';
+              const isRetryMessageIdInvalid = retryErrorMessage.includes('MESSAGE_ID_INVALID') || 
+                                             retryErrorMessage.includes('message_id_invalid') ||
+                                             (retryErrorCode === 400 && retryErrorMessage.includes('MESSAGE_ID_INVALID')) ||
+                                             (retryError.errorMessage && retryError.errorMessage.includes('MESSAGE_ID_INVALID'));
+              
+              if (isRetryMessageIdInvalid && useSavedTemplate && savedTemplateData) {
+                console.log(`[BROADCAST] ⚠️ MESSAGE_ID_INVALID during retry: Saved template message (slot ${savedTemplateData.slot}) no longer exists`);
+                // Try to clear the invalid template slot
+                try {
+                  const savedTemplatesService = (await import('./savedTemplatesService.js')).default;
+                  await savedTemplatesService.clearSlot(accountId, savedTemplateData.slot);
+                  console.log(`[BROADCAST] ✅ Cleared invalid saved template slot ${savedTemplateData.slot} for account ${accountId}`);
+                } catch (clearError) {
+                  console.log(`[BROADCAST] ⚠️ Could not clear invalid template slot: ${clearError.message}`);
+                }
+                errorCount++;
+                failedGroups.push({ name: groupName, reason: 'Invalid saved template message ID (retry)', id: groupId || 'unknown' });
+                continue; // Skip this group
+              }
+              
+              // If retry also fails, treat as normal error and continue
+              console.log(`[BROADCAST] Retry failed for group "${groupName}", treating as error: ${retryError.message}`);
+              errorCount++;
+              // Continue to error handling below
+            }
+          }
+          
+          // Validate error object before accessing properties
+          if (!error || typeof error !== 'object') {
+            console.log(`[BROADCAST] Invalid error object, treating as unknown error`);
+            errorCount++;
+            continue;
+          }
+          
           // Check if it's a SESSION_REVOKED error
           if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
             logError(`[BROADCAST ERROR] Session revoked for account ${accountId} during broadcast`);
@@ -804,30 +1853,103 @@ class AutomationService {
           
           // Check if user is banned from the channel/group
           const errorMessage = error.message || error.toString() || '';
-          const errorCode = error.code || error.errorCode || '';
+          const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
+          
+          // Check if it's a MESSAGE_ID_INVALID error (message no longer exists in Saved Messages)
+          const isMessageIdInvalid = errorMessage.includes('MESSAGE_ID_INVALID') || 
+                                     errorMessage.includes('message_id_invalid') ||
+                                     (errorCode === 400 && errorMessage.includes('MESSAGE_ID_INVALID')) ||
+                                     (error.errorMessage && error.errorMessage.includes('MESSAGE_ID_INVALID'));
+          
+          if (isMessageIdInvalid && useSavedTemplate && savedTemplateData) {
+            const errorGroupName = group.name || 'Unknown Group';
+            const errorGroupId = group.entity?.id?.toString() || group.entity?.id || 'unknown';
+            
+            console.log(`[BROADCAST] ⚠️ MESSAGE_ID_INVALID: Saved template message (slot ${savedTemplateData.slot}, ID: ${savedTemplateData.messageId}) no longer exists in Saved Messages for group "${errorGroupName}"`);
+            loggingService.logError(accountId, `MESSAGE_ID_INVALID: Saved template message (slot ${savedTemplateData.slot}) no longer exists - message may have been deleted from Saved Messages`, userId);
+            
+            // Try to clear the invalid template slot
+            try {
+              const savedTemplatesService = (await import('./savedTemplatesService.js')).default;
+              await savedTemplatesService.clearSlot(accountId, savedTemplateData.slot);
+              console.log(`[BROADCAST] ✅ Cleared invalid saved template slot ${savedTemplateData.slot} for account ${accountId}`);
+              loggingService.logWarning(accountId, `Cleared invalid saved template slot ${savedTemplateData.slot}`, userId);
+            } catch (clearError) {
+              console.log(`[BROADCAST] ⚠️ Could not clear invalid template slot: ${clearError.message}`);
+            }
+            
+            // Skip this group and continue with others
+            errorCount++;
+            failedGroups.push({ name: errorGroupName, reason: 'Invalid saved template message ID', id: errorGroupId });
+            continue;
+          }
           const isBanned = errorMessage.includes('USER_BANNED_IN_CHANNEL') || 
                           errorMessage.includes('USER_BANNED') ||
                           errorMessage.includes('CHAT_ADMIN_REQUIRED') ||
                           errorMessage.includes('CHAT_WRITE_FORBIDDEN') ||
                           (errorCode === 400 && (errorMessage.includes('BANNED') || errorMessage.includes('ADMIN_REQUIRED')));
           
-          if (isBanned) {
-            // User is banned or doesn't have permission - mark group as inactive and try to leave
-            // Get group ID from entity (group.entity.id.toString() or group.entity.id)
-            const groupId = group.entity?.id?.toString() || group.entity?.id;
-            console.log(`[BROADCAST] User banned from group "${group.name}" (${groupId || 'unknown'}), marking as inactive...`);
+          // Check for other permanent errors that should mark group as inactive
+          const isPeerInvalid = errorMessage.includes('PEER_ID_INVALID') || 
+                                (errorCode === 400 && errorMessage.includes('PEER_ID_INVALID'));
+          const isPaymentRequired = errorMessage.includes('ALLOW_PAYMENT_REQUIRED') || 
+                                     (errorCode === 406 && errorMessage.includes('ALLOW_PAYMENT_REQUIRED'));
+          const isPlainForbidden = errorMessage.includes('CHAT_SEND_PLAIN_FORBIDDEN') || 
+                                   (errorCode === 403 && errorMessage.includes('CHAT_SEND_PLAIN_FORBIDDEN'));
+          
+          // Determine error reason for logging (before checking updates channel)
+          let errorReason = 'unknown error';
+          if (isBanned || isPeerInvalid || isPaymentRequired || isPlainForbidden) {
+            if (isBanned) {
+              errorReason = 'User banned or no permission';
+            } else if (isPeerInvalid) {
+              errorReason = 'Invalid peer (group/channel may be deleted)';
+            } else if (isPaymentRequired) {
+              errorReason = 'Payment required to send messages';
+            } else if (isPlainForbidden) {
+              errorReason = 'Plain text messages forbidden';
+            }
+          }
+          
+          // Handle permanent errors (banned, invalid peer, payment required, plain text forbidden)
+          if (isBanned || isPeerInvalid || isPaymentRequired || isPlainForbidden) {
+            // Check if this is one of the updates channels - never leave them
+            // Use accountLinker's isUpdatesChannel method for robust checking
+            const isUpdatesChannel = await accountLinker.isUpdatesChannel(
+              { 
+                name: group.name, 
+                username: group.entity?.username,
+                id: group.entity?.id,
+                entity: group.entity
+              },
+              client
+            );
+            
+            if (isUpdatesChannel) {
+              const groupNameSafe = group?.name || groupName || 'Unknown Group';
+              console.log(`[BROADCAST] Skipping updates channel "${groupNameSafe}" - never leave it even if banned`);
+              // Still mark as error but don't leave
+              errorCount++;
+              failedGroups.push({ name: groupNameSafe, reason: `Updates channel - ${errorReason}`, id: groupId || 'unknown' });
+              continue; // Skip this group
+            }
+            
+            // Mark group as inactive and try to leave
+            // groupId is already available from earlier in the function
+            const groupNameSafe = group?.name || groupName || 'Unknown Group';
+            console.log(`[BROADCAST] ${errorReason} for group "${groupNameSafe}" (${groupId || 'unknown'}), marking as inactive...`);
             
             if (groupId) {
               await groupService.markGroupInactive(accountId, groupId);
-              loggingService.logError(accountId, `User banned from group: ${group.name} - marked as inactive`, userId);
+              loggingService.logError(accountId, `${errorReason}: ${groupNameSafe} - marked as inactive`, userId);
             } else {
-              console.log(`[BROADCAST] Warning: Could not get group ID for "${group.name}", skipping database update`);
-              loggingService.logError(accountId, `User banned from group: ${group.name} - could not get group ID`, userId);
+              console.log(`[BROADCAST] Warning: Could not get group ID for "${groupNameSafe}", skipping database update`);
+              loggingService.logError(accountId, `${errorReason}: ${groupNameSafe} - could not get group ID`, userId);
             }
             
             // Try to leave the group/channel using the entity directly
             try {
-              const groupEntity = group.entity;
+              const groupEntity = group?.entity;
               if (groupEntity) {
                 if (groupEntity.broadcast || groupEntity.megagroup) {
                   // It's a channel or supergroup - leave it
@@ -836,21 +1958,27 @@ class AutomationService {
                       channel: groupEntity,
                     })
                   );
-                  console.log(`[GROUPS] Left channel/supergroup "${group.name}" (${groupId || 'unknown'})`);
-                  loggingService.logInfo(accountId, `Left banned channel: ${group.name}`, userId);
+                  console.log(`[GROUPS] Left channel/supergroup "${groupNameSafe}" (${groupId || 'unknown'})`);
+                  loggingService.logInfo(accountId, `Left channel: ${groupNameSafe}`, userId);
                 } else {
                   // It's a regular group - delete dialog (leave)
                   await client.deleteDialog(groupEntity);
-                  console.log(`[GROUPS] Left group "${group.name}" (${groupId || 'unknown'})`);
-                  loggingService.logInfo(accountId, `Left banned group: ${group.name}`, userId);
+                  console.log(`[GROUPS] Left group "${groupNameSafe}" (${groupId || 'unknown'})`);
+                  loggingService.logInfo(accountId, `Left group: ${groupNameSafe}`, userId);
                 }
               } else {
-                console.log(`[GROUPS] Could not leave group "${group.name}": group entity not available`);
+                console.log(`[GROUPS] Could not leave group "${groupNameSafe}": group entity not available`);
               }
             } catch (leaveError) {
               // If we can't leave, that's okay - we've already marked it as inactive
-              console.log(`[GROUPS] Could not leave group "${group.name}": ${leaveError.message}`);
-              loggingService.logWarning(accountId, `Could not leave banned group ${group.name}: ${leaveError.message}`, userId);
+              // For PEER_ID_INVALID, we might not be able to leave since the peer is invalid
+              const leaveErrorMessage = leaveError?.message || 'Unknown error';
+              if (isPeerInvalid) {
+                console.log(`[GROUPS] Cannot leave invalid peer "${groupNameSafe}": ${leaveErrorMessage}`);
+              } else {
+                console.log(`[GROUPS] Could not leave group "${groupNameSafe}": ${leaveErrorMessage}`);
+                loggingService.logWarning(accountId, `Could not leave group ${groupNameSafe}: ${leaveErrorMessage}`, userId);
+              }
             }
             
             errorCount++;
@@ -858,25 +1986,342 @@ class AutomationService {
             continue;
           }
           
-          errorCount++;
+          // CRITICAL: Record ban risk for any error
+          this.recordBanRisk(accountId, errorReason || 'error');
+          
+          // Enhanced error logging with full error details
           const errorGroupName = group.name || 'Unknown Group';
           const errorGroupId = group.entity?.id?.toString() || group.entity?.id || 'unknown';
-          console.log(`[BROADCAST] ❌ Failed to send to group "${errorGroupName}" (ID: ${errorGroupId}): ${error.message}`);
+          const errorType = error.constructor?.name || 'Error';
+          
+          // Add to failed groups tracking
+          // errorMessage and errorCode are already declared above
+          // errorReason is already declared earlier, so just assign to it (only if not already set by permanent error handling)
+          if (errorReason === 'unknown error') {
+            errorReason = errorCode === 429 || isFloodWaitError(error) ? 'Flood wait (retry failed)' :
+                         errorMessage.includes('TIMEOUT') ? 'Timeout' :
+                         errorMessage.includes('network') ? 'Network error' :
+                         errorMessage.includes('connection') ? 'Connection error' :
+                         errorCode !== 'N/A' ? `Error code ${errorCode}` : 'Unknown error';
+          }
+          failedGroups.push({ name: errorGroupName, reason: errorReason, id: errorGroupId });
+          const errorDetails = {
+            message: error.message || 'Unknown error',
+            code: errorCode,
+            type: errorType,
+            stack: error.stack ? error.stack.substring(0, 500) : 'No stack trace',
+            error: error.toString(),
+            response: error.response ? JSON.stringify(error.response).substring(0, 200) : 'No response'
+          };
+          
+          console.log(`[BROADCAST] ❌ Failed to send to group "${errorGroupName}" (ID: ${errorGroupId})`);
+          console.log(`[BROADCAST] Error Type: ${errorType}, Code: ${errorCode}, Message: ${errorDetails.message}`);
+          console.log(`[BROADCAST] Full error:`, errorDetails);
           logError(`[BROADCAST ERROR] Error sending to ${errorGroupName}:`, error);
-          loggingService.logError(accountId, `Error sending to ${errorGroupName}: ${error.message}`, userId);
+          loggingService.logError(accountId, `Error sending to ${errorGroupName}: ${errorDetails.message} (Code: ${errorCode}, Type: ${errorType})`, userId);
           
           // Record analytics for failure
-          analyticsService.recordGroupAnalytics(accountId, errorGroupId, errorGroupName, false, error.message).catch(err => {
+          analyticsService.recordGroupAnalytics(accountId, errorGroupId, errorGroupName, false, errorDetails.message).catch(err => {
             console.log(`[SILENT_FAIL] Analytics recording failed: ${err.message}`);
           });
           
-          // If rate limited, wait longer before continuing
-          if (error.message.includes('FLOOD') || error.message.includes('rate') || error.code === 429) {
-            console.log(`[BROADCAST] Rate limit detected, waiting 30 seconds before continuing...`);
-            await new Promise((resolve) => setTimeout(resolve, 30000));
+          // CRITICAL: Check for bot blocked errors (user blocked the bot)
+          // Note: errorMessage and errorCode are already declared above at line 1825-1826
+          const isBotBlocked = errorMessage.includes('bot was blocked') ||
+                              errorMessage.includes('bot blocked') ||
+                              errorMessage.includes('BLOCKED') ||
+                              errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden'));
+          
+          if (isBotBlocked) {
+            console.log(`[BOT_BLOCKED] User blocked the bot for group "${groupName}". Marking as inactive.`);
+            this.recordBanRisk(accountId, 'blocked');
+            if (groupId) {
+              await groupService.markGroupInactive(accountId, groupId);
+            }
+            errorCount++;
+            continue; // Skip this group
+          }
+          
+          // Check if it's a flood wait error - RETRY instead of skipping
+          if (isFloodWaitError(error)) {
+            rateLimited = true;
+            this.recordRateLimit(accountId);
+            
+            // CRITICAL: Check circuit breaker after recording flood wait
+            const circuitCheck = this.checkCircuitBreaker(accountId);
+            if (!circuitCheck.canProceed) {
+              console.error(`[CIRCUIT_BREAKER] ⚠️ CRITICAL: ${circuitCheck.reason}`);
+              logError(`[CIRCUIT_BREAKER] Broadcast stopped for account ${accountId} due to circuit breaker`);
+              await this.stopBroadcast(userId, accountId);
+              break; // Stop immediately to prevent ban
+            }
+            
+            // Extract wait time from FloodWaitError using utility function
+            const waitSeconds = extractWaitTime(error);
+            
+            // Use the actual wait time from Telegram, or fallback to conservative delay
+            let delayMs;
+            if (waitSeconds !== null && waitSeconds > 0 && !isNaN(waitSeconds)) {
+              // Add 2 second buffer to ensure we wait long enough
+              delayMs = (waitSeconds + 2) * 1000;
+              console.log(`[FLOOD_WAIT] ⚠️ FloodWaitError detected for group "${errorGroupName}". Telegram requires ${waitSeconds}s wait. Waiting ${waitSeconds + 2}s before RETRYING...`);
+              console.log(`[FLOOD_WAIT] Error details - message: "${error.message || 'N/A'}", errorMessage: "${error.errorMessage || 'N/A'}", code: "${error.code || 'N/A'}"`);
+            } else {
+              // Enhanced fallback: try to parse from error message/description if extraction failed
+              const errorMsgLower = (error.message || error.errorMessage || error.toString() || '').toLowerCase();
+              let extractedFromMsg = null;
+              
+              // Try to extract from message directly
+              const msgMatch = errorMsgLower.match(/flood_wait[_\s](\d+)/);
+              if (msgMatch && msgMatch[1]) {
+                extractedFromMsg = parseInt(msgMatch[1], 10);
+              }
+              
+              if (extractedFromMsg && !isNaN(extractedFromMsg) && extractedFromMsg > 0) {
+                delayMs = (extractedFromMsg + 2) * 1000;
+                console.log(`[FLOOD_WAIT] ⚠️ Extracted wait time from error message: ${extractedFromMsg}s. Waiting ${extractedFromMsg + 2}s before RETRYING...`);
+              } else {
+                // Conservative fallback: 60 seconds if we truly can't extract wait time
+                delayMs = 60000;
+                console.log(`[FLOOD_WAIT] ⚠️ Rate limit detected but couldn't extract wait time. Using conservative fallback: ${delayMs / 1000}s before RETRYING...`);
+                console.log(`[FLOOD_WAIT] Error details for debugging - message: "${error.message || 'N/A'}", errorMessage: "${error.errorMessage || 'N/A'}", code: "${error.code || 'N/A'}", response: ${JSON.stringify(error.response || {}).substring(0, 200)}`);
+              }
+            }
+            
+            // Wait for the required time
+            console.log(`[FLOOD_WAIT] Waiting ${(delayMs / 1000).toFixed(1)}s before retrying group "${errorGroupName}"...`);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            console.log(`[FLOOD_WAIT] Wait completed, proceeding with retry...`);
+            
+            // RETRY sending to this group after waiting
+            console.log(`[FLOOD_WAIT] Retrying send to group "${errorGroupName}" after flood wait...`);
+            try {
+              // Validate group entity still exists before retry
+              if (!group || !group.entity) {
+                console.log(`[FLOOD_WAIT] Group entity missing during retry, skipping`);
+                errorCount++;
+                failedGroups.push({ name: errorGroupName, reason: 'Flood wait retry - missing entity', id: errorGroupId });
+                continue;
+              }
+              
+              // Re-check broadcast status
+              const currentBroadcastCheck = this.activeBroadcasts.get(broadcastKey);
+              if (!currentBroadcastCheck || !currentBroadcastCheck.isRunning) {
+                console.log(`[FLOOD_WAIT] Broadcast stopped during retry wait, aborting`);
+                break;
+              }
+              
+              // Retry sending to this group
+              if (useSavedTemplate && savedTemplateData && savedMessagesEntity) {
+                await client.forwardMessages(group.entity, {
+                  messages: [savedTemplateData.messageId],
+                  fromPeer: savedMessagesEntity,
+                });
+                console.log(`[FLOOD_WAIT] ✅ Retry successful: Forwarded to group "${errorGroupName}"`);
+                successCount++;
+                this.recordMessageSent(accountId);
+                this.recordGroupMessageSent(accountId, errorGroupId);
+                loggingService.logBroadcast(accountId, `Retried and sent to group: ${errorGroupName} (after flood wait)`, 'success');
+                continue; // Successfully retried, move to next group
+              } else if (message && message.trim().length > 0) {
+                // Get settings for mentions if needed
+                let settings;
+                try {
+                  settings = await configService.getAccountSettings(accountId);
+                  if (!settings) settings = {};
+                } catch (settingsError) {
+                  settings = {};
+                }
+                
+                const autoMention = settings?.autoMention || false;
+                let mentionCount = settings?.mentionCount || 5;
+                if (![1, 3, 5].includes(mentionCount)) mentionCount = 5;
+                
+                let messageToSend = message;
+                let entities = [];
+                
+                // Try to add mentions if enabled (but don't fail if it doesn't work)
+                if (autoMention) {
+                  try {
+                    const mentionResult = await Promise.race([
+                      mentionService.addMentionsToMessage(client, group.entity, message, mentionCount, cachedExcludeUserId),
+                      new Promise((_, reject) => setTimeout(() => reject(new Error('Mention timeout')), 2000))
+                    ]);
+                    messageToSend = mentionResult.message;
+                    entities = mentionResult.entities || [];
+                  } catch (mentionError) {
+                    // Continue without mentions if mention fails
+                    messageToSend = message;
+                    entities = [];
+                  }
+                }
+                
+                // Send message (with or without mentions)
+                if (entities.length > 0) {
+                  // Build HTML message with mentions
+                  let htmlMessage = messageToSend;
+                  const sortedEntities = [...entities].sort((a, b) => b.offset - a.offset);
+                  for (const entity of sortedEntities) {
+                    const userIdValue = typeof entity.userId === 'bigint' ? Number(entity.userId) : 
+                                      typeof entity.userId === 'number' ? entity.userId : 
+                                      parseInt(entity.userId);
+                    if (!isNaN(userIdValue)) {
+                      const before = htmlMessage.substring(0, entity.offset);
+                      const after = htmlMessage.substring(entity.offset + entity.length);
+                      htmlMessage = before + `<a href="tg://user?id=${userIdValue}">&#8203;</a>` + after;
+                    }
+                  }
+                  await client.sendMessage(group.entity, { message: htmlMessage, parseMode: 'html' });
+                } else {
+                  await client.sendMessage(group.entity, { message: messageToSend });
+                }
+                
+                console.log(`[FLOOD_WAIT] ✅ Retry successful: Sent to group "${errorGroupName}"`);
+                successCount++;
+                this.recordMessageSent(accountId);
+                this.recordGroupMessageSent(accountId, errorGroupId);
+                loggingService.logBroadcast(accountId, `Retried and sent to group: ${errorGroupName} (after flood wait)`, 'success');
+                
+                // Record analytics for success
+                analyticsService.recordGroupAnalytics(accountId, errorGroupId, errorGroupName, true).catch(() => {});
+                
+                continue; // Successfully retried, move to next group
+              } else {
+                console.log(`[FLOOD_WAIT] No message available for retry`);
+                errorCount++;
+                continue;
+              }
+            } catch (retryError) {
+              // If retry also fails, log and continue
+              const retryErrorCode = retryError.code || retryError.errorCode || 'N/A';
+              const retryErrorMessage = retryError.message || retryError.toString() || 'Unknown error';
+              
+              // Check if it's a MESSAGE_ID_INVALID error during flood wait retry
+              const isRetryMessageIdInvalid = retryErrorMessage.includes('MESSAGE_ID_INVALID') || 
+                                             retryErrorMessage.includes('message_id_invalid') ||
+                                             (retryErrorCode === 400 && retryErrorMessage.includes('MESSAGE_ID_INVALID')) ||
+                                             (retryError.errorMessage && retryError.errorMessage.includes('MESSAGE_ID_INVALID'));
+              
+              if (isRetryMessageIdInvalid && useSavedTemplate && savedTemplateData) {
+                console.log(`[FLOOD_WAIT] ⚠️ MESSAGE_ID_INVALID during flood wait retry: Saved template message (slot ${savedTemplateData.slot}) no longer exists`);
+                loggingService.logError(accountId, `MESSAGE_ID_INVALID during flood wait retry: Saved template message (slot ${savedTemplateData.slot}) no longer exists`, userId);
+                // Try to clear the invalid template slot
+                try {
+                  const savedTemplatesService = (await import('./savedTemplatesService.js')).default;
+                  await savedTemplatesService.clearSlot(accountId, savedTemplateData.slot);
+                  console.log(`[FLOOD_WAIT] ✅ Cleared invalid saved template slot ${savedTemplateData.slot} for account ${accountId}`);
+                } catch (clearError) {
+                  console.log(`[FLOOD_WAIT] ⚠️ Could not clear invalid template slot: ${clearError.message}`);
+                }
+                errorCount++;
+                failedGroups.push({ 
+                  name: errorGroupName, 
+                  reason: 'Invalid saved template message ID (flood wait retry)', 
+                  id: errorGroupId 
+                });
+              } else {
+                console.log(`[FLOOD_WAIT] ❌ Retry failed for group "${errorGroupName}": ${retryErrorMessage} (Code: ${retryErrorCode})`);
+                logError(`[FLOOD_WAIT RETRY ERROR] Retry failed for ${errorGroupName}:`, retryError);
+                loggingService.logError(accountId, `Flood wait retry failed for ${errorGroupName}: ${retryErrorMessage}`, userId);
+                errorCount++;
+                failedGroups.push({ 
+                  name: errorGroupName, 
+                  reason: `Flood wait retry failed: ${retryErrorMessage} (Code: ${retryErrorCode})`, 
+                  id: errorGroupId 
+                });
+              }
+              // Continue to next group - don't retry again
+            }
           } else {
-            // For other errors, wait a bit before continuing
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            // Check for other recoverable errors (timeouts, network errors, etc.)
+            const errorMessage = error.message || error.toString() || '';
+            const isTimeout = errorMessage.includes('TIMEOUT') || errorMessage.includes('timeout') || errorCode === 408;
+            const isNetworkError = errorMessage.includes('network') || errorMessage.includes('ECONNRESET') || errorMessage.includes('ENOTFOUND') || errorMessage.includes('ETIMEDOUT');
+            const isConnectionError = errorMessage.includes('connection') || errorMessage.includes('disconnected') || errorMessage.includes('Not connected');
+            
+            // Retry recoverable errors once
+            if ((isTimeout || isNetworkError || isConnectionError) && i < groupsToSend.length - 1) {
+              console.log(`[BROADCAST] ⚠️ Recoverable error (${isTimeout ? 'timeout' : isNetworkError ? 'network' : 'connection'}) for group "${errorGroupName}", retrying after 3s...`);
+              await new Promise((resolve) => setTimeout(resolve, 3000));
+              
+              try {
+                // Validate group entity
+                if (!group || !group.entity) {
+                  console.log(`[BROADCAST] Group entity missing during retry`);
+                  errorCount++;
+                  continue;
+                }
+                
+                // Re-check broadcast status
+                const currentBroadcastCheck = this.activeBroadcasts.get(broadcastKey);
+                if (!currentBroadcastCheck || !currentBroadcastCheck.isRunning) {
+                  console.log(`[BROADCAST] Broadcast stopped during retry wait`);
+                  break;
+                }
+                
+                // Retry sending (simplified - no mentions for retry)
+                if (useSavedTemplate && savedTemplateData && savedMessagesEntity) {
+                  await client.forwardMessages(group.entity, {
+                    messages: [savedTemplateData.messageId],
+                    fromPeer: savedMessagesEntity,
+                  });
+                  console.log(`[BROADCAST] ✅ Retry successful: Forwarded to group "${errorGroupName}"`);
+                  successCount++;
+                  this.recordMessageSent(accountId);
+                  this.recordGroupMessageSent(accountId, errorGroupId);
+                  continue;
+                } else if (message && message.trim().length > 0) {
+                  await client.sendMessage(group.entity, { message: message });
+                  console.log(`[BROADCAST] ✅ Retry successful: Sent to group "${errorGroupName}"`);
+                  successCount++;
+                  this.recordMessageSent(accountId);
+                  this.recordGroupMessageSent(accountId, errorGroupId);
+                  continue;
+                }
+              } catch (retryError) {
+                const retryErrorCode = retryError.code || retryError.errorCode || 'N/A';
+                const retryErrorMessage = retryError.message || retryError.toString() || 'Unknown error';
+                
+                // Check if it's a MESSAGE_ID_INVALID error during retry
+                const isRetryMessageIdInvalid = retryErrorMessage.includes('MESSAGE_ID_INVALID') || 
+                                               retryErrorMessage.includes('message_id_invalid') ||
+                                               (retryErrorCode === 400 && retryErrorMessage.includes('MESSAGE_ID_INVALID')) ||
+                                               (retryError.errorMessage && retryError.errorMessage.includes('MESSAGE_ID_INVALID'));
+                
+                if (isRetryMessageIdInvalid && useSavedTemplate && savedTemplateData) {
+                  console.log(`[BROADCAST] ⚠️ MESSAGE_ID_INVALID during retry: Saved template message (slot ${savedTemplateData.slot}) no longer exists`);
+                  loggingService.logError(accountId, `MESSAGE_ID_INVALID during retry: Saved template message (slot ${savedTemplateData.slot}) no longer exists`, userId);
+                  // Try to clear the invalid template slot
+                  try {
+                    const savedTemplatesService = (await import('./savedTemplatesService.js')).default;
+                    await savedTemplatesService.clearSlot(accountId, savedTemplateData.slot);
+                    console.log(`[BROADCAST] ✅ Cleared invalid saved template slot ${savedTemplateData.slot} for account ${accountId}`);
+                  } catch (clearError) {
+                    console.log(`[BROADCAST] ⚠️ Could not clear invalid template slot: ${clearError.message}`);
+                  }
+                  errorCount++;
+                  failedGroups.push({ 
+                    name: errorGroupName, 
+                    reason: 'Invalid saved template message ID (retry)', 
+                    id: errorGroupId 
+                  });
+                  // Continue to delay below
+                } else {
+                  console.log(`[BROADCAST] ❌ Retry failed for group "${errorGroupName}": ${retryErrorMessage} (Code: ${retryErrorCode})`);
+                  errorCount++;
+                  failedGroups.push({ 
+                    name: errorGroupName, 
+                    reason: `Recoverable error retry failed: ${retryErrorMessage}`, 
+                    id: errorGroupId 
+                  });
+                }
+                // Continue to delay below
+              }
+            }
+            
+            // For other errors, use random delay before continuing (anti-freeze)
+            const delayMs = this.getRandomDelay(accountId);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
           }
         }
       }
@@ -891,10 +2336,49 @@ class AutomationService {
       
       loggingService.logBroadcast(accountId, `Broadcast cycle completed. Success: ${successCount}, Errors: ${errorCount}`, 'info');
       console.log(`[BROADCAST] ✅ Completed sending 1 message to all groups for account ${accountId} (user ${userId})`);
-      console.log(`[BROADCAST] 📊 Summary: Total groups: ${groups.length}, Success: ${successCount}, Errors: ${errorCount}, Success rate: ${groups.length > 0 ? ((successCount / groups.length) * 100).toFixed(1) : 0}%`);
+      const tracking = this.getAntiFreezeTracking(accountId);
+      
+      console.log(`[BROADCAST] 📊 Summary: Total groups: ${groupsToSend.length}, Success: ${successCount}, Errors: ${errorCount}, Success rate: ${groupsToSend.length > 0 ? ((successCount / groupsToSend.length) * 100).toFixed(1) : 0}%`);
+      if (rateLimited || tracking.rateLimitCount > 0) {
+        console.log(`[ANTI-FREEZE] 📊 Rate limit tracking: Count: ${tracking.rateLimitCount}${rateLimited ? ' (Rate limited in this cycle)' : ''}`);
+      }
+      
+      // CRITICAL: Check ban risk and circuit breaker status
+      const circuitCheck = this.checkCircuitBreaker(accountId);
+      if (circuitCheck.isOpen) {
+        console.error(`[BAN_PREVENTION] ⚠️ CRITICAL: Circuit breaker is OPEN for account ${accountId}. Broadcast paused to prevent ban.`);
+        logError(`[BAN_PREVENTION] Circuit breaker open for account ${accountId}`, null, circuitCheck.reason);
+      }
+      
+      const riskTracking = this.banRiskTracking.get(accountId);
+      if (riskTracking && riskTracking.errorRate > 30) {
+        console.warn(`[BAN_PREVENTION] ⚠️ High error rate detected for account ${accountId}: ${riskTracking.errorRate.toFixed(1)}%`);
+      }
+      
+      // Log failed groups summary if there are failures
+      if (failedGroups.length > 0) {
+        console.log(`[BROADCAST] ⚠️ Failed Groups Summary (${failedGroups.length} groups):`);
+        const failureReasons = {};
+        failedGroups.forEach(fg => {
+          const reason = fg.reason || 'Unknown error';
+          if (!failureReasons[reason]) {
+            failureReasons[reason] = [];
+          }
+          failureReasons[reason].push(fg.name || fg.id || 'Unknown');
+        });
+        
+        Object.entries(failureReasons).forEach(([reason, groups]) => {
+          console.log(`[BROADCAST]   - ${reason}: ${groups.length} group(s) - ${groups.slice(0, 5).join(', ')}${groups.length > 5 ? ` ... and ${groups.length - 5} more` : ''}`);
+        });
+        
+        // Log to database for tracking
+        if (failedGroups.length > 0) {
+          loggingService.logWarning(accountId, `Broadcast cycle had ${failedGroups.length} failed groups. Reasons: ${Object.keys(failureReasons).join(', ')}`, userId).catch(() => {});
+        }
+      }
       
       // Record broadcast statistics
-      broadcastStatsService.recordStats(accountId, groups.length, successCount, errorCount).catch(err => {
+      broadcastStatsService.recordStats(accountId, groupsToSend.length, successCount, errorCount).catch(err => {
         console.log(`[SILENT_FAIL] Broadcast stats recording failed: ${err.message}`);
       });
       

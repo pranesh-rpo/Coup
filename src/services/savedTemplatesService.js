@@ -75,14 +75,15 @@ class SavedTemplatesService {
           })));
         }
 
+        // SQLite uses EXCLUDED for ON CONFLICT DO UPDATE
         await db.query(
           `INSERT INTO saved_templates (account_id, slot, message_text, message_entities, message_id, updated_at)
-           VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
            ON CONFLICT (account_id, slot) 
            DO UPDATE SET 
-             message_text = $3,
-             message_entities = $4,
-             message_id = $5,
+             message_text = EXCLUDED.message_text,
+             message_entities = EXCLUDED.message_entities,
+             message_id = EXCLUDED.message_id,
              updated_at = CURRENT_TIMESTAMP`,
           [accountId, slot, messageText, messageEntities, messageId]
         );

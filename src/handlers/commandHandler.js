@@ -8,10 +8,11 @@ import groupService from '../services/groupService.js';
 import configService from '../services/configService.js';
 import adminNotifier from '../services/adminNotifier.js';
 import otpHandler, { createOTPKeypad } from './otpHandler.js';
-import { createMainMenu, createBackButton, createStopButton, createAccountSwitchKeyboard, createGroupsMenu, createConfigMenu, createRateLimitKeyboard, createQuietHoursKeyboard, createABModeKeyboard, createScheduleKeyboard, createABMessagesKeyboard, createSavedTemplatesKeyboard, generateStatusText } from './keyboardHandler.js';
+import { createMainMenu, createBackButton, createStopButton, createAccountSwitchKeyboard, createGroupsMenu, createConfigMenu, createQuietHoursKeyboard, createABModeKeyboard, createScheduleKeyboard, createABMessagesKeyboard, createSavedTemplatesKeyboard, generateStatusText, createLoginOptionsKeyboard } from './keyboardHandler.js';
 import { config } from '../config.js';
 import logger, { logError } from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
+import { safeBotApiCall } from '../utils/floodWaitHandler.js';
 import { Api } from 'telegram/tl/index.js';
 
 // Store reference to pending phone numbers set for setting pending state
@@ -47,7 +48,7 @@ function addPendingPhoneNumber(userId) {
  */
 function escapeHtml(text) {
   if (!text) return '';
-  return text
+  return String(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -55,53 +56,193 @@ function escapeHtml(text) {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * Strip HTML tags from text to convert HTML formatted messages to plain text
+ * This is useful when users forward messages with Telegram formatting
+ */
+function stripHtmlTags(text) {
+  if (!text) return '';
+  
+  // Ensure we're working with a string
+  let workingText = String(text);
+  
+  // First decode HTML entities
+  let decoded = workingText
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+  
+  // Then strip HTML tags (including Telegram-specific formatting)
+  // Remove common HTML tags like <b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, etc.
+  let stripped = decoded.replace(/<[^>]+>/g, '');
+  
+  // Decode any remaining HTML entities (in case some were nested)
+  stripped = stripped
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+  
+  console.log(`[STRIP_HTML] Original length: ${workingText.length}, Stripped length: ${stripped.length}`);
+  console.log(`[STRIP_HTML] Original: ${workingText.substring(0, 100)}...`);
+  console.log(`[STRIP_HTML] Stripped: ${stripped.substring(0, 100)}...`);
+  
+  return stripped.trim();
+}
+
 // Helper function to check if user is verified
 async function checkUserVerification(bot, userId) {
   // If no updates channel configured, allow access
-  if (!config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length === 0) {
     return { verified: true };
   }
 
-  const isVerified = await userService.isUserVerified(userId);
+  const isVerifiedInDb = await userService.isUserVerified(userId);
   
-  if (isVerified) {
+  // If marked as verified in DB, do a real-time check to ensure they're still in ALL channels
+  if (isVerifiedInDb) {
+    const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+    
+    // Real-time check: verify user is still in ALL channels (not just one)
+    let isStillMemberOfAll = true;
+    for (const channelUsername of channelUsernames) {
+      if (!channelUsername || typeof channelUsername !== 'string') {
+        continue; // Skip invalid channel names
+      }
+
+      try {
+        // CRITICAL: Use safeBotApiCall to prevent rate limiting and bot deletion
+        // getChat and getChatMember can trigger rate limits if called too frequently
+        const chat = await safeBotApiCall(
+          () => bot.getChat(`@${channelUsername}`),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
+        
+        // Validate chat response
+        if (!chat || !chat.id) {
+          console.warn(`[VERIFICATION] Invalid chat response for @${channelUsername}`);
+          isStillMemberOfAll = false;
+          break;
+        }
+
+        const channelId = chat.id;
+        
+        // CRITICAL: Use safeBotApiCall for getChatMember to prevent rate limiting
+        const member = await safeBotApiCall(
+          () => bot.getChatMember(channelId, userId),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
+        
+        // Validate member response
+        if (!member || !member.status) {
+          console.warn(`[VERIFICATION] Invalid member response for user ${userId} in @${channelUsername}`);
+          isStillMemberOfAll = false;
+          break;
+        }
+
+        const isMember = member.status === 'member' || 
+                        member.status === 'administrator' || 
+                        member.status === 'creator';
+        
+        if (!isMember) {
+          // User is not in this channel - they must be in ALL channels
+          console.log(`[VERIFICATION] User ${userId} is not in @${channelUsername} (required channel)`);
+          isStillMemberOfAll = false;
+          break;
+        }
+      } catch (checkError) {
+        const errorMessage = checkError.message || checkError.toString() || '';
+        const errorCode = checkError.response?.error_code || checkError.code;
+        
+        // Handle different error types
+        if (errorCode === 400 && errorMessage.includes('chat not found')) {
+          console.warn(`[VERIFICATION] Channel @${channelUsername} not found or inaccessible`);
+          isStillMemberOfAll = false;
+          break;
+        } else if (errorCode === 403 && errorMessage.includes('not enough rights')) {
+          console.warn(`[VERIFICATION] Bot is not admin of @${channelUsername} - cannot verify membership`);
+          isStillMemberOfAll = false;
+          break;
+        } else if (errorCode === 400 && (errorMessage.includes('user not found') || errorMessage.includes('chat not found'))) {
+          // User is likely not a member
+          console.log(`[VERIFICATION] Real-time check: User ${userId} not in @${channelUsername}`);
+          isStillMemberOfAll = false;
+          break;
+        } else {
+          // Other errors - log and mark as not verified
+          console.log(`[VERIFICATION] Real-time check error for user ${userId} in @${channelUsername}: ${errorMessage}`);
+          isStillMemberOfAll = false;
+          break;
+        }
+      }
+    }
+    
+    // If user is not in all channels, revoke verification immediately
+    if (!isStillMemberOfAll) {
+      console.log(`[VERIFICATION] User ${userId} not in all required channels, revoking verification`);
+      try {
+        await userService.updateUserVerification(userId, false);
+      } catch (error) {
+        console.error(`[VERIFICATION] Error revoking verification for user ${userId}:`, error.message);
+        // Continue anyway - return unverified status
+      }
+      return { verified: false, channelUsernames };
+    }
+    
     return { verified: true };
   }
 
-  // Try to verify user by checking channel membership
-  try {
-    // Extract channel username from updatesChannel (remove @ if present)
-    const channelUsername = config.updatesChannel.replace('@', '');
-    
-    // Try to get channel info and check membership
-    // Note: Bot API doesn't directly support checking membership, so we'll use a workaround
-    // We'll check when user clicks verify button instead
-    return { verified: false, channelUsername };
-  } catch (error) {
-    logger.logError('VERIFICATION', userId, error, 'Error checking channel membership');
-    return { verified: false, channelUsername: config.updatesChannel.replace('@', '') };
-  }
+  // Return all channel usernames for verification
+  const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+  return { verified: false, channelUsernames };
 }
 
-// Helper function to show verification required message
-async function showVerificationRequired(bot, chatId, channelUsername) {
+// Helper function to create channel buttons keyboard
+function createChannelButtonsKeyboard(channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Create buttons: Verify button on first row, then one button per channel
+  const keyboard = [
+    [{ text: '✅ Verify Channel', callback_data: 'btn_verify_channel' }]
+  ];
+  
+  // Add one button per channel
+  for (const channelUsername of channels) {
+    keyboard.push([{ text: `📢 Join @${channelUsername}`, url: `https://t.me/${channelUsername}` }]);
+  }
+  
+  return keyboard;
+}
+
+// Helper function to show verification required message with multiple channel buttons
+async function showVerificationRequired(bot, chatId, channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Build channel list text
+  const channelList = channels.map(ch => `📢 @${ch}`).join('\n');
+  
   const verificationMessage = `
 🔐 <b>Channel Verification Required</b>
 
-To use this bot, you must join our updates channel first.
+To use this bot, you must join our updates channel(s) first.
 
-📢 Join: @${channelUsername}
+${channelList}
 
-After joining, click the "✅ Verify" button below.
+After joining, click the "✅ Verify Channel" button below.
   `;
   
   return await bot.sendMessage(chatId, verificationMessage, {
     parse_mode: 'HTML',
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-        [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-      ]
+      inline_keyboard: createChannelButtonsKeyboard(channels)
     }
   });
 }
@@ -187,36 +328,33 @@ export async function handleStart(bot, msg) {
   }
 
   // Check channel verification requirement (mandatory if updates channel is configured)
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const verification = await checkUserVerification(bot, userId);
     
     if (!verification.verified) {
-      // Show verification requirement message
-      await showVerificationRequired(bot, chatId, verification.channelUsername);
+      // Show verification requirement message with all channels
+      await showVerificationRequired(bot, chatId, verification.channelUsernames || updatesChannels.map(ch => ch.replace('@', '')));
       return;
     }
   }
 
   const statusText = await generateStatusText(userId);
   const welcomeMessage = `
-👋 <b>Welcome to Ora Telegram Bot!</b>
+✨ <b>Welcome to Coup Bot</b> ✨
 
-🤖 <i>Automate sending messages to all your Telegram groups</i>
+Manage your Telegram broadcasts with ease!${statusText}
 
-✨ <b>Key Features:</b>
-🔗 Link multiple accounts
-🔄 A/B message testing
-💎 Saved message templates
-👥 Group management
-📊 Broadcast statistics
-⏰ Smart scheduling
-⚙️ Advanced configuration${statusText}
-
-📱 <i>Use the buttons below to navigate</i>
+Select an option from the menu below:
   `;
 
-  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
-  logger.logInfo('START', `Welcome message sent to user ${userId}`, userId);
+  try {
+    await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
+    logger.logInfo('START', `Welcome message sent to user ${userId}`, userId);
+  } catch (error) {
+    logger.logError('START', userId, error, 'Failed to send welcome message');
+    // Don't throw - user already started the bot successfully
+  }
 }
 
 export async function handleMainMenu(bot, callbackQuery) {
@@ -227,31 +365,19 @@ export async function handleMainMenu(bot, callbackQuery) {
   logger.logButtonClick(userId, username, 'Back to Menu', chatId);
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const verification = await checkUserVerification(bot, userId);
     
     if (!verification.verified) {
-      await showVerificationRequired(bot, chatId, verification.channelUsername);
+      await showVerificationRequired(bot, chatId, verification.channelUsernames || updatesChannels.map(ch => ch.replace('@', '')));
       return;
     }
   }
 
   const statusText = await generateStatusText(userId);
   const welcomeMessage = `
-👋 <b>Welcome to Ora Telegram Bot!</b>
-
-🤖 <i>Automate sending messages to all your Telegram groups</i>
-
-✨ <b>Key Features:</b>
-🔗 Link multiple accounts
-🔄 A/B message testing
-💎 Saved message templates
-👥 Group management
-📊 Broadcast statistics
-⏰ Smart scheduling
-⚙️ Advanced configuration${statusText}
-
-📱 <i>Use the buttons below to navigate</i>
+👋 <b>Coup Bot</b>${statusText}
   `;
 
   await safeEditMessage(bot, chatId, callbackQuery.message.message_id, welcomeMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
@@ -263,11 +389,15 @@ export async function handleLink(bot, msg) {
   const chatId = msg.chat.id;
 
   // Allow users to link multiple accounts
+  try {
     await bot.sendMessage(
       chatId,
-      `📱 <b>Link Account</b>\n\nPlease send your phone number in international format:\n\n<b>Format:</b> <code>+1234567890</code> or <code>+1 234 567 8900</code>\n<b>Example:</b> <code>+1234567890</code>\n\n💡 <b>Tip:</b> You can type with or without spaces - they'll be removed automatically!\n💡 You can link multiple accounts!`,
+      `📱 <b>Link Account</b>\n\nPlease send your phone number in international format:\n\n<b>Format:</b> <code>+1234567890</code> or <code>+1 234 567 8900</code>\n<b>Example:</b> <code>+1234567890</code>`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
+  } catch (error) {
+    logger.logError('LINK', userId, error, 'Failed to send link account message');
+  }
 }
 
 export async function handleLinkButton(bot, callbackQuery) {
@@ -291,19 +421,205 @@ export async function handleLinkButton(bot, callbackQuery) {
     }
   }
 
-  // Allow users to link multiple accounts - no restriction here
-  // The saveLinkedAccount method will handle duplicate phone numbers
-  logger.logChange('LINK', userId, 'Requesting phone number input for new account');
+  // Show login options menu
+  logger.logChange('LINK', userId, 'Showing login options');
   await safeEditMessage(
     bot,
     chatId,
     callbackQuery.message.message_id,
-    `📱 <b>Link Account</b>\n\nPlease send your phone number in international format:\n\n<b>Format:</b> <code>+1234567890</code> or <code>+1 234 567 8900</code>\n<b>Example:</b> <code>+1234567890</code>\n\n💡 <b>Tip:</b> You can type with or without spaces - they'll be removed automatically!\n💡 You can link multiple accounts!`,
-    { parse_mode: 'HTML', ...createBackButton() }
+    `📱 <b>Link Account</b>\n\nChoose your preferred login method:\n\n🌐 <b>Web Login:</b> Scan QR code with Telegram app\n📱 <b>Share Phone:</b> Share your phone number via button\n⌨️ <b>Type Phone:</b> Enter phone number manually\n\n`,
+    { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
+  return false; // Don't set pending state yet - user needs to choose option
+}
+
+export async function handleLoginWeb(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Web Login', chatId);
+  logger.logChange('LINK', userId, 'Initiating web login (QR code)');
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  try {
+    // Show connecting status
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      '🔌 Connecting to Telegram...',
+      { parse_mode: 'HTML' }
+    );
+
+    // Initiate web login (pass chatId for 2FA notifications)
+    const result = await accountLinker.initiateWebLogin(userId, chatId);
+    
+    if (result.success) {
+      // Send QR code image (result.qrCode is a Buffer)
+      await bot.sendPhoto(
+        chatId,
+        result.qrCode,
+        {
+          caption: '📱 <b>Web Login</b>\n\n1. Open Telegram on your phone\n2. Go to Settings → Devices → Link Desktop Device\n3. Scan this QR code\n\n⏳ Waiting for you to scan and authorize...',
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Refresh QR Code', callback_data: 'btn_login_web' }],
+              [{ text: '◀️ Cancel', callback_data: 'btn_login_cancel' }],
+            ],
+          },
+        }
+      );
+      
+      // Delete the previous message
+      try {
+        await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+      } catch (e) {
+        // Ignore if message already deleted
+      }
+    } else {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        `❌ <b>Web Login Failed</b>\n\n<b>Error:</b> ${result.error}\n\nPlease try another login method.`,
+        { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
+      );
+    }
+  } catch (error) {
+    logger.logError('LINK', userId, error, 'Web login error');
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      `❌ <b>Web Login Error</b>\n\n<b>Error:</b> ${error.message}\n\nPlease try another login method.`,
+      { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
+    );
+  }
+}
+
+export async function handleLoginSharePhone(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Share Phone', chatId);
+  logger.logChange('LINK', userId, 'Requesting phone number via share button');
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  // Send message with request contact keyboard directly (skip intermediate step)
+  await bot.sendMessage(
+    chatId,
+    '📱 <b>Share Your Phone Number</b>\n\nPlease tap the button below to share your phone number:',
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        keyboard: [
+          [{
+            text: '📱 Share My Phone Number',
+            request_contact: true
+          }]
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    }
+  );
+
+  // Delete the previous message (login options menu)
+  try {
+    await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+  } catch (e) {
+    // Ignore if message already deleted
+  }
+}
+
+export async function handleSharePhoneConfirm(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Share Phone Confirm', chatId);
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  // Send message with request contact keyboard
+  await bot.sendMessage(
+    chatId,
+    '📱 <b>Share Your Phone Number</b>\n\nPlease tap the button below to share your phone number:',
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        keyboard: [
+          [{
+            text: '📱 Share My Phone Number',
+            request_contact: true
+          }]
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    }
+  );
+
+  // Delete the previous message
+  try {
+    await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+  } catch (e) {
+    // Ignore if message already deleted
+  }
+}
+
+export async function handleLoginTypePhone(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Type Phone', chatId);
+  logger.logChange('LINK', userId, 'Requesting phone number input for new account');
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  // Allow users to link multiple accounts - no restriction here
+  // The saveLinkedAccount method will handle duplicate phone numbers
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    `📱 <b>Link Account</b>\n\nPlease send your phone number in international format:\n\n<b>Format:</b> <code>+1234567890</code> or <code>+1 234 567 8900</code>\n<b>Example:</b> <code>+1234567890</code>`,
+    { parse_mode: 'HTML', ...createBackButton() }
+  );
+  
   return true; // Signal that phone number input is expected
+}
+
+export async function handleLoginCancel(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  // Cancel web login if in progress
+  await accountLinker.cancelWebLogin(userId);
+
+  // Show login options again
+  await bot.sendMessage(
+    chatId,
+    `📱 <b>Link Account</b>\n\nChoose your preferred login method:\n\n🌐 <b>Web Login:</b> Scan QR code with Telegram app\n📱 <b>Share Phone:</b> Share your phone number via button\n⌨️ <b>Type Phone:</b> Enter phone number manually\n\n`,
+    { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
+  );
+
+  // Delete the previous message
+  try {
+    await bot.deleteMessage(chatId, callbackQuery.message.message_id);
+  } catch (e) {
+    // Ignore if message already deleted
+  }
 }
 
 export async function handlePhoneNumber(bot, msg, phoneNumber) {
@@ -375,12 +691,14 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
         errorMessage += `<b>Error:</b> ${result.error}\n\n`;
         
         // Add helpful guidance based on error type
-        if (result.error.includes('PHONE') || result.error.includes('phone')) {
-          errorMessage += `💡 <b>Tip:</b> Make sure your phone number is correct and includes country code (e.g., +1234567890)\n\n`;
+        if (result.error.includes('Too many failed password attempts') || result.error.includes('wait') && result.error.includes('minute')) {
+          // Cooldown message - already has wait time, just add context
+          errorMessage += `🔒 <b>Security Cooldown:</b> This prevents too many login attempts.\n\n`;
+        } else if (result.error.includes('PHONE_PASSWORD_FLOOD') || (result.error.includes('FLOOD') && result.error.includes('PASSWORD'))) {
+          errorMessage += `⏳ <b>Rate Limited:</b> Too many login attempts. Please wait 5-10 minutes before trying again.\n\n`;
+        } else if (result.error.includes('PHONE') || result.error.includes('phone')) {
         } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
-          errorMessage += `⏳ <b>Tip:</b> Please wait a few minutes before trying again.\n\n`;
         } else if (result.error.includes('invalid') || result.error.includes('Invalid')) {
-          errorMessage += `💡 <b>Tip:</b> Please check your phone number format and try again.\n\n`;
         }
         
         errorMessage += `Click "🔗 Link Account" to try again.`;
@@ -413,11 +731,15 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
     }).catch(() => {}); // Silently fail to avoid blocking
     
     // Send error message with better formatting
+    try {
       await bot.sendMessage(
         chatId,
-        `❌ <b>Account Linking Error</b>\n\n<b>Error:</b> ${error.message}\n\n💡 <b>What to do:</b>\n• Check your internet connection\n• Verify your phone number format\n• Wait a moment and try again\n\nClick "🔗 Link Account" to retry.`,
+        `❌ <b>Account Linking Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
+    } catch (sendError) {
+      logger.logError('LINK', userId, sendError, 'Failed to send error message to user');
+    }
   }
 }
 
@@ -469,16 +791,11 @@ export async function handleOTPCallback(bot, callbackQuery) {
       logger.logSuccess('ACCOUNT_LINKED', userId, `Account ${verifyResult.accountId} linked successfully`);
       console.log(`[OTP] Account ${verifyResult.accountId} linked successfully for user ${userId}`);
       
-      // Add user to updates channel automatically
+      // Note: Updates channel joining is handled by accountLinker.joinUpdatesChannel()
+      // which is called automatically during account linking, so we don't need to call it here
       if (config.updatesChannel) {
-        const channelResult = await addUserToUpdatesChannel(bot, userId);
-        if (channelResult.success) {
-          console.log(`[ACCOUNT_LINK] User ${userId} added to updates channel after account linking`);
-          // Also mark user as verified since they're now in the channel
-          await userService.updateUserVerification(userId, true);
-        } else {
-          console.log(`[ACCOUNT_LINK] Could not add user ${userId} to updates channel: ${channelResult.error}`);
-        }
+        // Mark user as verified since account is linked
+        await userService.updateUserVerification(userId, true);
       }
       
       // Notify admins
@@ -493,7 +810,7 @@ export async function handleOTPCallback(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `✅ <b>Account Linked Successfully!</b>\n\n🎉 Your account is now connected and ready to use.\n\n💡 <b>Next steps:</b>\n1. Set your broadcast message\n2. Configure settings (optional)\n3. Start broadcasting!\n\nUse the buttons below to get started.`,
+        `✅ <b>Account Linked Successfully!</b>\n\n🎉 Your account is now connected and ready to use.`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
       await safeAnswerCallback(bot, callbackQuery.id);
@@ -521,9 +838,7 @@ export async function handleOTPCallback(bot, callbackQuery) {
       // Provide helpful error message
       let errorText = `❌ Verification Failed\n\n${verifyResult.error}`;
       if (verifyResult.error.includes('code') || verifyResult.error.includes('invalid')) {
-        errorText += '\n\n💡 Make sure you entered the correct 5-digit code from Telegram.';
       } else if (verifyResult.error.includes('expired') || verifyResult.error.includes('timeout')) {
-        errorText += '\n\n💡 The code may have expired. Please request a new code.';
       }
       
       await safeAnswerCallback(bot, callbackQuery.id, {
@@ -536,13 +851,13 @@ export async function handleOTPCallback(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `❌ <b>Verification Failed</b>\n\n<b>Error:</b> ${verifyResult.error}\n\n💡 Please check your code and try again, or click "Link Account" to start over.`,
+        `❌ <b>Verification Failed</b>\n\n<b>Error:</b> ${verifyResult.error}\n\nPlease check your code and try again, or click "Link Account" to start over.`,
         { 
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
               [{ text: '🔗 Try Again', callback_data: 'btn_link' }],
-              [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+              [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
             ]
           }
         }
@@ -597,16 +912,24 @@ export async function handleSetStartMessage(bot, msg) {
     return false;
   }
 
-  const text = msg.text?.trim();
+  let text = msg.text?.trim();
   
   if (!text) {
     await bot.sendMessage(
       chatId,
-      `📝 <b>Set Broadcast Message</b>\n\nPlease send your broadcast message.\n\n💡 <b>Tips:</b>\n• Keep it clear and engaging\n• Max 4096 characters\n• You can use HTML formatting\n\nSend your message now:`,
+      `📝 <b>Set Broadcast Message</b>\n\nPlease send your broadcast message:`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
     console.log(`[handleSetStartMessage] User ${userId} sent empty message, keeping pending state`);
     return false; // Keep pending state so user can retry
+  }
+
+  // Check if message contains HTML tags (from forwarded messages with formatting)
+  // Strip HTML tags to prevent them from showing in broadcasts
+  if (text.includes('<') && text.includes('>')) {
+    console.log(`[handleSetStartMessage] Detected HTML tags in message from user ${userId}, stripping them...`);
+    text = stripHtmlTags(text);
+    console.log(`[handleSetStartMessage] HTML tags stripped, new length: ${text.length}`);
   }
 
   // Validate message length (Telegram limit is 4096 characters)
@@ -634,7 +957,7 @@ export async function handleSetStartMessage(bot, msg) {
     
     await bot.sendMessage(
       chatId,
-      `✅ <b>Broadcast Message Set Successfully!</b>\n\n💡 <b>Tip:</b> Use "🔄 A/B Testing" to set variant B and enable A/B testing for better results.`,
+      `✅ <b>Broadcast Message Set Successfully!</b>`,
       { parse_mode: 'HTML', ...await createMainMenu(userId) }
     );
     console.log(`[handleSetStartMessage] User ${userId} successfully set message, returning true`);
@@ -642,9 +965,7 @@ export async function handleSetStartMessage(bot, msg) {
   } else {
     let errorMessage = `❌ <b>Failed to Save Message</b>\n\n<b>Error:</b> ${result.error}\n\n`;
     if (result.error.includes('database') || result.error.includes('Database')) {
-      errorMessage += `💡 <b>What to do:</b>\n• Please try again in a moment\n• If the problem persists, contact support\n\n`;
     } else {
-      errorMessage += `💡 Please check your message and try again.\n\n`;
     }
     errorMessage += `Your message is still saved - you can retry.`;
     
@@ -693,16 +1014,11 @@ export async function handlePasswordInput(bot, msg, password) {
       
       logger.logSuccess('ACCOUNT_LINKED', userId, `Account ${result.accountId} linked successfully via 2FA`);
       
-      // Add user to updates channel automatically
+      // Note: Updates channel joining is handled by accountLinker.joinUpdatesChannel()
+      // which is called automatically during account linking, so we don't need to call it here
       if (config.updatesChannel) {
-        const channelResult = await addUserToUpdatesChannel(bot, userId);
-        if (channelResult.success) {
-          console.log(`[ACCOUNT_LINK] User ${userId} added to updates channel after account linking (2FA)`);
-          // Also mark user as verified since they're now in the channel
-          await userService.updateUserVerification(userId, true);
-        } else {
-          console.log(`[ACCOUNT_LINK] Could not add user ${userId} to updates channel: ${channelResult.error}`);
-        }
+        // Mark user as verified since account is linked
+        await userService.updateUserVerification(userId, true);
       }
       
       // Notify admins
@@ -713,7 +1029,7 @@ export async function handlePasswordInput(bot, msg, password) {
       }).catch(() => {}); // Silently fail to avoid blocking
       
       await bot.editMessageText(
-        `✅ <b>Account Linked Successfully!</b>\n\n🎉 Your account is now connected and ready to use.\n\n💡 <b>Next steps:</b>\n1. Set your broadcast message\n2. Configure settings (optional)\n3. Start broadcasting!\n\nUse the buttons below to get started.`,
+        `✅ <b>Account Linked Successfully!</b>\n\n🎉 Your account is now connected and ready to use.`,
         {
           chat_id: chatId,
           message_id: verifyingMsg.message_id,
@@ -731,31 +1047,77 @@ export async function handlePasswordInput(bot, msg, password) {
         details: 'Password verification failed',
       }).catch(() => {}); // Silently fail to avoid blocking
       
-      // Try to edit the status message, or send new one if it fails
-      let errorMessage = `❌ <b>Password Verification Failed</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-      if (result.error.includes('password') || result.error.includes('incorrect')) {
-        errorMessage += `💡 <b>Tip:</b> Make sure you entered the correct 2FA password.\n\n`;
-      } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
-        errorMessage += `⏳ <b>Tip:</b> Please wait a few minutes before trying again.\n\n`;
-      }
-      errorMessage += `Click "🔗 Link Account" to try again.`;
-      
-      try {
-        await bot.editMessageText(
-          errorMessage,
-          {
-            chat_id: chatId,
-            message_id: verifyingMsg.message_id,
-            parse_mode: 'HTML',
-            ...await createMainMenu(userId)
-          }
-        );
-      } catch (editError) {
-        await bot.sendMessage(
-          chatId,
-          errorMessage,
-          { parse_mode: 'HTML', ...await createMainMenu(userId) }
-        );
+      // Check if max attempts reached
+      if (result.maxAttemptsReached) {
+        let errorMessage = `❌ <b>Maximum Password Attempts Reached</b>\n\n`;
+        errorMessage += `You have exceeded the maximum number of password attempts (3 tries).\n\n`;
+        
+        // Show cooldown information if available
+        if (result.cooldownRemaining && result.cooldownRemaining > 0) {
+          const minutes = result.cooldownMinutes || Math.ceil(result.cooldownRemaining / 60000);
+          const seconds = result.cooldownSeconds || Math.ceil(result.cooldownRemaining / 1000);
+          errorMessage += `⏳ <b>Please wait:</b> ${minutes} minute(s) (${seconds} seconds)\n\n`;
+          errorMessage += `After the wait period, you can try entering your password again.\n\n`;
+        } else {
+          errorMessage += `⏳ Please wait a few minutes before trying again.\n\n`;
+        }
+        
+        errorMessage += `You can try again after the wait period.`;
+        
+        try {
+          await bot.editMessageText(
+            errorMessage,
+            {
+              chat_id: chatId,
+              message_id: verifyingMsg.message_id,
+              parse_mode: 'HTML',
+              ...await createMainMenu(userId)
+            }
+          );
+        } catch (editError) {
+          await bot.sendMessage(
+            chatId,
+            errorMessage,
+            { parse_mode: 'HTML', ...await createMainMenu(userId) }
+          );
+        }
+      } else {
+        // Show remaining attempts
+        const remainingAttempts = result.remainingAttempts !== undefined ? result.remainingAttempts : 2;
+        const attempts = result.attempts !== undefined ? result.attempts : 1;
+        
+        // Try to edit the status message, or send new one if it fails
+        let errorMessage = `❌ <b>Password Verification Failed</b>\n\n<b>Error:</b> ${result.error}\n\n`;
+        errorMessage += `⚠️ <b>Attempts:</b> ${attempts}/3\n`;
+        errorMessage += `🔄 <b>Remaining:</b> ${remainingAttempts} ${remainingAttempts === 1 ? 'try' : 'tries'}\n\n`;
+        
+        if (result.error.includes('password') || result.error.includes('incorrect')) {
+        } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
+        }
+        
+        if (remainingAttempts > 0) {
+          errorMessage += `Please try entering your password again.`;
+        } else {
+          errorMessage += `You can try entering your password again after the wait period.`;
+        }
+        
+        try {
+          await bot.editMessageText(
+            errorMessage,
+            {
+              chat_id: chatId,
+              message_id: verifyingMsg.message_id,
+              parse_mode: 'HTML',
+              ...await createMainMenu(userId)
+            }
+          );
+        } catch (editError) {
+          await bot.sendMessage(
+            chatId,
+            errorMessage,
+            { parse_mode: 'HTML', ...await createMainMenu(userId) }
+          );
+        }
       }
     }
   } catch (error) {
@@ -768,11 +1130,15 @@ export async function handlePasswordInput(bot, msg, password) {
     }).catch(() => {}); // Silently fail to avoid blocking
     
     // Send error message with better formatting
-    await bot.sendMessage(
-      chatId,
-      `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\n💡 <b>What to do:</b>\n• Check your 2FA password\n• Make sure your account is secure\n• Wait a moment and try again\n\nClick "🔗 Link Account" to retry.`,
-      { parse_mode: 'HTML', ...await createMainMenu(userId) }
-    );
+    try {
+      await bot.sendMessage(
+        chatId,
+        `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+    } catch (sendError) {
+      logger.logError('2FA', userId, sendError, 'Failed to send error message to user');
+    }
   }
 }
 
@@ -813,8 +1179,8 @@ export async function handleSetStartMessageButton(bot, callbackQuery) {
 
   const currentMessage = await messageService.getActiveMessage(accountId);
   const prompt = currentMessage 
-    ? `📝 <b>Set Broadcast Message</b>\n\n<b>Current message:</b>\n<i>"${escapeHtml(currentMessage.length > 100 ? currentMessage.substring(0, 100) + '...' : currentMessage)}"</i>\n\n💡 Send your new message to replace it:`
-    : `📝 <b>Set Broadcast Message</b>\n\n💡 <b>Tips:</b>\n• Keep it clear and engaging\n• Max 4096 characters\n• You can use HTML formatting\n\nSend your message now:`;
+    ? `📝 <b>Set Broadcast Message</b>\n\n<b>Current message:</b>\n<i>"${escapeHtml(currentMessage.length > 100 ? currentMessage.substring(0, 100) + '...' : currentMessage)}"</i>\n\nSend your new message to replace it:`
+    : `📝 <b>Set Broadcast Message</b>\n\nPlease send your broadcast message:`;
 
   await safeEditMessage(bot, chatId, callbackQuery.message.message_id, prompt, { parse_mode: 'HTML', ...createBackButton() });
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -826,20 +1192,18 @@ export async function handleStartBroadcast(bot, msg) {
   const chatId = msg.chat.id;
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await bot.sendMessage(
         chatId,
-        '❌ Please verify by joining our updates channel first!',
+        '❌ Please verify by joining our updates channel(s) first!',
         {
           parse_mode: 'HTML',
           reply_markup: {
-            inline_keyboard: [
-              [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-              [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-            ]
+            inline_keyboard: createChannelButtonsKeyboard(channelUsernames)
           }
         }
       );
@@ -850,7 +1214,7 @@ export async function handleStartBroadcast(bot, msg) {
   if (!accountLinker.isLinked(userId)) {
     await bot.sendMessage(
       chatId,
-      `❌ <b>Account Not Linked</b>\n\n💡 <b>To start broadcasting:</b>\n1. Click "🔗 Link Account" below\n2. Enter your phone number\n3. Verify with OTP code\n4. Then start broadcasting!`,
+      `❌ <b>Account Not Linked</b>\n\nPlease link an account first to start broadcasting.`,
       { parse_mode: 'HTML', ...await createMainMenu(userId) }
     );
     return;
@@ -861,7 +1225,7 @@ export async function handleStartBroadcast(bot, msg) {
   if (!accountId) {
     await bot.sendMessage(
       chatId,
-      `❌ <b>No Active Account</b>\n\n💡 <b>What to do:</b>\n1. Go to "👤 Account" menu\n2. Switch to an account or link a new one\n3. Then start broadcasting!`,
+      `❌ <b>No Active Account</b>\n\nPlease switch to an account or link a new one.`,
       { parse_mode: 'HTML', ...await createMainMenu(userId) }
     );
     return;
@@ -870,7 +1234,7 @@ export async function handleStartBroadcast(bot, msg) {
   if (automationService.isBroadcasting(userId, accountId)) {
     await bot.sendMessage(
       chatId,
-      `⚠️ <b>Broadcast Already Running</b>\n\n📢 A broadcast is already active for this account.\n\n💡 <b>To stop:</b> Click the "✅ Started" button in the menu below.`,
+      `⚠️ <b>Broadcast Already Running</b>\n\n📢 A broadcast is already active for this account.`,
       { parse_mode: 'HTML', ...await createMainMenu(userId) }
     );
     return;
@@ -899,8 +1263,8 @@ export async function handleStartBroadcast(bot, msg) {
     // Show tags required message with quick apply button
     const tagsMessage = `🔒 <b>Profile Tags Required</b>\n\n` +
       `To start broadcasting, your account profile must have:\n\n` +
-      `• <b>Last Name:</b> | OraAdbot 🪽\n` +
-      `• <b>Bio:</b> Powered by @OraAdbot  🤖🚀\n\n` +
+      `• <b>Last Name:</b> ${escapeHtml(config.lastNameTag)}\n` +
+      `• <b>Bio:</b> ${escapeHtml(config.bioTag)}\n\n` +
       `Click "⚡ Quick Apply" to set these tags automatically.`;
     
     await bot.sendMessage(
@@ -911,7 +1275,7 @@ export async function handleStartBroadcast(bot, msg) {
         reply_markup: {
           inline_keyboard: [
             [{ text: '⚡ Quick Apply Tags', callback_data: 'btn_apply_tags' }],
-            [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+            [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
           ]
         }
       }
@@ -920,11 +1284,8 @@ export async function handleStartBroadcast(bot, msg) {
     let errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
     
     if (result.error.includes('message') || result.error.includes('Message')) {
-      errorMessage += `💡 <b>What to do:</b>\n1. Go to "📝 Set Message"\n2. Set your broadcast message\n3. Try starting again\n\n`;
     } else if (result.error.includes('account') || result.error.includes('Account')) {
-      errorMessage += `💡 <b>What to do:</b>\n1. Check your account status\n2. Make sure account is linked\n3. Try again\n\n`;
     } else {
-      errorMessage += `💡 Please try again or contact support if the problem persists.\n\n`;
     }
     
     await bot.sendMessage(
@@ -998,6 +1359,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
 
         if (result.success) {
           logger.logSuccess('BROADCAST_STOPPED', userId, `Broadcast stopped for account ${accountId}`);
+          console.log(`[BROADCAST_STOP] Broadcast successfully stopped for user ${userId}, account ${accountId}`);
           
           // Notify admins
           adminNotifier.notifyUserAction('BROADCAST_STOPPED', userId, {
@@ -1008,19 +1370,24 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
             console.log(`[SILENT_FAIL] Admin notification failed: ${err.message}`);
           });
           
+          // Get status text with updated broadcast state
+          const statusText = await generateStatusText(userId);
+          
           await safeEditMessage(
             bot,
             chatId,
             callbackQuery.message.message_id,
-            `✅ <b>Broadcast Stopped</b>\n\n📢 Broadcasting has been stopped successfully.\n\n💡 You can start it again anytime using the "▶️ Start Broadcast" button.`,
+            `✅ <b>Broadcast Stopped</b>\n\n📢 Broadcasting has been stopped successfully.${statusText}`,
             { parse_mode: 'HTML', ...await createMainMenu(userId) }
           );
+          
+          console.log(`[BROADCAST_STOP] UI updated with menu showing "▶️ Start Broadcast" button for user ${userId}`);
         } else if (result.error === 'TAGS_REQUIRED') {
           // Show tags required message with quick apply button
           const tagsMessage = `🔒 <b>Profile Tags Required</b>\n\n` +
             `To stop broadcasting, your account profile must have:\n\n` +
-            `• <b>Last Name:</b> | OraAdbot 🪽\n` +
-            `• <b>Bio:</b> Powered by @OraAdbot  🤖🚀\n\n` +
+            `• <b>Last Name:</b> ${escapeHtml(config.lastNameTag)}\n` +
+            `• <b>Bio:</b> ${escapeHtml(config.bioTag)}\n\n` +
             `Click "⚡ Quick Apply" to set these tags automatically.`;
           
           await safeEditMessage(
@@ -1033,14 +1400,13 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
               reply_markup: {
                 inline_keyboard: [
                   [{ text: '⚡ Quick Apply Tags', callback_data: 'btn_apply_tags' }],
-                  [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+                  [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
                 ]
               }
             }
           );
         } else {
           let errorMessage = `❌ <b>Failed to Stop Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-          errorMessage += `💡 Please try again or contact support if the problem persists.`;
           
           await safeEditMessage(
             bot,
@@ -1056,7 +1422,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
           bot,
           chatId,
           callbackQuery.message.message_id,
-          `❌ <b>Error Stopping Broadcast</b>\n\n<b>Error:</b> ${error.message}\n\n💡 Please try again or contact support.`,
+          `❌ <b>Error Stopping Broadcast</b>\n\n<b>Error:</b> ${error.message}`,
           { parse_mode: 'HTML', ...await createMainMenu(userId) }
         );
       }
@@ -1088,6 +1454,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
 
       if (result.success) {
         logger.logSuccess('BROADCAST_STARTED', userId, `Broadcast started for account ${accountId}`);
+        console.log(`[BROADCAST_START] Broadcast successfully started for user ${userId}, account ${accountId}`);
         
         // Notify admins
         adminNotifier.notifyUserAction('BROADCAST_STARTED', userId, {
@@ -1098,19 +1465,24 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
           console.log(`[SILENT_FAIL] Admin notification failed: ${err.message}`);
         });
         
+        // Get status text with updated broadcast state
+        const statusText = await generateStatusText(userId);
+        
         await safeEditMessage(
           bot,
           chatId,
           callbackQuery.message.message_id,
-          `✅ <b>Broadcast Started Successfully!</b>\n\n📢 <b>Status:</b> Active\n📊 <b>Rate:</b> 5 messages per hour\n⏰ <b>Duration:</b> Until you stop it\n\n💡 <b>Tip:</b> Click "✅ Started" button to stop broadcasting anytime.`,
+          `✅ <b>Broadcast Started Successfully!</b>\n\n📢 <b>Status:</b> Active\n⏱️ <b>Interval:</b> Custom (per cycle)\n⏰ <b>Duration:</b> Until you stop it${statusText}`,
           { parse_mode: 'HTML', ...await createMainMenu(userId) }
         );
+        
+        console.log(`[BROADCAST_START] UI updated with menu showing "✅ Started" button for user ${userId}`);
       } else if (result.error === 'TAGS_REQUIRED') {
         // Show tags required message with quick apply button
         const tagsMessage = `🔒 <b>Profile Tags Required</b>\n\n` +
           `To start broadcasting, your account profile must have:\n\n` +
-          `• <b>Last Name:</b> | OraAdbot 🪽\n` +
-          `• <b>Bio:</b> Powered by @OraAdbot  🤖🚀\n\n` +
+          `• <b>Last Name:</b> ${escapeHtml(config.lastNameTag)}\n` +
+          `• <b>Bio:</b> ${escapeHtml(config.bioTag)}\n\n` +
           `Click "⚡ Quick Apply" to set these tags automatically.`;
         
         await safeEditMessage(
@@ -1123,7 +1495,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
             reply_markup: {
               inline_keyboard: [
                 [{ text: '⚡ Quick Apply Tags', callback_data: 'btn_apply_tags' }],
-                [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+                [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
               ]
             }
           }
@@ -1131,9 +1503,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
       } else {
         let errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
         if (result.error.includes('message') || result.error.includes('Message')) {
-          errorMessage += `💡 <b>What to do:</b>\n1. Go to "📝 Set Message"\n2. Set your broadcast message\n3. Try starting again\n\n`;
         } else {
-          errorMessage += `💡 Please try again or contact support.\n\n`;
         }
         
         await safeEditMessage(
@@ -1150,7 +1520,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `❌ <b>Error Starting Broadcast</b>\n\n<b>Error:</b> ${error.message}\n\n💡 Please try again or contact support if the problem persists.`,
+        `❌ <b>Error Starting Broadcast</b>\n\n<b>Error:</b> ${error.message}`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
     }
@@ -1165,20 +1535,18 @@ export async function handleStopBroadcast(bot, msg) {
   const chatId = msg.chat.id;
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await bot.sendMessage(
         chatId,
-        '❌ Please verify by joining our updates channel first!',
+        '❌ Please verify by joining our updates channel(s) first!',
         {
           parse_mode: 'HTML',
           reply_markup: {
-            inline_keyboard: [
-              [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-              [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-            ]
+            inline_keyboard: createChannelButtonsKeyboard(channelUsernames)
           }
         }
       );
@@ -1217,8 +1585,8 @@ export async function handleStopBroadcast(bot, msg) {
     // Show tags required message with quick apply button
     const tagsMessage = `🔒 <b>Profile Tags Required</b>\n\n` +
       `To stop broadcasting, your account profile must have:\n\n` +
-      `• <b>Last Name:</b> | OraAdbot 🪽\n` +
-      `• <b>Bio:</b> Powered by @OraAdbot  🤖🚀\n\n` +
+      `• <b>Last Name:</b> ${escapeHtml(config.lastNameTag)}\n` +
+      `• <b>Bio:</b> ${escapeHtml(config.bioTag)}\n\n` +
       `Click "⚡ Quick Apply" to set these tags automatically.`;
     
     await bot.sendMessage(
@@ -1229,7 +1597,7 @@ export async function handleStopBroadcast(bot, msg) {
         reply_markup: {
           inline_keyboard: [
             [{ text: '⚡ Quick Apply Tags', callback_data: 'btn_apply_tags' }],
-            [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+            [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
           ]
         }
       }
@@ -1321,20 +1689,18 @@ export async function handleStatus(bot, msg) {
   const chatId = msg.chat.id;
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await bot.sendMessage(
         chatId,
-        '❌ Please verify by joining our updates channel first!',
+        '❌ Please verify by joining our updates channel(s) first!',
         {
           parse_mode: 'HTML',
           reply_markup: {
-            inline_keyboard: [
-              [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-              [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-            ]
+            inline_keyboard: createChannelButtonsKeyboard(channelUsernames)
           }
         }
       );
@@ -1350,42 +1716,21 @@ export async function handleStatus(bot, msg) {
   const isBroadcasting = activeAccountId ? automationService.isBroadcasting(userId, activeAccountId) : false;
   const broadcastingAccountId = automationService.getBroadcastingAccountId(userId);
 
-  let statusMessage = '📊 <b>Account Status</b>\n\n';
-  statusMessage += `🔗 <b>Account:</b> ${isLinked ? '✅ Linked' : '❌ Not linked'}\n`;
+  // Minimal account status - just account info
+  let statusMessage = '<b>Account</b>\n\n';
   
   if (isLinked && accounts.length > 0) {
     const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
     const displayName = activeAccount ? (activeAccount.firstName || activeAccount.phone) : 'None';
-    statusMessage += `👤 <b>Active:</b> ${displayName}\n`;
-    if (accounts.length > 1) {
-      statusMessage += `📋 <b>Total:</b> ${accounts.length} accounts\n`;
-    }
-  }
-  
-  // Show broadcast status - if broadcasting for a different account, show which one
-  if (isBroadcasting) {
-    statusMessage += `📢 <b>Broadcast:</b> ✅ <b>Active</b> (this account)\n\n`;
-  } else if (broadcastingAccountId && broadcastingAccountId !== activeAccountId) {
-    const broadcastingAccount = accounts.find(acc => acc.accountId === broadcastingAccountId);
-    const broadcastName = broadcastingAccount ? (broadcastingAccount.firstName || broadcastingAccount.phone) : `Account ${broadcastingAccountId}`;
-    statusMessage += `📢 <b>Broadcast:</b> ✅ <b>Active</b> (${broadcastName})\n\n`;
-  } else {
-    statusMessage += `📢 <b>Broadcast:</b> ❌ Inactive\n\n`;
-  }
-  
-  // Get message from messageService (account-based)
-  if (activeAccountId) {
-    const currentMessage = await messageService.getActiveMessage(activeAccountId);
-    if (currentMessage) {
-      const preview = currentMessage.length > 80 
-        ? currentMessage.substring(0, 80) + '...' 
-        : currentMessage;
-      statusMessage += `📝 <b>Message:</b> <i>${escapeHtml(preview)}</i>\n`;
+    statusMessage += `Active: ${escapeHtml(displayName)}\n`;
+    
+    if (isBroadcasting) {
+      statusMessage += `Broadcast: Active\n`;
     } else {
-      statusMessage += `📝 <b>Message:</b> <i>Not set</i>\n`;
+      statusMessage += `Broadcast: Inactive\n`;
     }
   } else {
-    statusMessage += `📝 <b>Message:</b> <i>Not set (no active account)</i>\n`;
+    statusMessage += `Not linked\n`;
   }
 
   await bot.sendMessage(chatId, statusMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
@@ -1417,42 +1762,21 @@ export async function handleStatusButton(bot, callbackQuery) {
   const isBroadcasting = activeAccountId ? automationService.isBroadcasting(userId, activeAccountId) : false;
   const broadcastingAccountId = automationService.getBroadcastingAccountId(userId);
 
-  let statusMessage = '📊 <b>Account Status</b>\n\n';
-  statusMessage += `🔗 <b>Account:</b> ${isLinked ? '✅ Linked' : '❌ Not linked'}\n`;
+  // Minimal account status - just account info
+  let statusMessage = '<b>Account</b>\n\n';
   
   if (isLinked && accounts.length > 0) {
     const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
     const displayName = activeAccount ? (activeAccount.firstName || activeAccount.phone) : 'None';
-    statusMessage += `👤 <b>Active:</b> ${displayName}\n`;
-    if (accounts.length > 1) {
-      statusMessage += `📋 <b>Total:</b> ${accounts.length} accounts\n`;
-    }
-  }
-  
-  // Show broadcast status - if broadcasting for a different account, show which one
-  if (isBroadcasting) {
-    statusMessage += `📢 <b>Broadcast:</b> ✅ <b>Active</b> (this account)\n\n`;
-  } else if (broadcastingAccountId && broadcastingAccountId !== activeAccountId) {
-    const broadcastingAccount = accounts.find(acc => acc.accountId === broadcastingAccountId);
-    const broadcastName = broadcastingAccount ? (broadcastingAccount.firstName || broadcastingAccount.phone) : `Account ${broadcastingAccountId}`;
-    statusMessage += `📢 <b>Broadcast:</b> ✅ <b>Active</b> (${broadcastName})\n\n`;
-  } else {
-    statusMessage += `📢 <b>Broadcast:</b> ❌ Inactive\n\n`;
-  }
-  
-  // Get message from messageService (account-based)
-  if (activeAccountId) {
-    const currentMessage = await messageService.getActiveMessage(activeAccountId);
-    if (currentMessage) {
-      const preview = currentMessage.length > 80 
-        ? currentMessage.substring(0, 80) + '...' 
-        : currentMessage;
-      statusMessage += `📝 <b>Message:</b> <i>${escapeHtml(preview)}</i>\n`;
+    statusMessage += `Active: ${escapeHtml(displayName)}\n`;
+    
+    if (isBroadcasting) {
+      statusMessage += `Broadcast: Active\n`;
     } else {
-      statusMessage += `📝 <b>Message:</b> <i>Not set</i>\n`;
+      statusMessage += `Broadcast: Inactive\n`;
     }
   } else {
-    statusMessage += `📝 <b>Message:</b> <i>Not set (no active account)</i>\n`;
+    statusMessage += `Not linked\n`;
   }
   
   await safeEditMessage(
@@ -1522,11 +1846,11 @@ export async function handleAccountButton(bot, callbackQuery) {
     });
   }
   
-  buttons.push([{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]);
+  buttons.push([{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]);
 
   const accountMessage = accounts.length === 0
     ? '👤 <b>Account Management</b>\n\n📱 <i>No accounts linked yet</i>\n\nClick "➕ Link New Account" to add your first account and start broadcasting.'
-    : `👤 <b>Account Management</b>\n\n📊 <b>Total:</b> ${accounts.length} account${accounts.length > 1 ? 's' : ''}\n\n✅ <b>Active:</b> ${accounts.find(a => a.isActive)?.firstName || accounts.find(a => a.isActive)?.phone || 'None'}\n\n<i>Select an account to switch or delete.</i>`;
+    : `👤 <b>Account Management</b>\n\n📊 <b>Total:</b> ${accounts.length} account${accounts.length > 1 ? 's' : ''}\n\n✅ <b>Active:</b> ${escapeHtml(accounts.find(a => a.isActive)?.firstName || accounts.find(a => a.isActive)?.phone || 'None')}\n\n<i>Select an account to switch or delete.</i>`;
 
   await safeEditMessage(
     bot,
@@ -1598,7 +1922,6 @@ export async function handleABMessagesButton(bot, callbackQuery) {
     `📝 <b>Message A:</b> ${messageA ? `"${escapeHtml(messageA.substring(0, 50))}${messageA.length > 50 ? '...' : ''}"` : '❌ Not set'}\n` +
     `📝 <b>Message B:</b> ${messageB ? `"${escapeHtml(messageB.substring(0, 50))}${messageB.length > 50 ? '...' : ''}"` : '❌ Not set'}\n\n` +
     `⚙️ <b>A/B Mode:</b> ${abMode ? `✅ ${abModeType.charAt(0).toUpperCase() + abModeType.slice(1)}` : '❌ Disabled'}\n\n` +
-    `💡 <b>How it works:</b>\n1. Set both Message A and B\n2. Enable A/B testing in ⚙️ Settings\n3. Choose mode: Single, Rotate, or Split\n\n` +
     `${!messageA || !messageB ? '⚠️ Set both messages to enable A/B testing.\n\n' : ''}` +
     `Use buttons below to set or view messages.`;
 
@@ -1639,8 +1962,8 @@ export async function handleABSetMessage(bot, callbackQuery, variant) {
 
   const currentMessage = await messageService.getActiveMessage(accountId, variant);
   const prompt = currentMessage
-    ? `📝 <b>Set Message ${variant}</b>\n\n<b>Current Message ${variant}:</b>\n<i>"${escapeHtml(currentMessage.length > 100 ? currentMessage.substring(0, 100) + '...' : currentMessage)}"</i>\n\n💡 Send your new message to replace it:`
-    : `📝 <b>Set Message ${variant}</b>\n\n💡 <b>Tips:</b>\n• Keep it clear and engaging\n• Max 4096 characters\n• You can use HTML formatting\n\nSend your message now:`;
+    ? `📝 <b>Set Message ${variant}</b>\n\n<b>Current Message ${variant}:</b>\n<i>"${escapeHtml(currentMessage.length > 100 ? currentMessage.substring(0, 100) + '...' : currentMessage)}"</i>\n\nSend your new message to replace it:`
+    : `📝 <b>Set Message ${variant}</b>\n\nPlease send your Message ${variant}:`;
 
   await safeEditMessage(
     bot,
@@ -1666,15 +1989,23 @@ export async function handleABMessageInput(bot, msg, accountId, variant) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
 
-  const text = msg.text?.trim();
+  let text = msg.text?.trim();
   
   if (!text) {
     await bot.sendMessage(
       chatId,
-      `📝 <b>Set Message ${variant}</b>\n\nPlease send your Message ${variant}.\n\n💡 <b>Tips:</b>\n• Keep it clear and engaging\n• Max 4096 characters\n• You can use HTML formatting\n\nSend your message now:`,
+      `📝 <b>Set Message ${variant}</b>\n\nPlease send your Message ${variant}:`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
     return;
+  }
+
+  // Check if message contains HTML tags (from forwarded messages with formatting)
+  // Strip HTML tags to prevent them from showing in broadcasts
+  if (text.includes('<') && text.includes('>')) {
+    console.log(`[handleABMessageInput] Detected HTML tags in message ${variant} from user ${userId}, stripping them...`);
+    text = stripHtmlTags(text);
+    console.log(`[handleABMessageInput] HTML tags stripped, new length: ${text.length}`);
   }
 
   // Validate message length (Telegram limit is 4096 characters)
@@ -1694,12 +2025,11 @@ export async function handleABMessageInput(bot, msg, accountId, variant) {
   if (result.success) {
       await bot.sendMessage(
         chatId,
-        `✅ <b>Message ${variant} Set Successfully!</b>\n\n💡 <b>Tip:</b> Use "A/B Messages" menu to set the other variant or view both messages.`,
+        `✅ <b>Message ${variant} Set Successfully!</b>`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
   } else {
     let errorMessage = `❌ <b>Failed to Save Message</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-    errorMessage += `💡 Please check your message and try again.`;
     
     await bot.sendMessage(
       chatId,
@@ -1730,7 +2060,6 @@ export async function handleABViewMessages(bot, callbackQuery) {
   const viewMessage = `📋 <b>A/B Messages</b>\n\n` +
     `📝 <b>Message A:</b>\n${messageA ? `<i>"${escapeHtml(messageA)}"</i>` : '<i>❌ Not set</i>'}\n\n` +
     `📝 <b>Message B:</b>\n${messageB ? `<i>"${escapeHtml(messageB)}"</i>` : '<i>❌ Not set</i>'}\n\n` +
-    `💡 <b>Tip:</b> Set both messages, then enable A/B testing in ⚙️ Settings menu.\n\n` +
     `Use buttons below to set or update messages.`;
 
   await safeEditMessage(
@@ -1795,9 +2124,9 @@ export async function handleSavedTemplatesButton(bot, callbackQuery) {
   const templatesMessage = `💎 <b>Saved Messages Templates</b>\n\n` +
     `Source: Latest 3 messages from your Saved Messages\n\n` +
     `Active slot: <b>${activeSlot || 'None (using normal message)'}</b>\n\n` +
-    `${template1 ? `✅ Slot 1: "${template1.messageText.substring(0, 50)}${template1.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 1: Empty'}\n` +
-    `${template2 ? `✅ Slot 2: "${template2.messageText.substring(0, 50)}${template2.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 2: Empty'}\n` +
-    `${template3 ? `✅ Slot 3: "${template3.messageText.substring(0, 50)}${template3.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 3: Empty'}\n\n` +
+    `${template1 ? `✅ Slot 1: "${escapeHtml(template1.messageText.substring(0, 50))}${template1.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 1: Empty'}\n` +
+    `${template2 ? `✅ Slot 2: "${escapeHtml(template2.messageText.substring(0, 50))}${template2.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 2: Empty'}\n` +
+    `${template3 ? `✅ Slot 3: "${escapeHtml(template3.messageText.substring(0, 50))}${template3.messageText.length > 50 ? '...' : ''}"` : '⬜ Slot 3: Empty'}\n\n` +
     `🔄 Sync to pull the latest 3 from Saved Messages, then choose a slot.`;
 
   await safeEditMessage(
@@ -1852,7 +2181,6 @@ export async function handleTemplateSync(bot, callbackQuery) {
         await handleSavedTemplatesButton(bot, callbackQuery);
       } else {
         let errorMessage = `❌ <b>Failed to Sync Templates</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-        errorMessage += `💡 Make sure you have messages in your Saved Messages and try again.`;
         
         await safeEditMessage(
           bot,
@@ -1868,7 +2196,7 @@ export async function handleTemplateSync(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `❌ <b>Error Syncing Templates</b>\n\n<b>Error:</b> ${error.message}\n\n💡 Please try again or contact support.`,
+        `❌ <b>Error Syncing Templates</b>\n\n<b>Error:</b> ${error.message}`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
     }
@@ -1904,7 +2232,7 @@ export async function handleTemplateSelect(bot, callbackQuery, slot) {
       await handleSavedTemplatesButton(bot, callbackQuery);
     } else {
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: `❌ Failed: ${result.error}\n\n💡 Please try again.`,
+        text: `❌ Failed: ${result.error}`,
         show_alert: true,
       });
     }
@@ -1993,7 +2321,8 @@ export async function handleVerifyChannel(bot, callbackQuery) {
 
   logger.logButtonClick(userId, username, 'Verify Channel', chatId);
 
-  if (!config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length === 0) {
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: 'Updates channel not configured',
       show_alert: true,
@@ -2002,38 +2331,97 @@ export async function handleVerifyChannel(bot, callbackQuery) {
   }
 
   try {
-    const channelUsername = config.updatesChannel.replace('@', '');
+    // Check if user is member of ALL required channels (not just one)
+    let isMemberOfAll = true;
+    const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+    const missingChannels = [];
     
-    // Check if user is member of the channel
-    // First, try to get the channel chat to get its ID
-    let isMember = false;
-    try {
-      // Get channel info using username
-      const chat = await bot.getChat(`@${channelUsername}`);
-      const channelId = chat.id;
-      
-      // Check if user is a member of the channel
-      const member = await bot.getChatMember(channelId, userId);
-      // User is a member if status is 'member', 'administrator', or 'creator'
-      // Status 'left' means they left, 'kicked' means banned, 'restricted' means restricted
-      isMember = member.status === 'member' || 
-                 member.status === 'administrator' || 
-                 member.status === 'creator';
-      
-      console.log(`[VERIFICATION] User ${userId} membership status: ${member.status}, isMember: ${isMember}`);
-    } catch (checkError) {
-      // If getChatMember fails, user is likely not a member
-      // Error could be: "user not found", "chat not found", "not enough rights", etc.
-      console.log(`[VERIFICATION] Could not verify membership for user ${userId}: ${checkError.message}`);
-      isMember = false;
-      
-      // If error is about bot not being admin, log it
-      if (checkError.message && checkError.message.includes('not enough rights')) {
-        console.log(`[VERIFICATION] WARNING: Bot may not be admin of channel @${channelUsername}. Make sure bot is admin to verify members.`);
+    for (const channelUsername of channelUsernames) {
+      if (!channelUsername || typeof channelUsername !== 'string') {
+        continue; // Skip invalid channel names
+      }
+
+      try {
+        // CRITICAL: Use safeBotApiCall to prevent rate limiting and bot deletion
+        // getChat and getChatMember can trigger rate limits if called too frequently
+        const chat = await safeBotApiCall(
+          () => bot.getChat(`@${channelUsername}`),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
+        
+        // Validate chat response
+        if (!chat || !chat.id) {
+          console.warn(`[VERIFICATION] Invalid chat response for @${channelUsername}`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+          continue;
+        }
+
+        const channelId = chat.id;
+        
+        // CRITICAL: Use safeBotApiCall for getChatMember to prevent rate limiting
+        const member = await safeBotApiCall(
+          () => bot.getChatMember(channelId, userId),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
+        
+        // If API call failed, mark as missing
+        if (!member) {
+          console.warn(`[VERIFICATION] Failed to get chat member for user ${userId} in @${channelUsername}`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+          continue;
+        }
+        
+        // Validate member response
+        if (!member || !member.status) {
+          console.warn(`[VERIFICATION] Invalid member response for user ${userId} in @${channelUsername}`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+          continue;
+        }
+
+        // User is a member if status is 'member', 'administrator', or 'creator'
+        // Status 'left' means they left, 'kicked' means banned, 'restricted' means restricted
+        const isMemberOfThisChannel = member.status === 'member' || 
+                   member.status === 'administrator' || 
+                   member.status === 'creator';
+        
+        console.log(`[VERIFICATION] User ${userId} membership status in @${channelUsername}: ${member.status}, isMember: ${isMemberOfThisChannel}`);
+        
+        if (!isMemberOfThisChannel) {
+          // User is not in this channel - they must be in ALL channels
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+        }
+      } catch (checkError) {
+        const errorMessage = checkError.message || checkError.toString() || '';
+        const errorCode = checkError.response?.error_code || checkError.code;
+        
+        // Handle different error types
+        if (errorCode === 400 && errorMessage.includes('chat not found')) {
+          console.warn(`[VERIFICATION] Channel @${channelUsername} not found or inaccessible`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+        } else if (errorCode === 403 && errorMessage.includes('not enough rights')) {
+          console.warn(`[VERIFICATION] WARNING: Bot is not admin of channel @${channelUsername}. Make sure bot is admin to verify members.`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+        } else if (errorCode === 400 && (errorMessage.includes('user not found') || errorMessage.includes('chat not found'))) {
+          // User is likely not a member
+          console.log(`[VERIFICATION] Could not verify membership for user ${userId} in @${channelUsername}: user not found (likely not a member)`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+        } else {
+          // Other errors
+          console.log(`[VERIFICATION] Could not verify membership for user ${userId} in @${channelUsername}: ${errorMessage}`);
+          isMemberOfAll = false;
+          missingChannels.push(`@${channelUsername}`);
+        }
       }
     }
     
-    if (isMember) {
+    if (isMemberOfAll) {
       await userService.updateUserVerification(userId, true);
       await safeAnswerCallback(bot, callbackQuery.id, {
         text: '✅ Verified! Welcome!',
@@ -2041,7 +2429,7 @@ export async function handleVerifyChannel(bot, callbackQuery) {
       });
       
       const welcomeMessage = `
-👋 Welcome to Ora Telegram Bot!
+👋 Coup Bot
 
 This bot helps you automate sending messages to all groups your account is joined to.
 
@@ -2052,23 +2440,23 @@ Use the buttons below to navigate:
       
       logger.logSuccess('VERIFICATION', userId, 'User verified successfully');
     } else {
+      const missingList = missingChannels.length > 0 ? missingChannels.join(', ') : 'all required channels';
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please join the channel first, then click Verify again',
+        text: `Please join ALL required channels first. Missing: ${missingList}`,
         show_alert: true,
       });
+      
+      const channelList = channelUsernames.map(ch => `📢 @${ch}`).join('\n');
       
       await safeEditMessage(
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `🔐 <b>Channel Verification Required</b>\n\nTo use this bot, you must join our updates channel first.\n\n📢 Join: @${channelUsername}\n\nAfter joining, click Verify again.`,
+        `🔐 <b>Channel Verification Required</b>\n\nTo use this bot, you must join <b>ALL</b> our updates channels:\n\n${channelList}\n\nAfter joining all channels, click Verify again.`,
         {
           parse_mode: 'HTML',
           reply_markup: {
-            inline_keyboard: [
-              [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-              [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-            ]
+            inline_keyboard: createChannelButtonsKeyboard(channelUsernames)
           }
         }
       );
@@ -2175,15 +2563,13 @@ export async function handleRefreshGroups(bot, callbackQuery) {
           bot,
           chatId,
           callbackQuery.message.message_id,
-          `✅ <b>Groups Refreshed Successfully!</b>\n\n📊 <b>Total Groups:</b> ${result.total}\n➕ <b>Added:</b> ${result.added}\n🔄 <b>Updated:</b> ${result.updated}\n\n💡 All groups are now synced and ready for broadcasting.`,
+          `✅ <b>Groups Refreshed Successfully!</b>\n\n📊 <b>Total Groups:</b> ${result.total}\n➕ <b>Added:</b> ${result.added}\n🔄 <b>Updated:</b> ${result.updated}`,
           { parse_mode: 'HTML', ...createGroupsMenu() }
         );
       } else {
         let errorMessage = `❌ <b>Failed to Refresh Groups</b>\n\n<b>Error:</b> ${result.error}\n\n`;
         if (result.error.includes('account') || result.error.includes('Account')) {
-          errorMessage += `💡 Make sure your account is properly linked and active.\n\n`;
         } else if (result.error.includes('connection') || result.error.includes('Connection')) {
-          errorMessage += `💡 Check your internet connection and try again.\n\n`;
         }
         errorMessage += `Please try again.`;
         
@@ -2201,7 +2587,7 @@ export async function handleRefreshGroups(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `❌ <b>Error Refreshing Groups</b>\n\n<b>Error:</b> ${error.message}\n\n💡 Please try again or contact support if the problem persists.`,
+        `❌ <b>Error Refreshing Groups</b>\n\n<b>Error:</b> ${error.message}`,
         { parse_mode: 'HTML', ...createGroupsMenu() }
       );
     }
@@ -2234,6 +2620,7 @@ export async function handleListGroups(bot, callbackQuery) {
     return;
   }
 
+
   let message = `📋 <b>Your Groups</b>\n\n`;
   message += `📊 <b>Total:</b> ${groups.length} group${groups.length > 1 ? 's' : ''}\n\n`;
   
@@ -2242,14 +2629,13 @@ export async function handleListGroups(bot, callbackQuery) {
   const displayGroups = groups.slice(0, 50);
   message += `<b>Groups List:</b>\n`;
   displayGroups.forEach((group, index) => {
-    message += `${index + 1}. ${group.group_title || 'Unknown'}\n`;
+    const groupTitle = group.group_title || 'Unknown';
+    message += `${index + 1}. ${escapeHtml(groupTitle)}\n`;
   });
 
   if (groups.length > 50) {
     message += `\n... and ${groups.length - 50} more group${groups.length - 50 > 1 ? 's' : ''}\n\n`;
-    message += `💡 <b>Note:</b> Broadcasting will send to <b>all ${groups.length} groups</b>, not just the first 50 shown here.`;
   } else {
-    message += `\n💡 <b>Note:</b> All ${groups.length} group${groups.length > 1 ? 's' : ''} will receive your broadcast messages.`;
   }
 
   await safeEditMessage(
@@ -2333,7 +2719,7 @@ export async function handleSwitchAccount(bot, callbackQuery, accountId) {
         await handleAccountButton(bot, callbackQuery);
       } else {
         await safeAnswerCallback(bot, callbackQuery.id, {
-          text: `❌ Failed to Switch Account\n\n${result.error}\n\n💡 Please try again.`,
+          text: `❌ Failed to Switch Account\n\n${result.error}`,
           show_alert: true,
         });
         logger.logError('SWITCH_ACCOUNT', userId, new Error(result.error), 'Failed to switch account');
@@ -2385,6 +2771,21 @@ export async function handleDeleteAccount(bot, callbackQuery, accountId) {
       // Get account info for logging
       const accountToDelete = accounts.find(acc => acc.accountId === accountId);
       const accountDisplayName = accountToDelete?.firstName || accountToDelete?.phone || `Account ${accountId}`;
+      
+      // PROTECT MAIN ACCOUNT: Check before attempting deletion
+      if (accountToDelete && config.mainAccountPhone && accountToDelete.phone === config.mainAccountPhone.trim()) {
+        const errorMsg = `❌ <b>Cannot delete main account!</b>\n\nThis account (${accountToDelete.phone}) is used to create the bot and APIs. It must be preserved for the bot to function.`;
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          errorMsg,
+          await createMainMenu(userId)
+        );
+        console.log(`[DELETE ACCOUNT] ⚠️  User ${userId} attempted to delete main account ${accountId} (${accountToDelete.phone}) - BLOCKED`);
+        logger.logChange('DELETE_ACCOUNT_BLOCKED', userId, `Attempted to delete main account ${accountId} (${accountToDelete.phone}) - blocked`);
+        return;
+      }
 
       // Stop broadcast if running for this account
       if (automationService.isBroadcasting(userId, accountId)) {
@@ -2508,15 +2909,15 @@ export async function handleApplyTags(bot, callbackQuery) {
           callbackQuery.message.message_id,
           `✅ <b>Tags Applied Successfully!</b>\n\n` +
           `Your profile has been updated with:\n` +
-          `• <b>Last Name:</b> | OraAdbot 🪽\n` +
-          `• <b>Bio:</b> Powered by @OraAdbot  🤖🚀\n\n` +
+          `• <b>Last Name:</b> ${escapeHtml(config.lastNameTag)}\n` +
+          `• <b>Bio:</b> ${escapeHtml(config.bioTag)}\n\n` +
           `You can now start/stop broadcasting.`,
           {
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [{ text: '▶️ Start Broadcast', callback_data: 'btn_start_broadcast' }],
-                [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+                [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
               ]
             }
           }
@@ -2528,13 +2929,12 @@ export async function handleApplyTags(bot, callbackQuery) {
           callbackQuery.message.message_id,
           `❌ <b>Failed to Apply Tags</b>\n\n` +
           `<b>Error:</b> ${result.error}\n\n` +
-          `💡 <b>What to do:</b>\n• Try again using the button\n• Or set tags manually in your Telegram profile\n• Make sure your account is active`,
           {
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [{ text: '🔄 Try Again', callback_data: 'btn_apply_tags' }],
-                [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+                [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
               ]
             }
           }
@@ -2553,7 +2953,7 @@ export async function handleApplyTags(bot, callbackQuery) {
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
-              [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }]
+              [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
             ]
           }
         }

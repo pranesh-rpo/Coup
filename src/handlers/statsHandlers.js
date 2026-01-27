@@ -13,13 +13,37 @@ import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
 import { createBackButton, createMainMenu } from './keyboardHandler.js';
 
 // Helper function to show verification required
-async function showVerificationRequired(bot, chatId, channelUsername) {
+// Helper function to create channel buttons keyboard
+function createChannelButtonsKeyboard(channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Create buttons: Verify button on first row, then one button per channel
+  const keyboard = [
+    [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }]
+  ];
+  
+  // Add one button per channel
+  for (const channelUsername of channels) {
+    keyboard.push([{ text: `📢 Join @${channelUsername}`, url: `https://t.me/${channelUsername}` }]);
+  }
+  
+  return keyboard;
+}
+
+async function showVerificationRequired(bot, chatId, channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Build channel list text
+  const channelList = channels.map(ch => `📢 @${ch}`).join('\n');
+  
   const verificationMessage = `
 🔐 <b>Channel Verification Required</b>
 
-To use this bot, you must join our updates channel first.
+To use this bot, you must join our updates channel(s) first.
 
-📢 Join: @${channelUsername}
+${channelList}
 
 After joining, click the "✅ Verify" button below.
   `;
@@ -27,10 +51,7 @@ After joining, click the "✅ Verify" button below.
   return await bot.sendMessage(chatId, verificationMessage, {
     parse_mode: 'HTML',
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-        [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-      ]
+      inline_keyboard: createChannelButtonsKeyboard(channels)
     }
   });
 }
@@ -43,15 +64,16 @@ export async function handleStatsButton(bot, callbackQuery) {
   logger.logButtonClick(userId, username, 'Statistics', chatId);
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
+        text: 'Please verify by joining our updates channel(s) first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
@@ -105,7 +127,7 @@ export async function handleStatsButton(bot, callbackQuery) {
           { text: '⚠️ Problems', callback_data: 'stats_problematic' },
           { text: '🔄 A/B Results', callback_data: 'stats_ab' }
         ],
-        [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }],
+        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
       ],
     },
   };

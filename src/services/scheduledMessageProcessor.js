@@ -65,8 +65,9 @@ class ScheduledMessageProcessor {
           const accountId = scheduledMessage.account_id;
           
           // Get user ID for this account from database
+          // SQLite uses ? placeholders
           const accountQuery = await db.query(
-            'SELECT user_id FROM accounts WHERE account_id = $1',
+            'SELECT user_id FROM accounts WHERE account_id = ?',
             [accountId]
           );
           

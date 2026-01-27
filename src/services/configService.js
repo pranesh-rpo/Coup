@@ -39,7 +39,7 @@ class ConfigService {
       const row = result.rows[0];
       return {
         manualInterval: row.manual_interval,
-        dailyCap: row.daily_cap || 50,
+        dailyCap: row.daily_cap || 1500,
         dailySent: row.daily_sent || 0,
         capResetDate: row.cap_reset_date,
         quietStart: row.quiet_start,
@@ -58,9 +58,9 @@ class ConfigService {
   }
 
   /**
-   * Update manual interval (rate limit preset)
+   * Update manual interval (custom interval)
    * @param {number} accountId - Account ID
-   * @param {number|null} intervalMinutes - Interval in minutes (null for default)
+   * @param {number|null} intervalMinutes - Interval in minutes (minimum 11, null for default)
    */
   async setManualInterval(accountId, intervalMinutes) {
     try {
@@ -69,61 +69,41 @@ class ConfigService {
         [intervalMinutes, accountId]
       );
       
-      const preset = this.intervalToPreset(intervalMinutes);
-      logger.logChange('CONFIG', accountId, `Manual interval set to ${intervalMinutes || 'default'} minutes (preset: ${preset})`);
+      logger.logChange('CONFIG', accountId, `Custom interval set to ${intervalMinutes || 'default (11 min)'} minutes`);
       
-      return { success: true, preset };
+      return { success: true };
     } catch (error) {
-      logger.logError('CONFIG', accountId, error, 'Failed to set manual interval');
+      logger.logError('CONFIG', accountId, error, 'Failed to set custom interval');
       throw error;
     }
   }
 
   /**
-   * Set rate limit preset
+   * Set custom interval (replaces rate limit preset)
    * @param {number} accountId - Account ID
-   * @param {string} preset - '1', '3', '5', 'default', or 'custom'
+   * @param {number} intervalMinutes - Interval in minutes (minimum 11)
    */
-  async setRateLimitPreset(accountId, preset) {
-    let intervalMinutes = null;
+  async setCustomInterval(accountId, intervalMinutes) {
+    const minIntervalMinutes = 11;
     
-    switch (preset) {
-      case '1':
-        intervalMinutes = 60; // 1 message/hour
-        break;
-      case '3':
-        intervalMinutes = 20; // 3 messages/hour
-        break;
-      case '5':
-        intervalMinutes = 12; // 5 messages/hour
-        break;
-      case 'default':
-        intervalMinutes = null; // Use default (12 minutes)
-        break;
-      default:
-        return { success: false, error: 'Invalid preset' };
+    // Validate minimum interval
+    if (intervalMinutes < minIntervalMinutes) {
+      return { 
+        success: false, 
+        error: `Minimum interval is ${minIntervalMinutes} minutes. Please enter a value of ${minIntervalMinutes} or higher.` 
+      };
+    }
+    
+    // Validate reasonable maximum (e.g., 1440 minutes = 24 hours)
+    const maxIntervalMinutes = 1440;
+    if (intervalMinutes > maxIntervalMinutes) {
+      return { 
+        success: false, 
+        error: `Maximum interval is ${maxIntervalMinutes} minutes (24 hours). Please enter a lower value.` 
+      };
     }
     
     return await this.setManualInterval(accountId, intervalMinutes);
-  }
-
-  /**
-   * Convert interval to preset name
-   */
-  intervalToPreset(intervalMinutes) {
-    if (intervalMinutes === null || intervalMinutes === undefined) {
-      return 'default';
-    }
-    if (intervalMinutes <= 12) {
-      return '5'; // 5 messages/hour
-    }
-    if (intervalMinutes <= 20) {
-      return '3'; // 3 messages/hour
-    }
-    if (intervalMinutes >= 60) {
-      return '1'; // 1 message/hour
-    }
-    return 'custom';
   }
 
   /**
@@ -158,8 +138,9 @@ class ConfigService {
    */
   async setQuietHours(accountId, startTime, endTime) {
     try {
+      // SQLite uses ? placeholders
       await db.query(
-        'UPDATE accounts SET quiet_start = $1, quiet_end = $2, updated_at = CURRENT_TIMESTAMP WHERE account_id = $3',
+        'UPDATE accounts SET quiet_start = ?, quiet_end = ?, updated_at = CURRENT_TIMESTAMP WHERE account_id = ?',
         [startTime, endTime, accountId]
       );
       
@@ -172,7 +153,7 @@ class ConfigService {
       return { success: true };
     } catch (error) {
       logger.logError('CONFIG', accountId, error, 'Failed to set quiet hours');
-      throw error;
+      return { success: false, error: error.message };
     }
   }
 
@@ -318,9 +299,10 @@ class ConfigService {
    */
   async getSchedule(accountId) {
     try {
+      // SQLite uses ? placeholders and 0/1 for booleans
       const result = await db.query(
         `SELECT * FROM schedules 
-         WHERE account_id = $1 AND is_active = TRUE 
+         WHERE account_id = ? AND is_active = 1 
          ORDER BY id DESC 
          LIMIT 1`,
         [accountId]
@@ -373,16 +355,16 @@ class ConfigService {
         return { success: false, error: 'Maximum interval must be between minimum interval and 60 minutes' };
       }
 
-      // Deactivate existing schedules
+      // Deactivate existing schedules (SQLite uses ? placeholders and 0/1 for booleans)
       await db.query(
-        'UPDATE schedules SET is_active = FALSE WHERE account_id = $1',
+        'UPDATE schedules SET is_active = 0 WHERE account_id = ?',
         [accountId]
       );
 
-      // Insert new schedule
+      // Insert new schedule (SQLite uses ? placeholders and 0/1 for booleans)
       await db.query(
         `INSERT INTO schedules (account_id, start_time, end_time, min_interval, max_interval, schedule_type, is_active)
-         VALUES ($1, $2, $3, $4, $5, 'normal', TRUE)`,
+         VALUES (?, ?, ?, ?, ?, 'normal', 1)`,
         [accountId, startTime, endTime, minInterval, maxInterval]
       );
 
@@ -401,8 +383,9 @@ class ConfigService {
    */
   async clearSchedule(accountId) {
     try {
+      // SQLite uses ? placeholders and 0/1 for booleans
       await db.query(
-        'UPDATE schedules SET is_active = FALSE WHERE account_id = $1',
+        'UPDATE schedules SET is_active = 0 WHERE account_id = ?',
         [accountId]
       );
 

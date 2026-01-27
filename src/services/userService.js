@@ -5,9 +5,10 @@ class UserService {
   async addUser(userId, username, firstName) {
     try {
       const userIdNum = typeof userId === 'string' ? parseInt(userId) : userId;
+      // SQLite uses INTEGER (0/1) for booleans
       await db.query(
         `INSERT INTO users (user_id, username, first_name, joined_at, is_verified, is_active)
-         VALUES ($1, $2, $3, CURRENT_TIMESTAMP, FALSE, TRUE)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP, 0, 1)
          ON CONFLICT (user_id) 
          DO UPDATE SET username = EXCLUDED.username, first_name = EXCLUDED.first_name`,
         [userIdNum, username || null, firstName || null]
@@ -22,8 +23,14 @@ class UserService {
   async getUser(userId) {
     try {
       const userIdNum = typeof userId === 'string' ? parseInt(userId) : userId;
-      const result = await db.query('SELECT * FROM users WHERE user_id = $1', [userIdNum]);
-      return result.rows[0] || null;
+      const result = await db.query('SELECT * FROM users WHERE user_id = ?', [userIdNum]);
+      const user = result.rows[0] || null;
+      // Convert SQLite INTEGER booleans (0/1) to JavaScript booleans
+      if (user) {
+        user.is_verified = user.is_verified === 1;
+        user.is_active = user.is_active === 1;
+      }
+      return user;
     } catch (error) {
       logError('[USER ERROR] Error getting user:', error);
       return null;
@@ -33,9 +40,11 @@ class UserService {
   async updateUserVerification(userId, isVerified) {
     try {
       const userIdNum = typeof userId === 'string' ? parseInt(userId) : userId;
+      // SQLite uses INTEGER (0/1) for booleans, not true/false
+      const isVerifiedInt = isVerified ? 1 : 0;
       await db.query(
-        'UPDATE users SET is_verified = $1 WHERE user_id = $2',
-        [isVerified, userIdNum]
+        'UPDATE users SET is_verified = ? WHERE user_id = ?',
+        [isVerifiedInt, userIdNum]
       );
       console.log(`[USER] Updated verification status for user ${userIdNum}: ${isVerified}`);
     } catch (error) {
@@ -51,7 +60,8 @@ class UserService {
 
   async getAllUserIds() {
     try {
-      const result = await db.query('SELECT user_id FROM users WHERE is_active = TRUE');
+      // SQLite uses INTEGER (0/1) for booleans
+      const result = await db.query('SELECT user_id FROM users WHERE is_active = 1');
       return result.rows.map(row => row.user_id);
     } catch (error) {
       logError('[USER ERROR] Error getting all user IDs:', error);

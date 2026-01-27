@@ -7,8 +7,18 @@ import messageManager from './services/messageManager.js';
 import adminNotifier from './services/adminNotifier.js';
 import userService from './services/userService.js';
 import automationService from './services/automationService.js';
+// Note: automationService is already imported above, using it for blockedUsers tracking
 import logger, { colors, logError } from './utils/logger.js';
 import { safeAnswerCallback } from './utils/safeEdit.js';
+import { isFloodWaitError, extractWaitTime, waitForFloodError, safeBotApiCall } from './utils/floodWaitHandler.js';
+import { validateUserId, validateAccountId, sanitizeCallbackData, validateCallbackData, sanitizeErrorMessage, adminCommandRateLimiter, verifyAccountOwnership, sanitizeString } from './utils/security.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const LOCK_FILE = path.join(__dirname, '..', '.bot.lock');
 
 // Filter out normal Telegram client connection/reconnection logs
 const originalConsoleLog = console.log;
@@ -154,11 +164,16 @@ import {
   handleTemplateSelect,
   handleTemplateClear,
   handleApplyTags,
+  handleLoginWeb,
+  handleLoginSharePhone,
+  handleSharePhoneConfirm,
+  handleLoginTypePhone,
+  handleLoginCancel,
 } from './handlers/commandHandler.js';
 import {
   handleConfigButton,
-  handleConfigRateLimit,
-  handleConfigRateLimitPreset,
+  handleConfigCustomInterval,
+  handleCustomIntervalInput,
   handleConfigQuietHours,
   handleQuietHoursSet,
   handleQuietHoursView,
@@ -183,26 +198,114 @@ import {
   handleABResults,
 } from './handlers/statsHandlers.js';
 import notificationService from './services/notificationService.js';
+import channelVerificationService from './services/channelVerificationService.js';
 import { initializeAdminBot } from './handlers/adminBotHandlers.js';
 import { createMainMenu, createBackButton } from './handlers/keyboardHandler.js';
+
+// Environment validation
+function validateEnvironment() {
+  const required = ['BOT_TOKEN', 'API_ID', 'API_HASH'];
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+  
+  // SQLite doesn't require database connection settings
+  // DB_PATH is optional (defaults to ./data/bot.db)
+  
+  console.log('✅ Environment validation passed');
+}
+
+// Process lock to prevent multiple instances
+function checkProcessLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      // Check if the process in the lock file is still running
+      const lockContent = fs.readFileSync(LOCK_FILE, 'utf8');
+      const lockData = JSON.parse(lockContent);
+      const lockPid = lockData.pid;
+      
+      try {
+        // Check if process is still running (Unix/Mac)
+        process.kill(lockPid, 0); // Signal 0 doesn't kill, just checks if process exists
+        // Process is still running - another instance exists
+        console.error('❌ Another bot instance is already running (PID: ' + lockPid + ')');
+        console.error('   Please stop the existing instance before starting a new one.');
+        console.error('   If the process is stuck, delete the lock file: ' + LOCK_FILE);
+        process.exit(1);
+      } catch (error) {
+        // Process doesn't exist - stale lock file, remove it
+        console.log('⚠️  Found stale lock file (process ' + lockPid + ' not running). Removing...');
+        fs.unlinkSync(LOCK_FILE);
+      }
+    }
+    
+    // Create lock file
+    const lockData = {
+      pid: process.pid,
+      started: new Date().toISOString()
+    };
+    fs.writeFileSync(LOCK_FILE, JSON.stringify(lockData, null, 2));
+    console.log('✅ Process lock acquired (PID: ' + process.pid + ')');
+    
+    // Clean up lock file on exit
+    const cleanupLock = () => {
+      try {
+        if (fs.existsSync(LOCK_FILE)) {
+          fs.unlinkSync(LOCK_FILE);
+          console.log('✅ Process lock released');
+        }
+      } catch (error) {
+        // Ignore errors during cleanup
+      }
+    };
+    
+    process.on('exit', cleanupLock);
+    process.on('SIGINT', cleanupLock);
+    process.on('SIGTERM', cleanupLock);
+    process.on('SIGUSR2', cleanupLock);
+    process.on('uncaughtException', (error) => {
+      cleanupLock();
+      throw error;
+    });
+  } catch (error) {
+    console.error('❌ Error managing process lock:', error);
+    process.exit(1);
+  }
+}
 
 // Initialize database, schema, and services
 (async () => {
   try {
+    // Check for process lock first
+    checkProcessLock();
+    
+    // Validate environment variables first
+    validateEnvironment();
+    
+    console.log(`🚀 Starting bot in ${process.env.NODE_ENV || 'development'} mode...`);
+    console.log(`📅 Started at: ${new Date().toISOString()}`);
+    
     // Initialize admin notifier first (for error notifications)
     await adminNotifier.initialize();
     
     // Initialize database connection
+    console.log('[INIT] Connecting to database...');
     await db.connect();
     
     // Initialize database schema
+    console.log('[INIT] Initializing database schema...');
     await initializeSchema();
     
     // Initialize message manager
+    console.log('[INIT] Initializing message manager...');
     await messageManager.initialize();
     console.log('✅ Message manager initialized');
     
     // Initialize account linker
+    console.log('[INIT] Initializing account linker...');
     await accountLinker.initialize();
     console.log('✅ Account linker initialized');
     
@@ -212,29 +315,221 @@ import { createMainMenu, createBackButton } from './handlers/keyboardHandler.js'
     }, 60 * 60 * 1000); // 1 hour
     console.log('✅ Broadcast cleanup scheduler started');
     
+    // Start periodic cleanup for anti-freeze tracking (every 6 hours)
+    setInterval(() => {
+      automationService.cleanupAntiFreezeTracking();
+    }, 6 * 60 * 60 * 1000); // 6 hours
+    console.log('✅ Anti-freeze tracking cleanup scheduler started');
+    
+    // Start periodic cleanup for blocked users (every 12 hours)
+    setInterval(() => {
+      automationService.cleanupBlockedUsers();
+    }, 12 * 60 * 60 * 1000); // 12 hours
+    console.log('✅ Blocked users cleanup scheduler started');
+    
+    // Start periodic cleanup for pending verifications (every 30 minutes)
+    setInterval(() => {
+      accountLinker.cleanupPendingVerifications();
+    }, 30 * 60 * 1000); // 30 minutes
+    console.log('✅ Pending verifications cleanup scheduler started');
+    
+    // Start memory monitoring (every hour)
+    setInterval(() => {
+      const memUsage = process.memoryUsage();
+      const memUsageMB = {
+        rss: Math.round(memUsage.rss / 1024 / 1024),
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024)
+      };
+      
+      console.log(`[MEMORY MONITOR] RSS: ${memUsageMB.rss}MB, Heap: ${memUsageMB.heapUsed}/${memUsageMB.heapTotal}MB`);
+      
+      // Warn if memory usage is very high (more than 2.5GB)
+      if (memUsageMB.rss > 2500) {
+        console.warn(`[MEMORY WARNING] High memory usage: ${memUsageMB.rss}MB. Consider restarting the bot if it exceeds 3GB.`);
+        // Try to force garbage collection if available
+        if (global.gc) {
+          console.log('[MEMORY] Running garbage collection...');
+          global.gc();
+        }
+      }
+    }, 60 * 60 * 1000); // 1 hour
+    console.log('✅ Memory monitoring started');
+    
     // Notify admins of successful startup
-    await adminNotifier.notifyEvent('BOT_STARTED', 'Bot started successfully', {});
+    await adminNotifier.notifyEvent('BOT_STARTED', 'Bot started successfully', {
+      mode: process.env.NODE_ENV || 'development',
+      timestamp: new Date().toISOString()
+    });
+    
+    console.log('✅ All services initialized successfully');
   } catch (error) {
-    logError('Error initializing services:', error);
+    logError('❌ Error initializing services:', error);
+    
+    // Check if it's a database connection error
+    const isDbError = 
+      error.message?.includes('ECONNREFUSED') ||
+      error.message?.includes('Connection refused') ||
+      error.code === 'ECONNREFUSED' ||
+      error.message?.includes('Connection terminated') ||
+      error.message?.includes('Connection closed');
+    
+    if (isDbError) {
+      console.error('');
+      console.error('═══════════════════════════════════════════════════════');
+      console.error('❌ DATABASE CONNECTION FAILED');
+      console.error('═══════════════════════════════════════════════════════');
+      console.error('');
+      console.error('The bot cannot connect to SQLite database.');
+      console.error('');
+      console.error('Troubleshooting steps:');
+      console.error('1. Check if the database directory exists and is writable:');
+      console.error('   mkdir -p ./data');
+      console.error('   chmod 755 ./data');
+      console.error('');
+      console.error('2. Verify database path in .env file (optional):');
+      console.error('   DB_PATH=./data/bot.db (defaults to ./data/bot.db if not set)');
+      console.error('');
+      console.error('3. Check file permissions:');
+      console.error('   ls -la ./data/bot.db');
+      console.error('');
+      console.error('═══════════════════════════════════════════════════════');
+      console.error('');
+    }
+    
     // Send startup error to admins
     await adminNotifier.notifyStartupError(error).catch(() => {
       // Silently fail if admin notifier isn't configured
     });
-    process.exit(1);
+    
+    console.error('❌ Failed to start bot. Exiting...');
+    
+    // For database errors, exit with code 2 to distinguish from other errors
+    // PM2 can be configured to not restart on exit code 2
+    process.exit(isDbError ? 2 : 1);
   }
 })();
 
-    // Initialize bot
-const bot = new TelegramBot(config.botToken, { polling: true });
+// Initialize bot with polling (autoStart: false so we can delete webhook first)
+const bot = new TelegramBot(config.botToken, { 
+  polling: {
+    interval: 300, // Polling interval in milliseconds
+    autoStart: false, // We'll start after deleting webhook if needed
+    params: {
+      timeout: 10, // Long polling timeout in seconds
+      allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member']
+    }
+  }
+});
+
+// Delete any existing webhook before starting polling
+(async () => {
+  try {
+    // Use safeBotApiCall to handle potential floodwait errors during startup
+    await safeBotApiCall(
+      () => bot.deleteWebHook({ drop_pending_updates: false }),
+      { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+    );
+    console.log('✅ Deleted any existing webhook');
+  } catch (error) {
+    // Check if it's a floodwait error
+    if (isFloodWaitError(error)) {
+      const waitSeconds = extractWaitTime(error);
+      console.warn(`[FLOOD_WAIT] ⚠️ Rate limited while deleting webhook. Waiting ${waitSeconds + 1}s...`);
+      await waitForFloodError(error, 1);
+      // Retry once
+      try {
+        await bot.deleteWebHook({ drop_pending_updates: false });
+        console.log('✅ Deleted any existing webhook (after retry)');
+      } catch (retryError) {
+        console.log('ℹ️ No existing webhook to delete (or error deleting):', retryError.message);
+      }
+    } else {
+      // Ignore other errors - webhook might not exist
+      console.log('ℹ️ No existing webhook to delete (or error deleting):', error.message);
+    }
+  }
+  
+  // Start polling
+  try {
+    await bot.startPolling();
+    console.log('✅ Polling started');
+  } catch (error) {
+    // Check if it's a floodwait error during polling start
+    if (isFloodWaitError(error)) {
+      const waitSeconds = extractWaitTime(error);
+      console.error(`[FLOOD_WAIT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s before retry...`);
+      await waitForFloodError(error, 1);
+      // Retry starting polling
+      await bot.startPolling();
+      console.log('✅ Polling started (after retry)');
+    } else {
+      throw error; // Re-throw non-floodwait errors
+    }
+  }
+})();
 
 // Initialize notification service
 notificationService.setBot(bot);
+
+// Initialize channel verification service (monitors users leaving channels)
+channelVerificationService.initialize(bot);
+console.log('✅ Channel verification service initialized');
 
 // Initialize admin bot (pass main bot instance for admin broadcasts)
 initializeAdminBot(bot);
 console.log('✅ Admin bot initialized');
 
-console.log('🤖 Bot is running...');
+// Handle chat_member updates (when users leave/join channels) - for polling mode
+bot.on('chat_member', async (msg) => {
+  try {
+    const chatMemberUpdate = msg;
+    const chat = chatMemberUpdate.chat;
+    const newMember = chatMemberUpdate.new_chat_member;
+    const oldMember = chatMemberUpdate.old_chat_member;
+    const user = newMember?.user || chatMemberUpdate.from;
+    
+    if (chat && user && newMember && oldMember) {
+      const chatId = chat.id;
+      const userId = user.id;
+      const newStatus = newMember.status;
+      const oldStatus = oldMember.status;
+      
+      // Check if user left the channel (status changed to 'left' or 'kicked')
+      const userLeft = (newStatus === 'left' || newStatus === 'kicked') && 
+                       (oldStatus === 'member' || oldStatus === 'administrator' || oldStatus === 'creator');
+      
+      if (userLeft) {
+        // Check if this is a channel (negative ID means channel/supergroup)
+        const isChannel = chatId < 0;
+        
+        if (isChannel) {
+          // Get channel username
+          const channelUsername = chat.username;
+          
+          // Check if this is one of the required updates channels
+          const updatesChannels = config.getUpdatesChannels();
+          if (updatesChannels.length > 0) {
+            const channelUsernames = updatesChannels.map(ch => ch.replace('@', '').toLowerCase());
+            const normalizedUsername = channelUsername ? channelUsername.toLowerCase() : null;
+            
+            if (normalizedUsername && channelUsernames.includes(normalizedUsername)) {
+              // User left a required channel - process in background
+              channelVerificationService.handleUserLeftChannel(userId, channelUsername).catch(error => {
+                console.error(`[CHANNEL_LEAVE] Error handling user leave:`, error.message);
+              });
+            }
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // Log error but don't block update processing
+    console.error('[CHANNEL_LEAVE] Error processing chat_member update:', error.message);
+  }
+});
+
+console.log('🤖 Bot is running with polling...');
 
 // Store pending inputs
 const pendingPhoneNumbers = new Set();
@@ -243,6 +538,7 @@ const pendingPasswords = new Set();
 const pendingQuietHoursInputs = new Map(); // userId -> { accountId, type: 'start' | 'end' }
 const pendingABMessages = new Map(); // userId -> { accountId, variant: 'A' | 'B' }
 const pendingScheduleInputs = new Map(); // userId -> { accountId, type: 'schedule' }
+const pendingCustomIntervalInputs = new Map(); // userId -> { accountId }
 
 // Set the reference in commandHandler so it can set pending state when redirecting to link
 setPendingPhoneNumbersReference(pendingPhoneNumbers);
@@ -362,15 +658,36 @@ let lastAdminBroadcast = null;
 bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
   await ensureUserStored(msg);
   
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
+  const userId = validateUserId(msg.from?.id);
+  if (!userId) {
+    console.log('[ADMIN_BROADCAST] Invalid user ID');
+    return;
+  }
+  
+  const chatId = msg.chat?.id;
+  if (!chatId) {
+    console.log('[ADMIN_BROADCAST] Invalid chat ID');
+    return;
+  }
 
   console.log(`[ADMIN_BROADCAST] Command received from user ${userId}`);
 
-  // Check if user is admin
+  // SECURITY: Check if user is admin
   if (!isAdmin(userId)) {
     console.log(`[ADMIN_BROADCAST] Unauthorized access attempt from user ${userId}`);
     await bot.sendMessage(chatId, '❌ You are not authorized to use this command.');
+    return;
+  }
+
+  // SECURITY: Rate limiting for admin commands
+  const rateLimit = adminCommandRateLimiter.checkRateLimit(userId, 5, 60000); // 5 commands per minute
+  if (!rateLimit.allowed) {
+    console.log(`[ADMIN_BROADCAST] Rate limit exceeded for user ${userId}`);
+    await bot.sendMessage(
+      chatId,
+      `⏳ Rate limit exceeded. Please wait ${Math.ceil(rateLimit.resetIn / 1000)} seconds before trying again.`,
+      { parse_mode: 'HTML' }
+    );
     return;
   }
 
@@ -398,21 +715,14 @@ bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
       { parse_mode: 'HTML' }
     );
 
-    // Get ALL users from ALL tables that might have user_id
-    // This includes: users, accounts, logs, audit_logs, pending_verifications
-    // This way we can find users even if the users table was cleared
+    // CRITICAL: Only send to users who have actually interacted with the bot
+    // Telegram ToS prohibits sending unsolicited messages to users who haven't started the bot
+    // ONLY include users from 'users' table (users who have used /start)
+    // DO NOT include users from 'accounts' table - they may have linked accounts without using /start
+    // DO NOT send to users from logs/audit_logs/pending_verifications as they may have never interacted
+    // This is CRITICAL to prevent bot deletion by Telegram for ToS violations
     const allUsersQuery = `
-      SELECT DISTINCT user_id FROM (
-        SELECT user_id FROM users
-        UNION
-        SELECT user_id FROM accounts WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM logs WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM audit_logs WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM pending_verifications WHERE user_id IS NOT NULL
-      ) AS all_users
+      SELECT DISTINCT user_id FROM users
       ORDER BY user_id
     `;
     
@@ -437,25 +747,98 @@ bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
       return;
     }
 
-    console.log(`[ADMIN_BROADCAST] Starting broadcast to ${userIds.length} users (found from all tables: users, accounts, logs, audit_logs, pending_verifications)`);
+    console.log(`[ADMIN_BROADCAST] Starting broadcast to ${userIds.length} users (only users who have interacted with bot)`);
     let successCount = 0;
     let failedCount = 0;
 
-    // Send message to each user
+    // CRITICAL: Rate limiting for admin broadcasts
+    // Telegram allows ~30 messages/second, but we use ULTRA-CONSERVATIVE limits to prevent bot deletion
+    // Reduced to 10 messages/minute (1 per 6 seconds) to stay well below limits and avoid spam detection
+    const MIN_DELAY_BETWEEN_MESSAGES = 6000; // 6 seconds between messages (10 messages/minute max) - INCREASED for safety
+    const MAX_MESSAGES_PER_MINUTE = 10; // Ultra-conservative limit (reduced from 20)
+    
+    // Track messages sent in the last minute
+    const messageTimestamps = [];
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000;
+
+    // Send message to each user with proper rate limiting
     for (const targetUserId of userIds) {
       try {
-        await bot.sendMessage(targetUserId, broadcastMessage, { parse_mode: 'HTML' });
-        successCount++;
-        logger.logChange('ADMIN_BROADCAST', userId, `Sent broadcast to user ${targetUserId}`);
+        // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+        const recentMessages = messageTimestamps.filter(ts => ts > oneMinuteAgo);
+        if (recentMessages.length >= MAX_MESSAGES_PER_MINUTE) {
+          // Calculate wait time until oldest message is 1 minute old
+          const oldestMessage = Math.min(...recentMessages);
+          const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+          console.log(`[ADMIN_BROADCAST] Rate limit reached (${recentMessages.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          // Update timestamps after waiting
+          const newNow = Date.now();
+          const newOneMinuteAgo = newNow - 60000;
+          messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
+        }
+
+        // CRITICAL: Check if user has blocked the bot (prevent sending to blocked users)
+        if (automationService.blockedUsers.has(targetUserId)) {
+          const blockedInfo = automationService.blockedUsers.get(targetUserId);
+          // Re-check if blocked status is recent (within 24 hours)
+          if (blockedInfo && blockedInfo.lastChecked && (Date.now() - blockedInfo.lastChecked) < (24 * 60 * 60 * 1000)) {
+            console.log(`[ADMIN_BROADCAST] Skipping user ${targetUserId} - previously blocked`);
+            failedCount++;
+            continue;
+          }
+        }
+
+        // Use safeBotApiCall to properly handle flood waits
+        const sendResult = await safeBotApiCall(
+          () => bot.sendMessage(targetUserId, broadcastMessage, { parse_mode: 'HTML' }),
+          { maxRetries: 3, bufferSeconds: 2, throwOnFailure: false }
+        );
+
+        if (sendResult) {
+          successCount++;
+          messageTimestamps.push(Date.now());
+          logger.logChange('ADMIN_BROADCAST', userId, `Sent broadcast to user ${targetUserId}`);
+          
+          // CRITICAL: Remove from blocked list if send succeeded
+          if (automationService.blockedUsers.has(targetUserId)) {
+            automationService.blockedUsers.delete(targetUserId);
+          }
+        } else {
+          failedCount++;
+          console.log(`[ADMIN_BROADCAST] Failed to send to user ${targetUserId} after retries`);
+          logger.logError('ADMIN_BROADCAST', targetUserId, new Error('Failed after retries'), `Failed to send broadcast to user ${targetUserId}`);
+        }
       } catch (error) {
         failedCount++;
+        
+        // CRITICAL: Check if user blocked the bot
+        const errorMessage = error.message || error.toString() || '';
+        const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
+        const isBotBlocked = errorMessage.includes('bot was blocked') ||
+                            errorMessage.includes('bot blocked') ||
+                            errorMessage.includes('BLOCKED') ||
+                            errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden')) ||
+                            errorMessage.includes('chat not found');
+        
+        if (isBotBlocked) {
+          // CRITICAL: Mark user as blocked to prevent future sends
+          automationService.blockedUsers.set(targetUserId, {
+            blocked: true,
+            lastChecked: Date.now()
+          });
+          console.log(`[ADMIN_BROADCAST] User ${targetUserId} has blocked the bot - added to blocked list`);
+        }
+        
         // Log but don't stop - continue with other users
         console.log(`[ADMIN_BROADCAST] Failed to send to user ${targetUserId}: ${error.message}`);
         logger.logError('ADMIN_BROADCAST', targetUserId, error, `Failed to send broadcast to user ${targetUserId}`);
       }
 
-      // Small delay to avoid rate limiting (100ms = 10 messages/second, safer than 50ms)
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // CRITICAL: Wait at least MIN_DELAY_BETWEEN_MESSAGES between messages to avoid rate limits
+      // This ensures we never exceed Telegram's rate limits
+      await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_MESSAGES));
     }
 
     // Update status message with results
@@ -477,7 +860,9 @@ bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
   } catch (error) {
     console.error('[ADMIN_BROADCAST] Error:', error);
     logger.logError('ADMIN_BROADCAST', userId, error, 'Admin broadcast error');
-    await bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+    // SECURITY: Sanitize error message to prevent information leakage
+    const safeErrorMessage = sanitizeErrorMessage(error, false);
+    await bot.sendMessage(chatId, `❌ Error: ${safeErrorMessage}`);
   }
 });
 
@@ -509,21 +894,14 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
       { parse_mode: 'HTML' }
     );
 
-    // Get ALL users from ALL tables that might have user_id
-    // This includes: users, accounts, logs, audit_logs, pending_verifications
-    // This way we can find users even if the users table was cleared
+    // CRITICAL: Only send to users who have actually interacted with the bot
+    // Telegram ToS prohibits sending unsolicited messages to users who haven't started the bot
+    // ONLY include users from 'users' table (users who have used /start)
+    // DO NOT include users from 'accounts' table - they may have linked accounts without using /start
+    // DO NOT send to users from logs/audit_logs/pending_verifications as they may have never interacted
+    // This is CRITICAL to prevent bot deletion by Telegram for ToS violations
     const allUsersQuery = `
-      SELECT DISTINCT user_id FROM (
-        SELECT user_id FROM users
-        UNION
-        SELECT user_id FROM accounts WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM logs WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM audit_logs WHERE user_id IS NOT NULL
-        UNION
-        SELECT user_id FROM pending_verifications WHERE user_id IS NOT NULL
-      ) AS all_users
+      SELECT DISTINCT user_id FROM users
       ORDER BY user_id
     `;
     
@@ -548,24 +926,81 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
       return;
     }
 
-    console.log(`[ADMIN_BROADCAST] Resending last broadcast to ${userIds.length} users (found from all tables: users, accounts, logs, audit_logs, pending_verifications)`);
+    console.log(`[ADMIN_BROADCAST] Resending last broadcast to ${userIds.length} users (only users who have interacted with bot)`);
     let successCount = 0;
     let failedCount = 0;
 
-    // Send message to each user
+    // CRITICAL: Rate limiting for admin broadcasts
+    // Telegram allows ~30 messages/second, but we use ULTRA-CONSERVATIVE limits to prevent bot deletion
+    // Reduced to 10 messages/minute (1 per 6 seconds) to stay well below limits and avoid spam detection
+    const MIN_DELAY_BETWEEN_MESSAGES = 6000; // 6 seconds between messages (10 messages/minute max) - INCREASED for safety
+    const MAX_MESSAGES_PER_MINUTE = 10; // Ultra-conservative limit (reduced from 20)
+    
+    // Track messages sent in the last minute
+    const messageTimestamps = [];
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000;
+
+    // Send message to each user with proper rate limiting
     for (const targetUserId of userIds) {
       try {
-        await bot.sendMessage(targetUserId, lastAdminBroadcast, { parse_mode: 'HTML' });
-        successCount++;
-        logger.logChange('ADMIN_BROADCAST', userId, `Resent broadcast to user ${targetUserId}`);
-      } catch (error) {
-        failedCount++;
-        console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId}: ${error.message}`);
-        logger.logError('ADMIN_BROADCAST', targetUserId, error, `Failed to resend broadcast to user ${targetUserId}`);
-      }
+        // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+        const recentMessages = messageTimestamps.filter(ts => ts > oneMinuteAgo);
+        if (recentMessages.length >= MAX_MESSAGES_PER_MINUTE) {
+          // Calculate wait time until oldest message is 1 minute old
+          const oldestMessage = Math.min(...recentMessages);
+          const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+          console.log(`[ADMIN_BROADCAST] Rate limit reached (${recentMessages.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          // Update timestamps after waiting
+          const newNow = Date.now();
+          const newOneMinuteAgo = newNow - 60000;
+          messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
+        }
 
-      // Small delay to avoid rate limiting (100ms = 10 messages/second, safer than 50ms)
-      await new Promise(resolve => setTimeout(resolve, 100));
+        // Use safeBotApiCall to properly handle flood waits
+        const sendResult = await safeBotApiCall(
+          () => bot.sendMessage(targetUserId, lastAdminBroadcast, { parse_mode: 'HTML' }),
+          { maxRetries: 3, bufferSeconds: 2, throwOnFailure: false }
+        );
+
+        if (sendResult) {
+          successCount++;
+          messageTimestamps.push(Date.now());
+          logger.logChange('ADMIN_BROADCAST', userId, `Resent broadcast to user ${targetUserId}`);
+        } else {
+          failedCount++;
+          console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId} after retries`);
+          logger.logError('ADMIN_BROADCAST', targetUserId, new Error('Failed after retries'), `Failed to resend broadcast to user ${targetUserId}`);
+        }
+        } catch (error) {
+          failedCount++;
+          
+          // CRITICAL: Check if user blocked the bot
+          const errorMessage = error.message || error.toString() || '';
+          const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
+          const isBotBlocked = errorMessage.includes('bot was blocked') ||
+                              errorMessage.includes('bot blocked') ||
+                              errorMessage.includes('BLOCKED') ||
+                              errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden')) ||
+                              errorMessage.includes('chat not found');
+          
+          if (isBotBlocked) {
+            // CRITICAL: Mark user as blocked to prevent future sends
+            automationService.blockedUsers.set(targetUserId, {
+              blocked: true,
+              lastChecked: Date.now()
+            });
+            console.log(`[ADMIN_BROADCAST] User ${targetUserId} has blocked the bot - added to blocked list`);
+          }
+          
+          console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId}: ${error.message}`);
+          logger.logError('ADMIN_BROADCAST', targetUserId, error, `Failed to resend broadcast to user ${targetUserId}`);
+        }
+
+      // CRITICAL: Wait at least MIN_DELAY_BETWEEN_MESSAGES between messages to avoid rate limits
+      // This ensures we never exceed Telegram's rate limits
+      await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_MESSAGES));
     }
 
     // Update status message with results
@@ -627,14 +1062,36 @@ bot.on('message', async (msg) => {
   
   // Log all incoming messages for debugging
   console.log(`[MESSAGE HANDLER] User ${userId} sent message: "${msg.text?.substring(0, 50) || 'non-text'}"`);
-  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneNumbers.has(userId)}, StartMsg: ${pendingStartMessages.has(userId)}, Password: ${pendingPasswords.has(userId)}, AB: ${pendingABMessages.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}`);
+  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneNumbers.has(userId)}, StartMsg: ${pendingStartMessages.has(userId)}, Password: ${pendingPasswords.has(userId)}, AB: ${pendingABMessages.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}, CustomInterval: ${pendingCustomIntervalInputs.has(userId)}`);
+  
+  // Handle contact sharing (phone number via button)
+  if (msg.contact && msg.contact.phone_number) {
+    const phoneNumber = msg.contact.phone_number;
+    // Ensure phone number has + prefix
+    const normalizedPhone = phoneNumber.startsWith('+') ? phoneNumber : `+${phoneNumber}`;
+    logger.logChange('PHONE_SHARE', userId, 'Phone number shared via contact button');
+    
+    // Remove the keyboard
+    await bot.sendMessage(chatId, '✅ Phone number received! Processing...', {
+      reply_markup: {
+        remove_keyboard: true,
+      },
+    });
+    
+    await handlePhoneNumber(bot, msg, normalizedPhone);
+    return;
+  }
   
   if (pendingPhoneNumbers.has(userId)) {
     pendingPhoneNumbers.delete(userId);
     
+    // SECURITY: Sanitize and validate phone number input
+    const rawPhoneNumber = msg.text?.trim() || '';
+    const sanitizedPhone = sanitizeString(rawPhoneNumber, 20); // Max 20 chars for phone
+    
     // Strip all spaces and other whitespace characters from phone number
     // Users might type "+1 234 567 8900" which should be normalized to "+12345678900"
-    const phoneNumber = msg.text?.trim().replace(/\s+/g, '');
+    const phoneNumber = sanitizedPhone.replace(/\s+/g, '');
     
     // Validate phone number format (E.164: + followed by 1-15 digits)
     const phoneRegex = /^\+[1-9]\d{1,14}$/;
@@ -643,7 +1100,7 @@ bot.on('message', async (msg) => {
     } else {
       await bot.sendMessage(
         chatId,
-        '❌ Invalid phone number format. Please use international format (e.g., +1234567890 or +1 234 567 8900)\n\n💡 <b>Tip:</b> Spaces are automatically removed, just include country code.\n\nTry the "Link Account" button again.',
+        '❌ Invalid phone number format. Please use international format (e.g., +1234567890 or +1 234 567 8900)\n\nTry the "Link Account" button again.',
         { parse_mode: 'HTML', ...createMainMenu() }
       );
     }
@@ -669,17 +1126,41 @@ bot.on('message', async (msg) => {
     const { accountId, variant } = pendingData;
     pendingABMessages.delete(userId);
     await handleABMessageInput(bot, msg, accountId, variant);
-  } else if (pendingPasswords.has(userId)) {
-    pendingPasswords.delete(userId);
+  } else if (pendingPasswords.has(userId) || accountLinker.isPasswordRequired(userId)) {
+    // Only remove from pendingPasswords if password is successfully verified
+    // Keep it if verification fails so user can retry
     const password = msg.text?.trim();
     if (password) {
-      await handlePasswordInput(bot, msg, password);
+      const result = await handlePasswordInput(bot, msg, password);
+      // Only remove pending state if password was successful or max attempts/cooldown reached
+      if (result && (result.success || result.maxAttemptsReached)) {
+        pendingPasswords.delete(userId);
+      }
     } else {
       await bot.sendMessage(
         chatId,
         '❌ Please provide a valid password.\n\nTry the "Link Account" button again.',
         createMainMenu()
       );
+      // Don't remove pending state for invalid input, allow retry
+    }
+  } else if (accountLinker.isWebLoginPasswordRequired(userId)) {
+    // Check if 2FA is needed for web login
+    const notification = accountLinker.getWebLoginPasswordNotification(userId);
+    const password = msg.text?.trim();
+    
+    if (password) {
+      // User sent password, handle it
+      await handlePasswordInput(bot, msg, password);
+    } else if (notification && !notification.notified) {
+      // Notify user that 2FA password is needed (only once)
+      await bot.sendMessage(
+        notification.chatId,
+        '🔐 <b>2FA Password Required</b>\n\n✅ QR code scanned successfully!\n\n🔒 Your account has two-factor authentication enabled.\n\nPlease enter your 2FA password to complete the login:',
+        { parse_mode: 'HTML' }
+      );
+      accountLinker.markWebLoginPasswordNotified(userId);
+      addPendingStateWithTimeout(pendingPasswords, userId);
     }
   } else if (pendingQuietHoursInputs.has(userId)) {
     const pendingData = pendingQuietHoursInputs.get(userId);
@@ -703,6 +1184,22 @@ bot.on('message', async (msg) => {
     const { accountId } = pendingData;
     pendingScheduleInputs.delete(userId);
     await handleScheduleInput(bot, msg, accountId);
+  } else if (pendingCustomIntervalInputs.has(userId)) {
+    const pendingData = pendingCustomIntervalInputs.get(userId);
+    if (!pendingData || !pendingData.accountId) {
+      // Invalid state, clear it
+      pendingCustomIntervalInputs.delete(userId);
+      console.log(`[MESSAGE HANDLER] Invalid pending custom interval state for user ${userId}, cleared`);
+      return;
+    }
+    const { accountId } = pendingData;
+    const result = await handleCustomIntervalInput(bot, msg, accountId);
+    if (result === true) {
+      pendingCustomIntervalInputs.delete(userId);
+      logger.logChange('CUSTOM_INTERVAL', userId, 'Custom interval input completed');
+    } else {
+      logger.logChange('CUSTOM_INTERVAL', userId, 'Custom interval input still pending (retry needed)');
+    }
   } else {
     // Normal message not in any pending state - ignore it
     console.log(`[MESSAGE HANDLER] User ${userId} sent normal message but not in any pending state - ignoring`);
@@ -742,10 +1239,43 @@ bot.on('callback_query', async (callbackQuery) => {
   // Ensure user is stored in database (for any interaction)
   await ensureUserStored(callbackQuery);
   
+  // SECURITY: Validate and sanitize callback data
   const data = callbackQuery.data;
-  const userId = callbackQuery.from.id;
-  const username = callbackQuery.from.username || 'Unknown';
-  const chatId = callbackQuery.message.chat.id;
+  if (!validateCallbackData(data)) {
+    console.log(`[SECURITY] Invalid callback data format from user ${callbackQuery.from?.id}: ${data?.substring(0, 50)}`);
+    try {
+      await bot.answerCallbackQuery(callbackQuery.id, {
+        text: 'Invalid request. Please try again.',
+        show_alert: true,
+      });
+    } catch (e) {
+      // Ignore if callback already expired
+    }
+    return;
+  }
+  
+  const userId = validateUserId(callbackQuery.from?.id);
+  if (!userId) {
+    console.log('[SECURITY] Invalid user ID in callback query');
+    try {
+      await bot.answerCallbackQuery(callbackQuery.id);
+    } catch (e) {
+      // Ignore if callback already expired
+    }
+    return;
+  }
+  
+  const username = (callbackQuery.from?.username || 'Unknown').substring(0, 50); // Limit length
+  const chatId = callbackQuery.message?.chat?.id;
+  if (!chatId) {
+    console.log('[SECURITY] Invalid chat ID in callback query');
+    try {
+      await bot.answerCallbackQuery(callbackQuery.id);
+    } catch (e) {
+      // Ignore if callback already expired
+    }
+    return;
+  }
 
   // Log every button click (following project rules)
   const buttonName = data.startsWith('otp_') ? `OTP_${data.replace('otp_', '')}` :
@@ -804,6 +1334,10 @@ bot.on('callback_query', async (callbackQuery) => {
         pendingScheduleInputs.delete(userId);
         console.log(`[CALLBACK] Cleared pending schedule state for user ${userId}`);
       }
+      if (pendingCustomIntervalInputs.has(userId)) {
+        pendingCustomIntervalInputs.delete(userId);
+        console.log(`[CALLBACK] Cleared pending custom interval state for user ${userId}`);
+      }
       await handleMainMenu(bot, callbackQuery);
     } else if (data === 'btn_account') {
       await handleAccountButton(bot, callbackQuery);
@@ -813,6 +1347,18 @@ bot.on('callback_query', async (callbackQuery) => {
         addPendingStateWithTimeout(pendingPhoneNumbers, userId);
         logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
       }
+    } else if (data === 'btn_login_web') {
+      await handleLoginWeb(bot, callbackQuery);
+    } else if (data === 'btn_login_share_phone') {
+      await handleLoginSharePhone(bot, callbackQuery);
+    } else if (data === 'btn_login_type_phone') {
+      const result = await handleLoginTypePhone(bot, callbackQuery);
+      if (result) {
+        addPendingStateWithTimeout(pendingPhoneNumbers, userId);
+        logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
+      }
+    } else if (data === 'btn_login_cancel') {
+      await handleLoginCancel(bot, callbackQuery);
     } else if (data === 'btn_set_start_msg') {
       await handleSetStartMessageButton(bot, callbackQuery);
       addPendingStateWithTimeout(pendingStartMessages, userId);
@@ -842,11 +1388,11 @@ bot.on('callback_query', async (callbackQuery) => {
       await handleConfigButton(bot, callbackQuery);
     } else if (data === 'btn_mention') {
       await handleConfigMention(bot, callbackQuery);
-    } else if (data === 'btn_config_rate_limit') {
-      await handleConfigRateLimit(bot, callbackQuery);
-    } else if (data.startsWith('config_rate_')) {
-      const preset = data.replace('config_rate_', '');
-      await handleConfigRateLimitPreset(bot, callbackQuery, preset);
+    } else if (data === 'btn_config_custom_interval') {
+      const result = await handleConfigCustomInterval(bot, callbackQuery);
+      if (result && result.accountId) {
+        addPendingStateWithTimeout(pendingCustomIntervalInputs, userId, result);
+      }
     } else if (data === 'btn_config_quiet_hours') {
       await handleConfigQuietHours(bot, callbackQuery);
     } else if (data === 'config_quiet_set') {
@@ -925,24 +1471,50 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'stats_ab') {
       await handleABResults(bot, callbackQuery);
     } else if (data.startsWith('switch_account_')) {
-      const accountId = parseInt(data.replace('switch_account_', ''));
-      if (isNaN(accountId)) {
+      const accountIdStr = data.replace('switch_account_', '');
+      const accountId = validateAccountId(accountIdStr);
+      if (!accountId) {
         await safeAnswerCallback(bot, callbackQuery.id, {
           text: 'Invalid account ID',
           show_alert: true,
         });
         return;
       }
+      
+      // SECURITY: Verify account ownership before allowing switch
+      const ownsAccount = await verifyAccountOwnership(userId, accountId, db.query.bind(db));
+      if (!ownsAccount) {
+        console.log(`[SECURITY] User ${userId} attempted to switch to account ${accountId} they don't own`);
+        await safeAnswerCallback(bot, callbackQuery.id, {
+          text: 'Access denied. You do not own this account.',
+          show_alert: true,
+        });
+        return;
+      }
+      
       await handleSwitchAccount(bot, callbackQuery, accountId);
     } else if (data.startsWith('delete_account_')) {
-      const accountId = parseInt(data.replace('delete_account_', ''));
-      if (isNaN(accountId)) {
+      const accountIdStr = data.replace('delete_account_', '');
+      const accountId = validateAccountId(accountIdStr);
+      if (!accountId) {
         await safeAnswerCallback(bot, callbackQuery.id, {
           text: 'Invalid account ID',
           show_alert: true,
         });
         return;
       }
+      
+      // SECURITY: Verify account ownership before allowing deletion
+      const ownsAccount = await verifyAccountOwnership(userId, accountId, db.query.bind(db));
+      if (!ownsAccount) {
+        console.log(`[SECURITY] User ${userId} attempted to delete account ${accountId} they don't own`);
+        await safeAnswerCallback(bot, callbackQuery.id, {
+          text: 'Access denied. You do not own this account.',
+          show_alert: true,
+        });
+        return;
+      }
+      
       await handleDeleteAccount(bot, callbackQuery, accountId);
     } else if (data === 'stop_broadcast') {
       await handleStopCallback(bot, callbackQuery);
@@ -976,15 +1548,52 @@ bot.on('callback_query', async (callbackQuery) => {
 
 // Error handling
 bot.on('polling_error', (error) => {
-  logger.logError('POLLING', null, error, 'Telegram polling error');
+  // Check if it's a flood wait error
+  if (isFloodWaitError(error)) {
+    const waitSeconds = extractWaitTime(error);
+    if (waitSeconds !== null && waitSeconds > 0) {
+      console.error(`[FLOOD_WAIT] ⚠️ Polling error due to rate limiting. Telegram requires ${waitSeconds}s wait.`);
+      logger.logError('POLLING_FLOOD_WAIT', null, error, `Polling rate limited: ${waitSeconds}s wait required`);
+    } else {
+      console.error(`[FLOOD_WAIT] ⚠️ Polling error due to rate limiting (couldn't extract wait time).`);
+      logger.logError('POLLING_FLOOD_WAIT', null, error, 'Polling rate limited (unknown wait time)');
+    }
+  } else {
+    logger.logError('POLLING', null, error, 'Telegram polling error');
+  }
 });
 
 bot.on('error', (error) => {
-  logError('Bot error:', error);
+  // Check if it's a flood wait error
+  if (isFloodWaitError(error)) {
+    const waitSeconds = extractWaitTime(error);
+    if (waitSeconds !== null && waitSeconds > 0) {
+      console.error(`[FLOOD_WAIT] ⚠️ Bot error due to rate limiting. Telegram requires ${waitSeconds}s wait.`);
+      logger.logError('BOT_FLOOD_WAIT', null, error, `Bot rate limited: ${waitSeconds}s wait required`);
+    } else {
+      console.error(`[FLOOD_WAIT] ⚠️ Bot error due to rate limiting (couldn't extract wait time).`);
+      logger.logError('BOT_FLOOD_WAIT', null, error, 'Bot rate limited (unknown wait time)');
+    }
+  } else {
+    logError('Bot error:', error);
+  }
 });
 
 // Handle unhandled promise rejections (filter out normal Telegram client errors)
 process.on('unhandledRejection', (reason, promise) => {
+  // Check for flood wait errors first - these are critical
+  if (reason && typeof reason === 'object' && isFloodWaitError(reason)) {
+    const waitSeconds = extractWaitTime(reason);
+    if (waitSeconds !== null && waitSeconds > 0) {
+      console.error(`[FLOOD_WAIT] ⚠️ CRITICAL: Unhandled flood wait error! Telegram requires ${waitSeconds}s wait. This may cause bans if not handled properly.`);
+      logger.logError('UNHANDLED_FLOOD_WAIT', null, reason, `Unhandled flood wait: ${waitSeconds}s wait required`);
+    } else {
+      console.error(`[FLOOD_WAIT] ⚠️ CRITICAL: Unhandled flood wait error (couldn't extract wait time). This may cause bans if not handled properly.`);
+      logger.logError('UNHANDLED_FLOOD_WAIT', null, reason, 'Unhandled flood wait (unknown wait time)');
+    }
+    return; // Don't log as regular error, we've already logged it
+  }
+  
   // Filter out timeout errors from Telegram client update loop - these are normal
   if (reason && typeof reason === 'object') {
     const errorMessage = reason.message || '';
@@ -994,6 +1603,24 @@ process.on('unhandledRejection', (reason, promise) => {
     if (errorMessage === 'TIMEOUT' || 
         (errorMessage.includes('TIMEOUT') && errorStack.includes('telegram/client/updates.js'))) {
       return; // Timeout errors in update loop are expected - don't log as errors
+    }
+    
+    // Filter BinaryReader errors (recoverable MTProto errors)
+    if (errorMessage.includes('readUInt32LE') || 
+        errorMessage.includes('BinaryReader') || 
+        errorMessage.includes('Cannot read properties of undefined') ||
+        errorStack.includes('BinaryReader')) {
+      console.log(`[UNHANDLED] Suppressed recoverable MTProto BinaryReader error: ${errorMessage.substring(0, 100)}`);
+      return; // These are recoverable and don't need to crash the app
+    }
+    
+    // Filter builder.resolve errors (common MTProto update handler issue)
+    if (errorMessage.includes('builder.resolve is not a function') ||
+        errorMessage.includes('builder.resolve') ||
+        errorStack.includes('_dispatchUpdate') ||
+        errorStack.includes('_processUpdate')) {
+      console.log(`[UNHANDLED] Suppressed MTProto update handler error: ${errorMessage.substring(0, 100)}`);
+      return; // These are recoverable update processing errors
     }
     
     // Filter "Not connected" errors during reconnection
@@ -1027,6 +1654,24 @@ process.on('uncaughtException', (error) => {
     return;
   }
   
+  // Filter BinaryReader errors (recoverable MTProto errors)
+  if (errorMessage.includes('readUInt32LE') || 
+      errorMessage.includes('BinaryReader') || 
+      errorMessage.includes('Cannot read properties of undefined') ||
+      errorStack.includes('BinaryReader')) {
+    console.log(`[UNCAUGHT] Suppressed recoverable MTProto BinaryReader error: ${errorMessage.substring(0, 100)}`);
+    return; // These are recoverable and don't need to crash the app
+  }
+  
+  // Filter builder.resolve errors (common MTProto update handler issue)
+  if (errorMessage.includes('builder.resolve is not a function') ||
+      errorMessage.includes('builder.resolve') ||
+      errorStack.includes('_dispatchUpdate') ||
+      errorStack.includes('_processUpdate')) {
+    console.log(`[UNCAUGHT] Suppressed MTProto update handler error: ${errorMessage.substring(0, 100)}`);
+    return; // These are recoverable update processing errors
+  }
+  
   // Filter out connection-related errors from Telegram client - these are normal during reconnections
   // Filter "Not connected" errors during reconnection
   if (errorMessage === 'Not connected' && errorStack.includes('telegram/network/connection/Connection.js')) {
@@ -1042,31 +1687,78 @@ process.on('uncaughtException', (error) => {
   // Don't exit on uncaught exceptions - let the process continue
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down bot...');
-  bot.stopPolling();
-  try {
-    await Promise.race([
-      db.close(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('DB close timeout')), 5000))
-    ]);
-  } catch (error) {
-    console.error('Error closing database:', error);
-  }
-  process.exit(0);
-});
+// Graceful shutdown handler
+let isShuttingDown = false;
 
-process.on('SIGTERM', async () => {
-  console.log('\n🛑 Shutting down bot...');
-  bot.stopPolling();
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    console.log(`[SHUTDOWN] Already shutting down, ignoring ${signal}`);
+    return;
+  }
+  
+  isShuttingDown = true;
+  console.log(`\n🛑 Received ${signal}, initiating graceful shutdown...`);
+  
+  const shutdownTimeout = setTimeout(() => {
+    console.error('[SHUTDOWN] Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000); // 10 second timeout for forced shutdown
+  
   try {
+    // Stop polling
+    console.log('[SHUTDOWN] Stopping polling...');
+    try {
+      await bot.stopPolling({ drop_pending_updates: true });
+      console.log('[SHUTDOWN] Polling stopped');
+    } catch (error) {
+      console.error('[SHUTDOWN] Error stopping polling:', error.message);
+    }
+    
+    // Stop automation services gracefully
+    console.log('[SHUTDOWN] Cleaning up automation services...');
+    try {
+      // Cleanup any running broadcasts if needed
+      automationService.cleanupStoppedBroadcasts();
+    } catch (error) {
+      console.error('[SHUTDOWN] Error cleaning up broadcasts:', error.message);
+    }
+    
+    // Stop channel verification service
+    console.log('[SHUTDOWN] Stopping channel verification service...');
+    try {
+      channelVerificationService.stop();
+    } catch (error) {
+      console.error('[SHUTDOWN] Error stopping channel verification service:', error.message);
+    }
+    
+    // Close database connections
+    console.log('[SHUTDOWN] Closing database connections...');
     await Promise.race([
       db.close(),
       new Promise((_, reject) => setTimeout(() => reject(new Error('DB close timeout')), 5000))
     ]);
+    console.log('[SHUTDOWN] Database closed');
+    
+    // Notify admins of shutdown
+    try {
+      await adminNotifier.notifyEvent('BOT_SHUTDOWN', `Bot shutting down (${signal})`, {});
+    } catch (error) {
+      console.error('[SHUTDOWN] Error notifying admins:', error.message);
+    }
+    
+    clearTimeout(shutdownTimeout);
+    console.log('✅ Graceful shutdown completed');
+    process.exit(0);
   } catch (error) {
-    console.error('Error closing database:', error);
+    clearTimeout(shutdownTimeout);
+    console.error('[SHUTDOWN] Error during shutdown:', error);
+    process.exit(1);
   }
-  process.exit(0);
-});
+}
+
+// Handle shutdown signals
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Handle PM2 shutdown signal
+process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2'));

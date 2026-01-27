@@ -6,6 +6,7 @@
 import db from '../database/db.js';
 import logger from '../utils/logger.js';
 import accountLinker from './accountLinker.js';
+import { config } from '../config.js';
 import groupService from './groupService.js';
 
 class AutoLeaveService {
@@ -31,6 +32,25 @@ class AutoLeaveService {
 
       for (const group of inactiveGroups) {
         try {
+          // Skip updates channels - never leave them
+          // Use accountLinker's isUpdatesChannel method for robust checking
+          const userId = await this.getUserIdFromAccountId(accountId);
+          if (!userId) continue;
+
+          const client = await accountLinker.getClient(userId, accountId);
+          if (!client) continue;
+
+          // Check if this is an updates channel
+          const isUpdatesChannel = await accountLinker.isUpdatesChannel(
+            { name: group.group_title, id: group.group_id },
+            client
+          );
+          
+          if (isUpdatesChannel) {
+            console.log(`[AUTO_LEAVE] Skipping updates channel "${group.group_title}" - never leave it`);
+            continue; // Skip this group
+          }
+
           const userId = await this.getUserIdFromAccountId(accountId);
           if (!userId) continue;
 

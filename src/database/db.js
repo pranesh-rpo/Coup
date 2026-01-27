@@ -1,94 +1,196 @@
-import pg from 'pg';
-const { Pool } = pg;
+import Database from 'better-sqlite3';
 import { config } from '../config.js';
 import { logError } from '../utils/logger.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
 
-class Database {
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+class DatabaseWrapper {
   constructor() {
-    this.pool = null;
+    this.db = null;
   }
 
-  async connect() {
-    if (this.pool) {
-      return this.pool;
+  connect() {
+    if (this.db) {
+      return this.db;
     }
 
-    this.pool = new Pool({
-      host: config.dbHost,
-      port: config.dbPort,
-      database: config.dbName,
-      user: config.dbUser,
-      password: config.dbPassword,
-      ssl: config.dbSsl ? { rejectUnauthorized: false } : false,
-    });
-
-    // Test connection
     try {
-      const client = await this.pool.connect();
-      console.log('✅ Database connected successfully');
-      client.release();
+      // Use database path from config or default to ./data/bot.db
+      const dbPath = config.dbPath || path.join(__dirname, '../../data/bot.db');
+      
+      // Ensure directory exists
+      const dbDir = path.dirname(dbPath);
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+
+      this.db = new Database(dbPath);
+      
+      // Enable foreign keys
+      this.db.pragma('foreign_keys = ON');
+      
+      // Enable WAL mode for better concurrency
+      this.db.pragma('journal_mode = WAL');
+      
+      console.log('✅ SQLite database connected successfully');
+      return this.db;
     } catch (error) {
       logError('❌ Database connection error:', error);
       throw error;
     }
-
-    return this.pool;
   }
 
-  async query(text, params) {
-    if (!this.pool) {
-      await this.connect();
+  // Helper function to convert PostgreSQL placeholders ($1, $2, etc.) to SQLite placeholders (?)
+  convertPlaceholders(sql) {
+    // Replace $1, $2, etc. with ?
+    // This handles both $1 and $N patterns
+    return sql.replace(/\$(\d+)/g, '?');
+  }
+
+  // Helper to sanitize parameters for SQLite (convert booleans to integers, handle undefined)
+  sanitizeParams(params) {
+    if (!params || !Array.isArray(params)) {
+      return [];
+    }
+    return params.map(param => {
+      // Convert booleans to integers (0/1) for SQLite
+      if (typeof param === 'boolean') {
+        return param ? 1 : 0;
+      }
+      // Convert undefined to null
+      if (param === undefined) {
+        return null;
+      }
+      return param;
+    });
+  }
+
+  async query(text, params = []) {
+    if (!this.db) {
+      this.connect();
     }
     
     try {
-      return await this.pool.query(text, params);
-    } catch (error) {
-      // Check if it's a connection error that requires reconnection
-      const isConnectionError = 
-        error.code === 'ECONNREFUSED' || 
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ENOTFOUND' ||
-        error.message?.includes('Connection terminated') ||
-        error.message?.includes('Connection closed') ||
-        error.message?.includes('server closed the connection');
+      // Convert PostgreSQL-style $1, $2, etc. to SQLite ? placeholders
+      let convertedSql = this.convertPlaceholders(text);
       
-      if (isConnectionError) {
-        console.log('[DB] Connection lost, attempting reconnect...');
-        logError('[DB] Connection error detected:', error);
+      // Handle RETURNING clause (SQLite doesn't support RETURNING, use lastInsertRowid instead)
+      const hasReturning = /RETURNING\s+\w+/i.test(convertedSql);
+      let returningColumn = null;
+      if (hasReturning) {
+        // Extract the column name from RETURNING clause
+        const returningMatch = convertedSql.match(/RETURNING\s+(\w+)/i);
+        returningColumn = returningMatch ? returningMatch[1] : 'id';
         
-        // Reset pool to force reconnection
-        try {
-          if (this.pool) {
-            await this.pool.end();
-          }
-        } catch (endError) {
-          // Ignore errors when ending pool
-        }
-        this.pool = null;
-        
-        // Reconnect
-        await this.connect();
-        
-        // Retry query once
-        try {
-          return await this.pool.query(text, params);
-        } catch (retryError) {
-          logError('[DB] Query retry failed after reconnect:', retryError);
-          throw retryError;
-        }
+        // Remove RETURNING clause for SQLite
+        convertedSql = convertedSql.replace(/\s+RETURNING\s+\w+/i, '');
       }
       
-      // For other errors, throw as-is
+      const stmt = this.db.prepare(convertedSql);
+      const sanitizedParams = this.sanitizeParams(params);
+      
+      // Handle different query types
+      const upperText = convertedSql.trim().toUpperCase();
+      
+      if (upperText.startsWith('SELECT') || upperText.startsWith('WITH')) {
+        if (sanitizedParams && sanitizedParams.length > 0) {
+          const result = stmt.all(sanitizedParams);
+          return { rows: result, rowCount: result.length };
+        } else {
+          const result = stmt.all();
+          return { rows: result, rowCount: result.length };
+        }
+      } else if (upperText.startsWith('INSERT') || upperText.startsWith('UPDATE') || upperText.startsWith('DELETE')) {
+        if (sanitizedParams && sanitizedParams.length > 0) {
+          const result = stmt.run(sanitizedParams);
+          
+          // If INSERT had RETURNING clause, query back to get the row
+          if (hasReturning && upperText.startsWith('INSERT') && result.lastInsertRowid && returningColumn) {
+            const tableMatch = convertedSql.match(/INSERT\s+INTO\s+(\w+)/i);
+            if (tableMatch) {
+              const tableName = tableMatch[1];
+              try {
+                const selectStmt = this.db.prepare(`SELECT * FROM ${tableName} WHERE ${returningColumn} = ?`);
+                const row = selectStmt.get(result.lastInsertRowid);
+                return {
+                  rows: row ? [row] : [],
+                  rowCount: result.changes,
+                  insertId: result.lastInsertRowid
+                };
+              } catch (selectError) {
+                // If select fails, just return insertId
+                return {
+                  rows: [{ [returningColumn]: result.lastInsertRowid }],
+                  rowCount: result.changes,
+                  insertId: result.lastInsertRowid
+                };
+              }
+            }
+          }
+          
+          return { 
+            rows: [], 
+            rowCount: result.changes,
+            insertId: result.lastInsertRowid 
+          };
+        } else {
+          const result = stmt.run();
+          
+          // If INSERT had RETURNING clause, query back to get the row
+          if (hasReturning && upperText.startsWith('INSERT') && result.lastInsertRowid && returningColumn) {
+            const tableMatch = convertedSql.match(/INSERT\s+INTO\s+(\w+)/i);
+            if (tableMatch) {
+              const tableName = tableMatch[1];
+              try {
+                const selectStmt = this.db.prepare(`SELECT * FROM ${tableName} WHERE ${returningColumn} = ?`);
+                const row = selectStmt.get(result.lastInsertRowid);
+                return {
+                  rows: row ? [row] : [],
+                  rowCount: result.changes,
+                  insertId: result.lastInsertRowid
+                };
+              } catch (selectError) {
+                // If select fails, just return insertId
+                return {
+                  rows: [{ [returningColumn]: result.lastInsertRowid }],
+                  rowCount: result.changes,
+                  insertId: result.lastInsertRowid
+                };
+              }
+            }
+          }
+          
+          return { 
+            rows: [], 
+            rowCount: result.changes,
+            insertId: result.lastInsertRowid 
+          };
+        }
+      } else {
+        // For other queries (CREATE, ALTER, etc.)
+        if (sanitizedParams && sanitizedParams.length > 0) {
+          stmt.run(sanitizedParams);
+        } else {
+          stmt.run();
+        }
+        return { rows: [], rowCount: 0 };
+      }
+    } catch (error) {
+      logError('[DB] Query error:', error);
       throw error;
     }
   }
 
   async close() {
-    if (this.pool) {
-      await this.pool.end();
-      this.pool = null;
+    if (this.db) {
+      this.db.close();
+      this.db = null;
     }
   }
 }
 
-export default new Database();
+export default new DatabaseWrapper();

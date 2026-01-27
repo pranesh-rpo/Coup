@@ -9,27 +9,48 @@ import userService from '../services/userService.js';
 import { config } from '../config.js';
 import logger from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
-import { createConfigMenu, createRateLimitKeyboard, createQuietHoursKeyboard, createABModeKeyboard, createScheduleKeyboard, createMainMenu, createBackButton } from './keyboardHandler.js';
+import { createConfigMenu, createQuietHoursKeyboard, createABModeKeyboard, createScheduleKeyboard, createMainMenu, createBackButton } from './keyboardHandler.js';
 
 // Helper function to show verification required (imported from commandHandler)
-async function showVerificationRequired(bot, chatId, channelUsername) {
+// Helper function to create channel buttons keyboard
+function createChannelButtonsKeyboard(channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Create buttons: Verify button on first row, then one button per channel
+  const keyboard = [
+    [{ text: '✅ Verify Channel', callback_data: 'btn_verify_channel' }]
+  ];
+  
+  // Add one button per channel
+  for (const channelUsername of channels) {
+    keyboard.push([{ text: `📢 Join @${channelUsername}`, url: `https://t.me/${channelUsername}` }]);
+  }
+  
+  return keyboard;
+}
+
+async function showVerificationRequired(bot, chatId, channelUsernames) {
+  // Handle both single string (backward compatibility) and array
+  const channels = Array.isArray(channelUsernames) ? channelUsernames : [channelUsernames];
+  
+  // Build channel list text
+  const channelList = channels.map(ch => `📢 @${ch}`).join('\n');
+  
   const verificationMessage = `
 🔐 <b>Channel Verification Required</b>
 
-To use this bot, you must join our updates channel first.
+To use this bot, you must join our updates channel(s) first.
 
-📢 Join: @${channelUsername}
+${channelList}
 
-After joining, click the "✅ Verify" button below.
+After joining, click the "✅ Verify Channel" button below.
   `;
   
   return await bot.sendMessage(chatId, verificationMessage, {
     parse_mode: 'HTML',
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '✅ Verify', callback_data: 'btn_verify_channel' }],
-        [{ text: '📢 Join Channel', url: `https://t.me/${channelUsername}` }]
-      ]
+      inline_keyboard: createChannelButtonsKeyboard(channels)
     }
   });
 }
@@ -42,15 +63,16 @@ export async function handleConfigButton(bot, callbackQuery) {
   logger.logButtonClick(userId, username, 'Config', chatId);
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
+        text: 'Please verify by joining our updates channel(s) first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
@@ -73,7 +95,7 @@ export async function handleConfigButton(bot, callbackQuery) {
   }
 
   const settings = await configService.getAccountSettings(accountId);
-  const preset = configService.intervalToPreset(settings?.manualInterval);
+  const currentInterval = settings?.manualInterval || 11; // Default 11 minutes
   const quietHours = settings?.quietStart && settings?.quietEnd 
     ? { start: settings.quietStart, end: settings.quietEnd }
     : null;
@@ -82,7 +104,7 @@ export async function handleConfigButton(bot, callbackQuery) {
   
   const configMessage = `⚙️ <b>Account Configuration</b>\n\n` +
     `📱 Account: ${(await accountLinker.getAccounts(userId)).find(a => a.accountId === accountId)?.phone || 'Unknown'}\n\n` +
-    `⚡ Rate Limit: ${preset === '1' ? '1 msg/hr' : preset === '3' ? '3 msg/hr' : preset === '5' ? '5 msg/hr' : 'Default'}\n` +
+    `⏱️ Custom Interval: ${currentInterval} minutes\n` +
     `🌙 Quiet Hours: ${quietHours ? `${quietHours.start} - ${quietHours.end}` : 'Not set'}\n` +
     `🔄 A/B Testing: ${settings?.abMode ? settings.abModeType.charAt(0).toUpperCase() + settings.abModeType.slice(1) : 'Disabled'}\n\n` +
     `Select an option to configure:`;
@@ -92,19 +114,22 @@ export async function handleConfigButton(bot, callbackQuery) {
     chatId,
     callbackQuery.message.message_id,
     configMessage,
-    { parse_mode: 'HTML', ...createConfigMenu(preset, quietHours, settings?.abMode || false, settings?.abModeType || 'single') }
+    { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours, settings?.abMode || false, settings?.abModeType || 'single') }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
   return { accountId }; // Return accountId for state management
 }
 
-export async function handleConfigRateLimit(bot, callbackQuery) {
+/**
+ * Handle custom interval configuration
+ */
+export async function handleConfigCustomInterval(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
   const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Config Rate Limit', chatId);
+  logger.logButtonClick(userId, username, 'Config Custom Interval', chatId);
 
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
@@ -116,59 +141,89 @@ export async function handleConfigRateLimit(bot, callbackQuery) {
   }
 
   const settings = await configService.getAccountSettings(accountId);
-  const preset = configService.intervalToPreset(settings?.manualInterval);
+  const currentInterval = settings?.manualInterval || 11; // Default 11 minutes
 
-  const rateLimitMessage = `⚡ <b>Rate Limit Presets</b>\n\n` +
-    `Select a rate limit preset:\n\n` +
-    `• <b>1 msg/hr</b> - 60 min interval (slowest, safest)\n` +
-    `• <b>3 msg/hr</b> - 20 min interval (balanced)\n` +
-    `• <b>5 msg/hr</b> - 12 min interval (default, recommended)\n` +
-    `• <b>Default</b> - Uses system default (12 min)\n\n` +
-    `Current: <b>${preset === '1' ? '1 msg/hr' : preset === '3' ? '3 msg/hr' : preset === '5' ? '5 msg/hr' : 'Default'}</b>`;
+  const intervalMessage = `⏱️ <b>Custom Broadcast Interval</b>\n\n` +
+    `Set the interval between broadcast cycles (minimum: 11 minutes).\n\n` +
+    `<b>Current interval:</b> ${currentInterval} minutes\n\n` +
+    `Please enter the interval in minutes (e.g., 15, 30, 60):`;
 
   await safeEditMessage(
     bot,
     chatId,
     callbackQuery.message.message_id,
-    rateLimitMessage,
-    { parse_mode: 'HTML', ...createRateLimitKeyboard(preset) }
+    intervalMessage,
+    { parse_mode: 'HTML', ...createBackButton() }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
+  return { accountId }; // Return accountId for pending state
 }
 
-export async function handleConfigRateLimitPreset(bot, callbackQuery, preset) {
-  const userId = callbackQuery.from.id;
-  const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
+/**
+ * Handle custom interval input
+ */
+export async function handleCustomIntervalInput(bot, msg, accountId) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
 
-  logger.logButtonClick(userId, username, `Config Rate Limit: ${preset}`, chatId);
-
-  const accountId = accountLinker.getActiveAccountId(userId);
-  if (!accountId) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'No active account found!',
-      show_alert: true,
-    });
-    return;
+  const text = msg.text?.trim();
+  
+  if (!text) {
+    await bot.sendMessage(
+      chatId,
+      `⏱️ <b>Custom Broadcast Interval</b>\n\nPlease enter the interval in minutes (minimum: 11 minutes).\n\nExample: 15, 30, 60\n\nSend your interval now:`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    return false; // Keep pending state
   }
 
-  const result = await configService.setRateLimitPreset(accountId, preset);
+  // Parse interval (must be a valid number)
+  const intervalMinutes = parseInt(text, 10);
+  
+  if (isNaN(intervalMinutes) || intervalMinutes < 11) {
+    await bot.sendMessage(
+      chatId,
+      `❌ Invalid interval. Please enter a number that is at least 11 minutes.\n\nExample: 15, 30, 60\n\nTry again:`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    console.log(`[CUSTOM_INTERVAL] User ${userId} entered invalid interval: ${text}`);
+    return false; // Keep pending state so user can retry
+  }
+
+  // Validate maximum (reasonable limit, e.g., 1440 minutes = 24 hours)
+  const maxIntervalMinutes = 1440;
+  if (intervalMinutes > maxIntervalMinutes) {
+    await bot.sendMessage(
+      chatId,
+      `❌ Interval too large. Maximum is ${maxIntervalMinutes} minutes (24 hours).\n\nPlease enter a smaller value:`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    console.log(`[CUSTOM_INTERVAL] User ${userId} entered interval too large: ${intervalMinutes} minutes`);
+    return false; // Keep pending state so user can retry
+  }
+
+  logger.logChange('CONFIG', userId, `Custom interval set to ${intervalMinutes} minutes`);
+  const result = await configService.setCustomInterval(accountId, intervalMinutes);
   
   if (result.success) {
-    const presetLabel = preset === '1' ? '1 msg/hr' : preset === '3' ? '3 msg/hr' : preset === '5' ? '5 msg/hr' : 'Default';
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: `✅ Rate limit set to ${presetLabel}`,
-      show_alert: true,
-    });
-    
-    // Refresh config menu
-    await handleConfigButton(bot, callbackQuery);
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Custom Interval Set Successfully!</b>\n\n⏱️ <b>Interval:</b> ${intervalMinutes} minutes`,
+      { parse_mode: 'HTML', ...await createMainMenu(userId) }
+    );
+    console.log(`[CUSTOM_INTERVAL] User ${userId} successfully set interval to ${intervalMinutes} minutes`);
+    return true; // Success - clear pending state
   } else {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: `Error: ${result.error}`,
-      show_alert: true,
-    });
+    let errorMessage = `❌ <b>Failed to Set Interval</b>\n\n<b>Error:</b> ${result.error}\n\n`;
+    
+    await bot.sendMessage(
+      chatId,
+      errorMessage,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    console.log(`[CUSTOM_INTERVAL] User ${userId} failed to set interval: ${result.error}`);
+    return false; // Keep pending state so user can retry
   }
 }
 
@@ -189,7 +244,7 @@ export async function handleConfigDailyCap(bot, callbackQuery) {
   }
 
   const settings = await configService.getAccountSettings(accountId);
-  const currentCap = settings?.dailyCap || 50;
+  const currentCap = settings?.dailyCap || 1500;
 
   await safeEditMessage(
     bot,
@@ -406,37 +461,45 @@ export async function handleQuietHoursInput(bot, msg, accountId) {
     return;
   }
 
-  const startTime = match[1];
-  const endTime = match[2];
-
-  // Validate times
-  const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-  if (!timeRegex.test(startTime) || !timeRegex.test(endTime)) {
+  // Extract full time strings from the input (match[1] and match[2] are just hours, need full time)
+  const times = text.split(/\s*-\s*/);
+  if (times.length !== 2) {
     await bot.sendMessage(
       chatId,
-      '❌ Invalid time format. Please use 24-hour format (HH:MM).\n\nExample: <code>22:00 - 06:00</code>',
+      '❌ Invalid format. Please use: <code>HH:MM - HH:MM</code>\n\nExample: <code>22:00 - 06:00</code>',
       { parse_mode: 'HTML', ...createBackButton() }
     );
     return;
   }
 
-  const result = await configService.setQuietHours(accountId, startTime, endTime);
-  
-  if (result.success) {
-    logger.logSuccess('CONFIG', userId, `Quiet hours set: ${startTime} - ${endTime} IST`);
+  const startTime = times[0].trim();
+  const endTime = times[1].trim();
+
+  try {
+    const result = await configService.setQuietHours(accountId, startTime, endTime);
+    
+    if (result.success) {
+      logger.logSuccess('CONFIG', userId, `Quiet hours set: ${startTime} - ${endTime} IST`);
+      await bot.sendMessage(
+        chatId,
+        `✅ <b>Quiet Hours Set Successfully!</b>\n\n` +
+        `🌙 <b>Time Window:</b> ${startTime} - ${endTime} IST\n` +
+        `📊 <b>Status:</b> Active`,
+        { parse_mode: 'HTML', ...createMainMenu() }
+      );
+    } else {
+      await bot.sendMessage(
+        chatId,
+        `❌ Error: ${result.error || 'Failed to set quiet hours'}\n\nPlease try again.`,
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+    }
+  } catch (error) {
+    logger.logError('CONFIG', userId, error, 'Failed to handle quiet hours input');
     await bot.sendMessage(
       chatId,
-      `✅ <b>Quiet Hours Set Successfully!</b>\n\n` +
-      `🌙 <b>Time Window:</b> ${startTime} - ${endTime} IST\n` +
-      `📊 <b>Status:</b> Active\n\n` +
-      `💡 Broadcasting will be automatically paused during these hours.`,
-      { parse_mode: 'HTML', ...createMainMenu() }
-    );
-  } else {
-    await bot.sendMessage(
-      chatId,
-      `❌ Error: ${result.error}\n\nPlease try again.`,
-      createBackButton()
+      `❌ An unexpected error occurred: ${error.message}\n\nPlease try again.`,
+      { parse_mode: 'HTML', ...createBackButton() }
     );
   }
 }
@@ -536,15 +599,16 @@ export async function handleConfigMention(bot, callbackQuery) {
   logger.logButtonClick(userId, username, 'Mentions', chatId);
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
+        text: 'Please verify by joining our updates channel(s) first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
@@ -596,7 +660,7 @@ export async function handleConfigMention(bot, callbackQuery) {
             { text: '3 users', callback_data: 'config_mention_count_3' },
             { text: '5 users', callback_data: 'config_mention_count_5' }
           ],
-          [{ text: '◀️ Back to Menu', callback_data: 'btn_main_menu' }],
+          [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
         ],
       },
     }
@@ -861,37 +925,45 @@ export async function handleScheduleInput(bot, msg, accountId) {
     return;
   }
 
-  const startTime = match[1];
-  const endTime = match[2];
-
-  // Validate times
-  const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-  if (!timeRegex.test(startTime) || !timeRegex.test(endTime)) {
+  // Extract full time strings from the input (match[1] and match[2] are just hours, need full time)
+  const times = text.split(/\s*-\s*/);
+  if (times.length !== 2) {
     await bot.sendMessage(
       chatId,
-      '❌ Invalid time format. Please use 24-hour format (HH:MM).\n\nExample: <code>09:00 - 17:00</code>',
+      '❌ Invalid format. Please use: <code>HH:MM - HH:MM</code>\n\nExample: <code>09:00 - 17:00</code>',
       { parse_mode: 'HTML', ...createBackButton() }
     );
     return;
   }
 
-  const result = await configService.setSchedule(accountId, startTime, endTime);
-  
-  if (result.success) {
-    logger.logSuccess('CONFIG', userId, `Schedule set: ${startTime} - ${endTime} IST`);
+  const startTime = times[0].trim();
+  const endTime = times[1].trim();
+
+  try {
+    const result = await configService.setSchedule(accountId, startTime, endTime);
+    
+    if (result.success) {
+      logger.logSuccess('CONFIG', userId, `Schedule set: ${startTime} - ${endTime} IST`);
+      await bot.sendMessage(
+        chatId,
+        `✅ <b>Schedule Set Successfully!</b>\n\n` +
+        `⏰ <b>Time Window:</b> ${startTime} - ${endTime} IST\n` +
+        `📊 <b>Status:</b> Active`,
+        { parse_mode: 'HTML', ...createMainMenu() }
+      );
+    } else {
+      await bot.sendMessage(
+        chatId,
+        `❌ Error: ${result.error || 'Failed to set schedule'}\n\nPlease try again.`,
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+    }
+  } catch (error) {
+    logger.logError('CONFIG', userId, error, 'Failed to handle schedule input');
     await bot.sendMessage(
       chatId,
-      `✅ <b>Schedule Set Successfully!</b>\n\n` +
-      `⏰ <b>Time Window:</b> ${startTime} - ${endTime} IST\n` +
-      `📊 <b>Status:</b> Active\n\n` +
-      `💡 Broadcasting will only occur during this time window. You can start broadcasts anytime, but messages will only be sent during the schedule.`,
-      { parse_mode: 'HTML', ...createMainMenu() }
-    );
-  } else {
-    await bot.sendMessage(
-      chatId,
-      `❌ Error: ${result.error}\n\nPlease try again.`,
-      createBackButton()
+      `❌ An unexpected error occurred: ${error.message}\n\nPlease try again.`,
+      { parse_mode: 'HTML', ...createBackButton() }
     );
   }
 }

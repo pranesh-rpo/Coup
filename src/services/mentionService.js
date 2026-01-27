@@ -23,10 +23,11 @@ class MentionService {
       }
       
       // Get recent messages from the group to find who sent them
+      // Reduced limit from 100 to 30 for faster fetching (was causing slowdowns)
       let messages = [];
       try {
         messages = await client.getMessages(groupEntity, {
-          limit: Math.min(limit * 10, 100), // Get more messages to find unique senders
+          limit: Math.min(limit * 5, 30), // Reduced from 100 to 30 for better performance
         });
         console.log(`[MENTION] Got ${messages?.length || 0} recent messages`);
       } catch (error) {
@@ -115,7 +116,7 @@ class MentionService {
         
         // Skip if no userId
         if (!userId) {
-          console.log(`[MENTION] Could not extract userId from message, skipping`);
+          // Reduced logging for performance
           continue;
         }
         
@@ -125,13 +126,11 @@ class MentionService {
                          parseInt(userId);
         
         if (isNaN(userIdNum)) {
-          console.log(`[MENTION] Invalid userId extracted: ${userId}, skipping`);
           continue;
         }
         
         // ALWAYS skip excluded user (account itself) - don't mention yourself
         if (excludeUserId && userIdNum === excludeUserId) {
-          console.log(`[MENTION] Skipping excluded user ID (account itself): ${userIdNum}`);
           continue;
         }
         
@@ -140,11 +139,10 @@ class MentionService {
           continue;
         }
         
-        // If we have userEntity from author, use it directly
+        // If we have userEntity from author, use it directly (OPTIMIZED: Skip entity lookup if we have it)
         if (userEntity && userEntity.className === 'User') {
           // Skip bots
           if (userEntity.bot) {
-            console.log(`[MENTION] Skipping bot user: ${userIdNum}`);
             continue;
           }
           
@@ -175,56 +173,20 @@ class MentionService {
             entity: userEntity,
             lastMessageDate: message.date || message.timestamp || 0
           });
-          console.log(`[MENTION] ✅ Added user ${userIdNum} from message author (accessHash: ${accessHashBigInt ? 'yes' : 'no'})`);
+          // Reduced logging for performance - only log when we have enough users
+          if (userMap.size <= limit) {
+            console.log(`[MENTION] ✅ Added user ${userIdNum} from message author`);
+          }
         } else {
-          // Try to get user entity if not available from message
-          try {
-            userEntity = await client.getEntity(userIdNum);
-            if (userEntity && userEntity.className === 'User') {
-              // Skip bots
-              if (userEntity.bot) {
-                console.log(`[MENTION] Skipping bot user: ${userIdNum}`);
-                continue;
-              }
-              
-              // Extract accessHash
-              if (userEntity.accessHash !== undefined && userEntity.accessHash !== null) {
-                if (typeof userEntity.accessHash === 'object') {
-                  if (userEntity.accessHash.personal !== undefined) {
-                    accessHash = userEntity.accessHash.personal;
-                  } else if (userEntity.accessHash.value !== undefined) {
-                    accessHash = userEntity.accessHash.value;
-                  } else if (userEntity.accessHash.rawValue !== undefined) {
-                    accessHash = userEntity.accessHash.rawValue;
-                  }
-                } else {
-                  accessHash = userEntity.accessHash;
-                }
-              }
-              
-              const accessHashBigInt = accessHash !== null && accessHash !== undefined 
-                ? (typeof accessHash === 'bigint' ? accessHash : BigInt(accessHash))
-                : null;
-              
-              userMap.set(userIdNum, {
-                userId: userIdNum,
-                accessHash: accessHashBigInt,
-                entity: userEntity,
-                lastMessageDate: message.date || message.timestamp || 0
-              });
-              console.log(`[MENTION] ✅ Added user ${userIdNum} from entity lookup (accessHash: ${accessHashBigInt ? 'yes' : 'no'})`);
-            }
-          } catch (entityError) {
-            console.log(`[MENTION] ⚠️ Could not get entity for user ${userIdNum}: ${entityError.message}`);
-            // Still add user without entity (we'll try to get it later when creating mentions)
+          // OPTIMIZATION: Skip expensive entity lookup - we can use userId without entity for mentions
+          // Only add user with userId, entity lookup is not necessary for mentions
             userMap.set(userIdNum, {
               userId: userIdNum,
               accessHash: null,
               entity: null,
               lastMessageDate: message.date || message.timestamp || 0
             });
-            console.log(`[MENTION] Added user ${userIdNum} without entity (will try to resolve later)`);
-          }
+          // Reduced logging for performance
         }
       }
       
@@ -272,9 +234,10 @@ class MentionService {
       
       try {
         // Method 1: Get recent participants
+        // Reduced limit for faster fetching
         participants = await client.getParticipants(groupEntity, {
           filter: { _: 'channelParticipantsRecent' },
-          limit: Math.min(limit * 10, 200), // Get more to filter
+          limit: Math.min(limit * 5, 50), // Reduced from 200 to 50 for better performance
         });
         console.log(`[MENTION] Got ${participants?.length || 0} participants with filter`);
       } catch (error) {
@@ -282,7 +245,7 @@ class MentionService {
         // Method 2: Try without filter
         try {
           participants = await client.getParticipants(groupEntity, {
-            limit: Math.min(limit * 10, 200),
+            limit: Math.min(limit * 5, 50), // Reduced from 200 to 50 for better performance
           });
           console.log(`[MENTION] Got ${participants?.length || 0} participants without filter`);
         } catch (err) {

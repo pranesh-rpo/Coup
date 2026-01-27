@@ -39,10 +39,11 @@ class LoggingService {
   async getRecentLogs(accountId, hours = 24) {
     try {
       const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
+      // SQLite uses datetime() function instead of NOW() and INTERVAL syntax
       const result = await db.query(
         `SELECT * FROM logs 
-         WHERE account_id = $1 
-         AND timestamp >= NOW() - INTERVAL '${hours} hours'
+         WHERE account_id = ? 
+         AND timestamp >= datetime('now', '-${hours} hours')
          ORDER BY timestamp DESC`,
         [accountIdNum]
       );
@@ -55,9 +56,10 @@ class LoggingService {
 
   async cleanupOldLogs(days = 1) {
     try {
+      // SQLite uses datetime() function instead of NOW() and INTERVAL syntax
       const result = await db.query(
         `DELETE FROM logs 
-         WHERE timestamp < NOW() - INTERVAL '${days} days'`
+         WHERE timestamp < datetime('now', '-${days} days')`
       );
       
       console.log(`[LOG CLEANUP] Deleted ${result.rowCount} old log entries`);

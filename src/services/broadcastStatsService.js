@@ -76,6 +76,7 @@ class BroadcastStatsService {
    */
   async getSummary(accountId, days = 30) {
     try {
+      // SQLite uses date() function instead of INTERVAL syntax
       const result = await db.query(
         `SELECT 
            COUNT(*) as total_broadcasts,
@@ -84,7 +85,7 @@ class BroadcastStatsService {
            AVG(success_rate) as avg_success_rate,
            MAX(broadcast_date) as last_broadcast
          FROM broadcast_stats
-         WHERE account_id = $1 AND broadcast_date >= CURRENT_DATE - INTERVAL '${days} days'`,
+         WHERE account_id = ? AND broadcast_date >= date('now', '-${days} days')`,
         [accountId]
       );
       return { success: true, summary: result.rows[0] };

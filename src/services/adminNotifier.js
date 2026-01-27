@@ -7,6 +7,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config.js';
 import { logError } from '../utils/logger.js';
+import { isFloodWaitError, extractWaitTime, waitForFloodError, safeBotApiCall } from '../utils/floodWaitHandler.js';
 
 class AdminNotifier {
   constructor() {
@@ -41,8 +42,11 @@ class AdminNotifier {
         return;
       }
 
-      // Test bot connection
-      const botInfo = await this.bot.getMe();
+      // Test bot connection with floodwait protection
+      const botInfo = await safeBotApiCall(
+        () => this.bot.getMe(),
+        { maxRetries: 3, bufferSeconds: 1, throwOnFailure: true }
+      );
       console.log(`[ADMIN NOTIFIER] Initialized successfully as @${botInfo.username}`);
       console.log(`[ADMIN NOTIFIER] Will send notifications to ${this.adminChatIds.length} admin chat(s)`);
       
@@ -65,16 +69,25 @@ class AdminNotifier {
 
     const { parseMode = 'HTML', disableNotification = false } = options;
 
-    // Send to all admin chats
+    // Send to all admin chats with floodwait protection
     const promises = this.adminChatIds.map(async (chatId) => {
       try {
-        await this.bot.sendMessage(chatId, message, {
-          parse_mode: parseMode,
-          disable_notification: disableNotification,
-        });
+        await safeBotApiCall(
+          () => this.bot.sendMessage(chatId, message, {
+            parse_mode: parseMode,
+            disable_notification: disableNotification,
+          }),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
       } catch (error) {
         // Don't log errors for admin notifications to avoid infinite loops
-        console.error(`[ADMIN NOTIFIER] Failed to send notification to chat ${chatId}:`, error.message);
+        // But check for floodwait to log it separately
+        if (isFloodWaitError(error)) {
+          const waitSeconds = extractWaitTime(error);
+          console.warn(`[ADMIN NOTIFIER] Rate limited sending to chat ${chatId} (wait: ${waitSeconds}s)`);
+        } else {
+          console.error(`[ADMIN NOTIFIER] Failed to send notification to chat ${chatId}:`, error.message);
+        }
       }
     });
 

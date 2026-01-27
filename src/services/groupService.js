@@ -1,5 +1,6 @@
 import db from '../database/db.js';
 import accountLinker from './accountLinker.js';
+import { config } from '../config.js';
 import { Api } from 'telegram/tl/index.js';
 import { logError } from '../utils/logger.js';
 
@@ -33,19 +34,83 @@ class GroupService {
   }
 
   async refreshGroups(accountId) {
+    // Enhanced validation
+    if (!accountId || (typeof accountId === 'string' && isNaN(parseInt(accountId))) || (typeof accountId === 'number' && accountId <= 0)) {
+      return { success: false, error: 'Invalid account ID' };
+    }
+    
+    const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
     let client = null;
     try {
       // Connect client on-demand
-      client = await accountLinker.getClientAndConnect(null, accountId);
+      client = await accountLinker.getClientAndConnect(null, accountIdNum);
       if (!client) {
         return { success: false, error: 'Account or client not found' };
       }
-      console.log(`[GROUPS] Connected client for account ${accountId} to refresh groups`);
+      console.log(`[GROUPS] Connected client for account ${accountIdNum} to refresh groups`);
 
-      const dialogs = await client.getDialogs();
-      const groups = dialogs.filter(
-        (dialog) => dialog.isGroup || dialog.isChannel
-      );
+      // Enhanced error handling for getDialogs
+      let dialogs = [];
+      try {
+        dialogs = await client.getDialogs();
+        if (!Array.isArray(dialogs)) {
+          console.warn(`[GROUPS] getDialogs returned non-array result, treating as empty`);
+          dialogs = [];
+        }
+      } catch (dialogError) {
+        logError(`[GROUPS ERROR] Error fetching dialogs:`, dialogError);
+        // Check if it's a session error
+        if (dialogError.errorMessage === 'SESSION_REVOKED' || (dialogError.code === 401 && dialogError.message && dialogError.message.includes('SESSION_REVOKED'))) {
+          return { success: false, error: 'Session revoked. Please re-link your account.' };
+        }
+        throw dialogError;
+      }
+      
+      // Helper function to check if dialog is one of the updates channels
+      const isUpdatesChannel = async (dialog) => {
+        const updatesChannels = config.getUpdatesChannels();
+        if (updatesChannels.length === 0) return false;
+        
+        try {
+          const dialogName = (dialog.name || '').toLowerCase();
+          const dialogUsername = (dialog.entity?.username || '').toLowerCase();
+          
+          // Check against all configured updates channels
+          for (const channelConfig of updatesChannels) {
+            const updatesChannelName = channelConfig.replace('@', '').toLowerCase();
+            if (dialogUsername === updatesChannelName || dialogName === updatesChannelName) {
+              return true;
+            }
+            // Check by entity ID
+            try {
+              const updatesEntity = await client.getEntity(channelConfig);
+              if (updatesEntity && dialog.entity && updatesEntity.id && dialog.entity.id) {
+                if (updatesEntity.id.toString() === dialog.entity.id.toString()) {
+                  return true;
+                }
+              }
+            } catch (e) {
+              // Skip ID check if fails
+            }
+          }
+          return false;
+        } catch (error) {
+          return false;
+        }
+      };
+      
+      // Filter out updates channel from groups
+      const groups = [];
+      for (const dialog of dialogs) {
+        if ((dialog.isGroup || dialog.isChannel)) {
+          const isUpdates = await isUpdatesChannel(dialog);
+          if (!isUpdates) {
+            groups.push(dialog);
+          } else {
+            console.log(`[GROUPS] Excluding updates channel "${dialog.name}" from refresh`);
+          }
+        }
+      }
 
       let added = 0;
       let updated = 0;
@@ -53,18 +118,34 @@ class GroupService {
       for (const group of groups) {
         try {
           const groupId = group.entity.id.toString();
-          const groupTitle = group.name || 'Unknown';
+          let groupTitle = group.name || 'Unknown';
+          
+          // Enhanced validation for group data
+          if (!groupId || groupId === '0' || groupId === '') {
+            console.warn(`[GROUPS] Skipping group with invalid ID: ${groupId}`);
+            continue;
+          }
+          
+          if (!groupTitle || groupTitle.trim().length === 0) {
+            groupTitle = 'Unknown Group'; // Default name for groups without title
+          }
+          
+          // Truncate group title if too long (database constraint)
+          const maxTitleLength = 255;
+          if (groupTitle.length > maxTitleLength) {
+            groupTitle = groupTitle.substring(0, maxTitleLength - 3) + '...';
+          }
 
           const existing = await db.query(
             'SELECT id FROM groups WHERE account_id = $1 AND group_id = $2',
-            [accountId, groupId]
+            [accountIdNum, groupId]
           );
 
           if (existing.rows.length > 0) {
             // Update existing group
             await db.query(
               'UPDATE groups SET group_title = $1, is_active = TRUE WHERE account_id = $2 AND group_id = $3',
-              [groupTitle, accountId, groupId]
+              [groupTitle, accountIdNum, groupId]
             );
             updated++;
           } else {
@@ -72,7 +153,7 @@ class GroupService {
             await db.query(
               `INSERT INTO groups (account_id, group_id, group_title, is_active, last_message_sent)
                VALUES ($1, $2, $3, TRUE, NULL)`,
-              [accountId, groupId, groupTitle]
+              [accountIdNum, groupId, groupTitle]
             );
             added++;
           }
@@ -81,17 +162,28 @@ class GroupService {
         }
       }
 
-      console.log(`[GROUPS] Refreshed groups for account ${accountId}: ${added} added, ${updated} updated, total: ${groups.length}`);
+      console.log(`[GROUPS] Refreshed groups for account ${accountIdNum}: ${added} added, ${updated} updated, total: ${groups.length}`);
       return { success: true, added, updated, total: groups.length };
     } catch (error) {
-      logError(`[GROUPS ERROR] Error refreshing groups for account ${accountId}:`, error);
-      return { success: false, error: error.message };
+      logError(`[GROUPS ERROR] Error refreshing groups for account ${accountIdNum}:`, error);
+      
+      // Enhanced error messages
+      let errorMessage = error.message || 'Unknown error';
+      if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
+        errorMessage = 'Session revoked. Please re-link your account.';
+      } else if (error.message && error.message.includes('timeout')) {
+        errorMessage = 'Request timed out. Please try again.';
+      } else if (error.message && error.message.includes('network')) {
+        errorMessage = 'Network error. Please check your connection and try again.';
+      }
+      
+      return { success: false, error: errorMessage };
     } finally {
       // Disconnect client after refreshing groups
       if (client && client.connected) {
         try {
           await client.disconnect();
-          console.log(`[GROUPS] Disconnected client for account ${accountId} after refreshing groups`);
+          console.log(`[GROUPS] Disconnected client for account ${accountIdNum} after refreshing groups`);
         } catch (disconnectError) {
           logError(`[GROUPS ERROR] Error disconnecting client:`, disconnectError);
         }

@@ -12,16 +12,19 @@ class AnalyticsService {
    */
   async recordGroupAnalytics(accountId, groupId, groupTitle, success, errorMessage = null) {
     try {
+      // SQLite uses INTEGER (0/1) for booleans and EXCLUDED for ON CONFLICT
+      const messagesSent = success ? 1 : 0;
+      const messagesFailed = success ? 0 : 1;
       const result = await db.query(
         `INSERT INTO group_analytics (account_id, group_id, group_title, messages_sent, messages_failed, last_message_sent, last_error, is_active)
-         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, TRUE)
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 1)
          ON CONFLICT (account_id, group_id) DO UPDATE
-         SET messages_sent = group_analytics.messages_sent + CASE WHEN $4 > 0 THEN 1 ELSE 0 END,
-             messages_failed = group_analytics.messages_failed + CASE WHEN $5 > 0 THEN 1 ELSE 0 END,
-             last_message_sent = CASE WHEN $4 > 0 THEN CURRENT_TIMESTAMP ELSE group_analytics.last_message_sent END,
-             last_error = CASE WHEN $6 IS NOT NULL THEN $6 ELSE group_analytics.last_error END,
+         SET messages_sent = group_analytics.messages_sent + EXCLUDED.messages_sent,
+             messages_failed = group_analytics.messages_failed + EXCLUDED.messages_failed,
+             last_message_sent = CASE WHEN EXCLUDED.messages_sent > 0 THEN CURRENT_TIMESTAMP ELSE group_analytics.last_message_sent END,
+             last_error = CASE WHEN EXCLUDED.last_error IS NOT NULL THEN EXCLUDED.last_error ELSE group_analytics.last_error END,
              updated_at = CURRENT_TIMESTAMP`,
-        [accountId, groupId, groupTitle, success ? 1 : 0, success ? 0 : 1, errorMessage]
+        [accountId, groupId, groupTitle, messagesSent, messagesFailed, errorMessage]
       );
       return { success: true };
     } catch (error) {
@@ -58,11 +61,12 @@ class AnalyticsService {
    */
   async getTopGroups(accountId, limit = 10) {
     try {
+      // SQLite uses INTEGER (0/1) for booleans and CAST(... AS REAL) instead of ::DECIMAL
       const result = await db.query(
         `SELECT * FROM group_analytics 
-         WHERE account_id = $1 AND is_active = TRUE
-         ORDER BY messages_sent DESC, (messages_sent::DECIMAL / NULLIF(messages_sent + messages_failed, 0)) DESC
-         LIMIT $2`,
+         WHERE account_id = ? AND is_active = 1
+         ORDER BY messages_sent DESC, (CAST(messages_sent AS REAL) / NULLIF(messages_sent + messages_failed, 0)) DESC
+         LIMIT ?`,
         [accountId, limit]
       );
       return { success: true, groups: result.rows };
@@ -77,13 +81,14 @@ class AnalyticsService {
    */
   async getProblematicGroups(accountId, limit = 10) {
     try {
+      // SQLite uses INTEGER (0/1) for booleans and CAST(... AS REAL) instead of ::DECIMAL
       const result = await db.query(
         `SELECT *, 
-         (messages_failed::DECIMAL / NULLIF(messages_sent + messages_failed, 0)) * 100 as failure_rate
+         (CAST(messages_failed AS REAL) / NULLIF(messages_sent + messages_failed, 0)) * 100 as failure_rate
          FROM group_analytics 
-         WHERE account_id = $1 AND is_active = TRUE AND messages_failed > 0
+         WHERE account_id = ? AND is_active = 1 AND messages_failed > 0
          ORDER BY failure_rate DESC, messages_failed DESC
-         LIMIT $2`,
+         LIMIT ?`,
         [accountId, limit]
       );
       return { success: true, groups: result.rows };

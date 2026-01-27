@@ -20,11 +20,11 @@ class SmartSchedulerService {
            COUNT(*) as total_sent,
            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count
          FROM logs
-         WHERE account_id = $1 
+         WHERE account_id = ? 
            AND log_type = 'broadcast'
-           AND timestamp >= NOW() - INTERVAL '${days} days'
+           AND timestamp >= datetime('now', '-${days} days')
          GROUP BY hour
-         ORDER BY (success_count::DECIMAL / NULLIF(total_sent, 0)) DESC, total_sent DESC
+         ORDER BY (CAST(success_count AS REAL) / NULLIF(total_sent, 0)) DESC, total_sent DESC
          LIMIT 5`,
         [accountId]
       );

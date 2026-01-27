@@ -1,12 +1,21 @@
 {
-  "name": "ora-telegram-bot",
+  "name": "beige-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for automated messaging to groups using MTProto API",
+  "description": "BeigeBot - Telegram bot for automated messaging to groups using MTProto API",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
+    "pm2:stop": "pm2 stop beige-bot",
+    "pm2:restart": "pm2 restart beige-bot",
+    "pm2:delete": "pm2 delete beige-bot",
+    "pm2:logs": "pm2 logs beige-bot",
+    "pm2:monit": "pm2 monit",
+    "pm2:save": "pm2 save",
+    "pm2:startup": "pm2 startup",
+    "production": "NODE_ENV=production node src/index.js"
   },
   "keywords": [
     "telegram",
@@ -17,9 +26,12 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "telegram": "^2.25.0",
+    "better-sqlite3": "^11.6.0",
     "dotenv": "^16.4.5",
-    "pg": "^8.11.3"
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "pm2": "^6.0.14",
+    "qrcode": "^1.5.4",
+    "telegram": "^2.25.0"
   }
 }

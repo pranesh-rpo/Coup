@@ -47,7 +47,11 @@ class LogHistoryService {
         params.push(`%${filters.search}%`);
       }
 
-      query += ` ORDER BY timestamp DESC LIMIT ${filters.limit || 100}`;
+      // SECURITY: Use parameterized query for LIMIT to prevent SQL injection
+      paramCount++;
+      const sanitizedLimit = Math.min(Math.max(1, parseInt(filters.limit) || 100), 1000); // Between 1 and 1000
+      query += ` ORDER BY timestamp DESC LIMIT $${paramCount}`;
+      params.push(sanitizedLimit);
 
       const result = await db.query(query, params);
       return { success: true, logs: result.rows };

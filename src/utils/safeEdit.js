@@ -1,13 +1,16 @@
 /**
  * Safe message editing utility
  * Handles "message is not modified" errors gracefully
+ * Also handles floodwait errors to prevent bans
  * Following project rules: always log changes and errors
  */
 
 import logger from './logger.js';
+import { isFloodWaitError, extractWaitTime, waitForFloodError, safeBotApiCall } from './floodWaitHandler.js';
 
 /**
  * Safely edit a message, ignoring "message is not modified" errors
+ * Also handles floodwait errors automatically
  * @param {Object} bot - Telegram bot instance
  * @param {number} chatId - Chat ID
  * @param {number} messageId - Message ID to edit
@@ -17,13 +20,21 @@ import logger from './logger.js';
  */
 export async function safeEditMessage(bot, chatId, messageId, text, options = {}) {
   try {
-    await bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      ...options,
-    });
-    logger.logChange('MESSAGE_EDIT', null, `Message ${messageId} edited in chat ${chatId}`);
-    return true;
+    // Use safeBotApiCall to handle floodwait errors automatically
+    const result = await safeBotApiCall(
+      () => bot.editMessageText(text, {
+        chat_id: chatId,
+        message_id: messageId,
+        ...options,
+      }),
+      { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+    );
+    
+    if (result) {
+      logger.logChange('MESSAGE_EDIT', null, `Message ${messageId} edited in chat ${chatId}`);
+      return true;
+    }
+    return false;
   } catch (error) {
     // Handle "message is not modified" error gracefully
     // Check multiple error properties and message formats
@@ -46,6 +57,13 @@ export async function safeEditMessage(bot, chatId, messageId, text, options = {}
       return false; // Return false instead of throwing
     }
     
+    // Check if it's a floodwait error that wasn't handled
+    if (isFloodWaitError(error)) {
+      const waitSeconds = extractWaitTime(error);
+      logger.logError('MESSAGE_EDIT', null, error, `FloodWaitError editing message ${messageId} in chat ${chatId} (wait: ${waitSeconds}s)`);
+      return false;
+    }
+    
     // Log other errors but don't throw - let caller handle
     logger.logError('MESSAGE_EDIT', null, error, `Failed to edit message ${messageId} in chat ${chatId}`);
     // Don't throw - return false to indicate failure
@@ -55,6 +73,7 @@ export async function safeEditMessage(bot, chatId, messageId, text, options = {}
 
 /**
  * Safely answer a callback query, ignoring expired query errors
+ * Also handles floodwait errors automatically
  * @param {Object} bot - Telegram bot instance
  * @param {string} callbackQueryId - Callback query ID
  * @param {Object} options - Options (text, show_alert)
@@ -62,8 +81,16 @@ export async function safeEditMessage(bot, chatId, messageId, text, options = {}
  */
 export async function safeAnswerCallback(bot, callbackQueryId, options = {}) {
   try {
-    await bot.answerCallbackQuery(callbackQueryId, options);
-    return true;
+    // Use safeBotApiCall to handle floodwait errors automatically
+    const result = await safeBotApiCall(
+      () => bot.answerCallbackQuery(callbackQueryId, options),
+      { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+    );
+    
+    if (result) {
+      return true;
+    }
+    return false;
   } catch (error) {
     // Handle expired query errors gracefully
     if (error.message && (
@@ -72,6 +99,13 @@ export async function safeAnswerCallback(bot, callbackQueryId, options = {}) {
       error.message.includes('query expired')
     )) {
       logger.logInfo('CALLBACK_QUERY', `Callback query ${callbackQueryId} expired (ignored)`, null);
+      return false;
+    }
+    
+    // Check if it's a floodwait error that wasn't handled
+    if (isFloodWaitError(error)) {
+      const waitSeconds = extractWaitTime(error);
+      logger.logError('CALLBACK_QUERY', null, error, `FloodWaitError answering callback ${callbackQueryId} (wait: ${waitSeconds}s)`);
       return false;
     }
     

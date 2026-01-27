@@ -16,15 +16,23 @@ class MessageManager {
 
   async loadMessages() {
     try {
-      // Check if messages table has user_id (old schema) or account_id (new schema)
-      const columnsCheck = await db.query(`
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_name = 'messages' AND column_name IN ('user_id', 'account_id', 'start_message', 'message_text')
+      // Check if messages table exists
+      const tableCheck = await db.query(`
+        SELECT name FROM sqlite_master WHERE type='table' AND name='messages'
       `);
       
-      const hasUserId = columnsCheck.rows.some(r => r.column_name === 'user_id');
-      const hasStartMessage = columnsCheck.rows.some(r => r.column_name === 'start_message');
+      if (tableCheck.rows.length === 0) {
+        console.log('[MESSAGE MANAGER] Messages table does not exist yet. Skipping legacy message loading.');
+        return;
+      }
+      
+      // Check if messages table has user_id (old schema) or account_id (new schema)
+      // Use PRAGMA table_info for SQLite instead of information_schema
+      const columnsCheck = await db.query(`PRAGMA table_info(messages)`);
+      
+      const columnNames = columnsCheck.rows.map(r => r.name);
+      const hasUserId = columnNames.includes('user_id');
+      const hasStartMessage = columnNames.includes('start_message');
       
       // If old schema exists, load from it
       if (hasUserId && hasStartMessage) {

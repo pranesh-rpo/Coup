@@ -10,10 +10,79 @@ import accountLinker from '../services/accountLinker.js';
 import automationService from '../services/automationService.js';
 import logger from '../utils/logger.js';
 import adminNotifier from '../services/adminNotifier.js';
+import { isFloodWaitError, extractWaitTime, waitForFloodError, safeBotApiCall } from '../utils/floodWaitHandler.js';
+import { validateUserId, sanitizeErrorMessage, adminCommandRateLimiter } from '../utils/security.js';
 
 let adminBot = null;
 let mainBot = null; // Reference to main bot for sending messages to users
 let lastAdminBroadcast = null; // Store last broadcast message
+let pollingRetryCount = 0;
+let pollingRetryTimeout = null;
+const MAX_POLLING_RETRIES = 5;
+const BASE_RETRY_DELAY = 10000; // 10 seconds base delay
+
+/**
+ * Restart admin bot polling with retry logic and exponential backoff
+ */
+async function restartPolling() {
+  if (!adminBot) return;
+  
+  pollingRetryCount++;
+  if (pollingRetryCount > MAX_POLLING_RETRIES) {
+    console.error('[ADMIN BOT] Max polling retries reached. Stopping retry attempts.');
+    pollingRetryTimeout = null;
+    return;
+  }
+  
+  // Exponential backoff: 10s, 20s, 40s, 80s, 160s
+  const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount - 1);
+  
+  console.log(`[ADMIN BOT] Restarting polling (attempt ${pollingRetryCount}/${MAX_POLLING_RETRIES}) in ${retryDelay / 1000}s...`);
+  
+  try {
+    adminBot.stopPolling();
+    
+    // Wait a moment before restarting
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Delete webhook before restarting polling
+    try {
+      await safeBotApiCall(
+        () => adminBot.deleteWebHook({ drop_pending_updates: false }),
+        { maxRetries: 2, bufferSeconds: 1, throwOnFailure: false }
+      );
+    } catch (webhookError) {
+      // Ignore webhook deletion errors
+    }
+    
+    // Wait a bit more before starting polling
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    try {
+      await adminBot.startPolling({ restart: true });
+      pollingRetryCount = 0; // Reset on success
+      pollingRetryTimeout = null;
+      console.log('[ADMIN BOT] Polling restarted successfully');
+    } catch (restartError) {
+      const errorMessage = restartError.message || '';
+      
+      // Check for 409 Conflict error
+      if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
+        console.error('[ADMIN BOT] ⚠️ 409 Conflict when restarting polling - stopping retry attempts');
+        console.error('[ADMIN BOT] Another instance is already polling this bot token');
+        pollingRetryTimeout = null;
+        pollingRetryCount = MAX_POLLING_RETRIES + 1; // Prevent further retries
+        return;
+      }
+      
+      console.error('[ADMIN BOT] Failed to restart polling:', restartError);
+      pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
+    }
+  } catch (error) {
+    console.error('[ADMIN BOT] Error stopping polling:', error);
+    pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
+  }
+}
 
 /**
  * Initialize admin bot
@@ -24,25 +93,202 @@ export function initializeAdminBot(mainBotInstance = null) {
     return null;
   }
 
+  // Prevent multiple initializations
+  if (adminBot) {
+    console.log('[ADMIN BOT] Admin bot already initialized, skipping...');
+    return adminBot;
+  }
+
   try {
-    adminBot = new TelegramBot(config.adminBotToken, { polling: true });
+    // Configure admin bot with autoStart: false so we can delete webhook first
+    adminBot = new TelegramBot(config.adminBotToken, { 
+      polling: {
+        autoStart: false, // We'll start after deleting webhook
+        interval: 300,
+        params: {
+          timeout: 10,
+          allowed_updates: ['message', 'callback_query']
+        }
+      },
+      request: {
+        timeout: 60000, // 60 seconds timeout for requests
+        agentOptions: {
+          keepAlive: true,
+          keepAliveMsecs: 10000
+        }
+      }
+    });
     mainBot = mainBotInstance; // Store reference to main bot
-    console.log('[ADMIN BOT] Admin bot initialized');
+    console.log('[ADMIN BOT] Admin bot instance created');
     console.log(`[ADMIN BOT] Main bot instance ${mainBot ? 'is set' : 'is NOT set'}`);
 
-    // Add error handler
+    // Enhanced error handlers with retry logic
     adminBot.on('polling_error', (error) => {
+      const errorMessage = error.message || '';
+      const errorCode = error.code || '';
+      const errorName = error.name || '';
+      const errorCause = error.cause || error.error || null;
+      const errorStack = error.stack || '';
+      
+      // Check for 409 Conflict error (multiple getUpdates requests)
+      const isConflictError = 
+        errorCode === 409 ||
+        errorMessage.includes('409') ||
+        errorMessage.includes('Conflict') ||
+        errorMessage.includes('terminated by other getUpdates') ||
+        errorMessage.includes('only one bot instance is running');
+      
+      // Check for timeout errors in various forms (direct, wrapped, or in stack)
+      // Include both ETIMEDOUT and ESOCKETTIMEDOUT
+      const isTimeoutError = 
+        errorCode === 'ETIMEDOUT' || 
+        errorCode === 'ESOCKETTIMEDOUT' ||
+        errorName === 'RequestError' && (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('ESOCKETTIMEDOUT')) ||
+        errorMessage.includes('ETIMEDOUT') || 
+        errorMessage.includes('ESOCKETTIMEDOUT') ||
+        errorMessage.includes('TIMEOUT') ||
+        (errorCause && (errorCause.code === 'ETIMEDOUT' || errorCause.code === 'ESOCKETTIMEDOUT' || errorCause.message?.includes('ETIMEDOUT') || errorCause.message?.includes('ESOCKETTIMEDOUT'))) ||
+        errorStack.includes('ETIMEDOUT') ||
+        errorStack.includes('ESOCKETTIMEDOUT');
+      
       console.error('[ADMIN BOT] Polling error:', error);
-      logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error');
+      
+      // Handle 409 Conflict error - another instance is polling
+      if (isConflictError) {
+        console.error('[ADMIN BOT] ⚠️ 409 Conflict: Another bot instance is polling. Stopping polling to avoid conflicts.');
+        console.error('[ADMIN BOT] This usually means:');
+        console.error('[ADMIN BOT]   1. Another process is using the same admin bot token');
+        console.error('[ADMIN BOT]   2. A webhook is set for this bot');
+        console.error('[ADMIN BOT]   3. The bot was restarted without properly stopping polling');
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - another instance is polling');
+        
+        // Stop polling to avoid conflicts
+        try {
+          adminBot.stopPolling();
+          console.log('[ADMIN BOT] Polling stopped due to conflict');
+        } catch (stopError) {
+          console.error('[ADMIN BOT] Error stopping polling:', stopError);
+        }
+        
+        // Don't retry on conflict errors - manual intervention needed
+        return;
+      }
+      
+      // Don't retry on certain errors (like unauthorized)
+      if (errorMessage.includes('401') || errorMessage.includes('Unauthorized')) {
+        console.error('[ADMIN BOT] Unauthorized error - check ADMIN_BOT_TOKEN');
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error - Unauthorized');
+        return;
+      }
+      
+      // Handle timeout errors gracefully - these are often transient network issues
+      if (isTimeoutError) {
+        console.warn('[ADMIN BOT] Polling timeout detected - will retry automatically');
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling timeout - will retry');
+      } else {
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error');
+      }
+      
+      // Retry polling on other errors (including timeouts)
+      if (pollingRetryCount < MAX_POLLING_RETRIES) {
+        if (!pollingRetryTimeout) {
+          const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount);
+          pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
+        }
+      }
     });
 
     adminBot.on('error', (error) => {
+      const errorMessage = error.message || '';
+      const errorCode = error.code || '';
+      const errorName = error.name || '';
+      const errorCause = error.cause || error.error || null;
+      const errorStack = error.stack || '';
+      
+      // Check for timeout errors in various forms (direct, wrapped, or in stack)
+      // Include both ETIMEDOUT and ESOCKETTIMEDOUT
+      const isTimeoutError = 
+        errorCode === 'ETIMEDOUT' || 
+        errorCode === 'ESOCKETTIMEDOUT' ||
+        errorName === 'RequestError' && (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('ESOCKETTIMEDOUT')) ||
+        errorMessage.includes('ETIMEDOUT') || 
+        errorMessage.includes('ESOCKETTIMEDOUT') ||
+        errorMessage.includes('TIMEOUT') ||
+        (errorCause && (errorCause.code === 'ETIMEDOUT' || errorCause.code === 'ESOCKETTIMEDOUT' || errorCause.message?.includes('ETIMEDOUT') || errorCause.message?.includes('ESOCKETTIMEDOUT'))) ||
+        errorStack.includes('ETIMEDOUT') ||
+        errorStack.includes('ESOCKETTIMEDOUT');
+      
+      const isConnectionError = 
+        errorCode === 'ECONNREFUSED' || 
+        errorMessage.includes('ECONNREFUSED') ||
+        (errorCause && errorCause.code === 'ECONNREFUSED');
+      
       console.error('[ADMIN BOT] Error:', error);
-      logger.logError('ADMIN_BOT', null, error, 'Admin bot error');
+      
+      // Handle timeout errors - these are often transient network issues
+      if (isTimeoutError) {
+        console.warn('[ADMIN BOT] Request timeout detected - will retry automatically');
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot request timeout - will retry');
+      } else {
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot error');
+      }
+      
+      // Retry on connection errors (including timeouts)
+      if (isConnectionError || isTimeoutError) {
+        if (pollingRetryCount < MAX_POLLING_RETRIES && !pollingRetryTimeout) {
+          const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount);
+          pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
+        }
+      }
     });
 
     // Register admin commands
     registerAdminCommands(adminBot);
+    
+    // Delete webhook and start polling (similar to main bot)
+    (async () => {
+      try {
+        // Delete any existing webhook before starting polling
+        await safeBotApiCall(
+          () => adminBot.deleteWebHook({ drop_pending_updates: false }),
+          { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+        );
+        console.log('[ADMIN BOT] ✅ Deleted any existing webhook');
+        
+        // Wait a moment before starting polling
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Start polling
+        await adminBot.startPolling();
+        console.log('[ADMIN BOT] ✅ Polling started');
+        pollingRetryCount = 0; // Reset retry count on successful start
+      } catch (error) {
+        const errorMessage = error.message || '';
+        
+        // Check for 409 Conflict error
+        if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
+          console.error('[ADMIN BOT] ⚠️ 409 Conflict when starting polling:');
+          console.error('[ADMIN BOT]   Another instance is already polling this bot token');
+          console.error('[ADMIN BOT]   Please check for other running instances or webhooks');
+          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict on startup');
+        } else if (isFloodWaitError(error)) {
+          const waitSeconds = extractWaitTime(error);
+          console.warn(`[ADMIN BOT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s...`);
+          await waitForFloodError(error, 1);
+          // Retry starting polling
+          try {
+            await adminBot.startPolling();
+            console.log('[ADMIN BOT] ✅ Polling started (after flood wait retry)');
+          } catch (retryError) {
+            console.error('[ADMIN BOT] Failed to start polling after retry:', retryError);
+            logger.logError('ADMIN_BOT', null, retryError, 'Admin bot polling start failed after retry');
+          }
+        } else {
+          console.error('[ADMIN BOT] Failed to start polling:', error);
+          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling start failed');
+        }
+      }
+    })();
     
     return adminBot;
   } catch (error) {
@@ -71,20 +317,33 @@ function registerAdminCommands(bot) {
 
     const welcomeMessage = `👑 <b>Admin Bot</b>\n\n` +
       `Welcome, Admin!\n\n` +
-      `<b>Available Commands:</b>\n` +
+      `<b>📊 Statistics:</b>\n` +
       `/stats - View bot statistics\n` +
-      `/users - List all users\n` +
-      `/accounts - List all accounts\n` +
+      `/users - List recent users\n` +
+      `/accounts - List recent accounts\n` +
       `/broadcasts - View active broadcasts\n` +
+      `/groups - List groups by account\n` +
+      `/database - Database statistics\n\n` +
+      `<b>👁️ Monitoring:</b>\n` +
       `/logs - View recent logs\n` +
+      `/logs_error - View error logs only\n` +
+      `/logs_success - View success logs only\n` +
       `/errors - View recent errors\n` +
-      `/notify <message> - Send notification to all admins\n` +
-      `/abroadcast <message> - Broadcast message to all users\n` +
-      `/abroadcast_last - Resend last broadcast message\n` +
-      `/user <id> - Get user details\n` +
-      `/account <id> - Get account details\n` +
-      `/stop_broadcast <user_id> - Stop user's broadcast\n` +
-      `/help - Show this help`;
+      `/user &lt;id&gt; - Get user details\n` +
+      `/account &lt;id&gt; - Get account details\n\n` +
+      `<b>🎮 Control:</b>\n` +
+      `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
+      `/stop_all_broadcasts - Stop all broadcasts\n` +
+      `/notify &lt;message&gt; - Send notification to admins\n` +
+      `/abroadcast &lt;message&gt; - Broadcast to all users\n` +
+      `/abroadcast_last - Resend last broadcast\n\n` +
+      `<b>⚙️ System:</b>\n` +
+      `/status - Bot health status\n` +
+      `/uptime - Bot uptime information\n` +
+      `/test - Test admin bot connection\n\n` +
+      `<b>❓ Help:</b>\n` +
+      `/help - Show detailed help\n` +
+      `/start - Show this menu`;
 
     await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML' });
   });
@@ -112,7 +371,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, statsMessage, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -139,7 +400,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -167,7 +430,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -196,7 +461,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -222,7 +489,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -252,20 +521,39 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
   // /user <id> command
   bot.onText(/\/user (.+)/, async (msg, match) => {
-    if (!isAdmin(msg.from.id)) {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
       await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
       return;
     }
 
+    // SECURITY: Rate limiting for admin commands
+    const rateLimit = adminCommandRateLimiter.checkRateLimit(adminUserId, 20, 60000); // 20 commands per minute
+    if (!rateLimit.allowed) {
+      await bot.sendMessage(
+        msg.chat.id,
+        `⏳ Rate limit exceeded. Please wait ${Math.ceil(rateLimit.resetIn / 1000)} seconds.`
+      );
+      return;
+    }
+
     try {
-      const userId = BigInt(match[1]);
-      const user = await db.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+      // SECURITY: Validate and sanitize user ID input
+      const targetUserId = validateUserId(match[1]);
+      if (!targetUserId) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID format');
+        return;
+      }
+      
+      const user = await db.query('SELECT * FROM users WHERE user_id = $1', [targetUserId]);
       
       if (user.rows.length === 0) {
         await bot.sendMessage(msg.chat.id, '❌ User not found');
@@ -287,7 +575,9 @@ function registerAdminCommands(bot) {
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -300,16 +590,317 @@ function registerAdminCommands(bot) {
 
     try {
       const userId = parseInt(match[1]);
-      const result = await automationService.stopBroadcast(userId);
       
-      if (result.success) {
-        await bot.sendMessage(msg.chat.id, `✅ Broadcast stopped for user ${userId}`);
-        logger.logChange('ADMIN', msg.from.id, `Stopped broadcast for user ${userId}`);
-      } else {
-        await bot.sendMessage(msg.chat.id, `❌ ${result.error}`);
+      // Get all broadcasting account IDs for this user
+      const broadcastingAccountIds = automationService.getBroadcastingAccountIds(userId);
+      
+      if (broadcastingAccountIds.length === 0) {
+        await bot.sendMessage(msg.chat.id, `❌ No active broadcasts found for user ${userId}`);
+        return;
       }
+      
+      let stoppedCount = 0;
+      for (const accountId of broadcastingAccountIds) {
+        const result = await automationService.stopBroadcast(userId, accountId);
+        if (result.success) {
+          stoppedCount++;
+        }
+      }
+      
+      await bot.sendMessage(msg.chat.id, `✅ Stopped ${stoppedCount} broadcast(s) for user ${userId}`);
+      logger.logChange('ADMIN', msg.from.id, `Stopped ${stoppedCount} broadcast(s) for user ${userId}`);
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /stop_all_broadcasts command
+  bot.onText(/\/stop_all_broadcasts/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const activeBroadcasts = Array.from(automationService.activeBroadcasts?.entries() || []);
+      
+      if (activeBroadcasts.length === 0) {
+        await bot.sendMessage(msg.chat.id, '📢 No active broadcasts to stop');
+        return;
+      }
+      
+      let stoppedCount = 0;
+      for (const [broadcastKey, broadcast] of activeBroadcasts) {
+        if (broadcast.isRunning) {
+          const result = await automationService.stopBroadcast(broadcast.userId, broadcast.accountId);
+          if (result.success) {
+            stoppedCount++;
+          }
+        }
+      }
+      
+      await bot.sendMessage(msg.chat.id, `✅ Stopped ${stoppedCount} out of ${activeBroadcasts.length} active broadcast(s)`);
+      logger.logChange('ADMIN', msg.from.id, `Stopped all broadcasts (${stoppedCount}/${activeBroadcasts.length})`);
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /account <id> command
+  bot.onText(/\/account (.+)/, async (msg, match) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const accountId = parseInt(match[1]);
+      const account = await db.query('SELECT * FROM accounts WHERE account_id = $1', [accountId]);
+      
+      if (account.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '❌ Account not found');
+        return;
+      }
+
+      const accountData = account.rows[0];
+      const groups = await db.query('SELECT COUNT(*) as count FROM groups WHERE account_id = $1 AND is_active = TRUE', [accountId]);
+      const logs = await db.query('SELECT COUNT(*) as count FROM logs WHERE account_id = $1', [accountId]);
+      const isBroadcasting = automationService.isBroadcasting(accountData.user_id, accountId);
+
+      let message = `🔑 <b>Account Details</b>\n\n`;
+      message += `Account ID: <code>${accountData.account_id}</code>\n`;
+      message += `User ID: <code>${accountData.user_id}</code>\n`;
+      message += `Phone: ${accountData.phone || 'N/A'}\n`;
+      message += `Active: ${accountData.is_active ? '✅' : '❌'}\n`;
+      message += `Broadcasting: ${isBroadcasting ? '📢 Yes' : '⏸️ No'}\n`;
+      message += `Created: ${new Date(accountData.created_at).toLocaleString()}\n\n`;
+      message += `Active Groups: ${groups.rows[0].count}\n`;
+      message += `Log Entries: ${logs.rows[0].count}`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /groups command
+  bot.onText(/\/groups/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const groups = await db.query(
+        'SELECT account_id, COUNT(*) as count FROM groups WHERE is_active = TRUE GROUP BY account_id ORDER BY count DESC LIMIT 20'
+      );
+
+      if (groups.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '👥 No active groups found');
+        return;
+      }
+
+      let message = `👥 <b>Groups by Account</b> (Top 20)\n\n`;
+      groups.rows.forEach((group, i) => {
+        message += `${i + 1}. Account <code>${group.account_id}</code>: ${group.count} groups\n`;
+      });
+
+      const totalGroups = await db.query('SELECT COUNT(*) as count FROM groups WHERE is_active = TRUE');
+      message += `\n📊 Total Active Groups: ${totalGroups.rows[0].count}`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /database command
+  bot.onText(/\/database/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      // SECURITY: Whitelist of allowed table names to prevent SQL injection
+      const allowedTables = ['users', 'accounts', 'groups', 'messages', 'logs', 'audit_logs'];
+      const stats = {};
+
+      for (const table of allowedTables) {
+        try {
+          // SECURITY: Validate table name against whitelist
+          // Only allow alphanumeric and underscore characters
+          if (!/^[a-zA-Z0-9_]+$/.test(table) || !allowedTables.includes(table)) {
+            stats[table] = 'Invalid';
+            continue;
+          }
+          
+          // Use parameterized query (though table names can't be parameterized in PostgreSQL)
+          // We rely on whitelist validation above
+          const result = await db.query(`SELECT COUNT(*) as count FROM ${table}`);
+          stats[table] = result.rows[0].count;
+        } catch (error) {
+          stats[table] = 'Error';
+        }
+      }
+
+      let message = `🗄️ <b>Database Statistics</b>\n\n`;
+      for (const [table, count] of Object.entries(stats)) {
+        message += `<b>${table}:</b> ${count}\n`;
+      }
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /status command
+  bot.onText(/\/status/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const activeBroadcasts = automationService.activeBroadcasts?.size || 0;
+      const memoryUsage = process.memoryUsage();
+      const uptime = process.uptime();
+      
+      const days = Math.floor(uptime / 86400);
+      const hours = Math.floor((uptime % 86400) / 3600);
+      const minutes = Math.floor((uptime % 3600) / 60);
+      const seconds = Math.floor(uptime % 60);
+      
+      // Test database connection
+      let dbStatus = '✅ Connected';
+      try {
+        await db.query('SELECT 1');
+      } catch (error) {
+        dbStatus = `❌ Error: ${error.message.substring(0, 50)}`;
+      }
+
+      const statusMessage = `🖥️ <b>Bot Status</b>\n\n` +
+        `<b>System:</b>\n` +
+        `Uptime: ${days}d ${hours}h ${minutes}m ${seconds}s\n` +
+        `Memory: ${(memoryUsage.heapUsed / 1024 / 1024).toFixed(2)} MB / ${(memoryUsage.heapTotal / 1024 / 1024).toFixed(2)} MB\n` +
+        `Node.js: ${process.version}\n\n` +
+        `<b>Bot:</b>\n` +
+        `Active Broadcasts: ${activeBroadcasts}\n` +
+        `Database: ${dbStatus}\n` +
+        `Main Bot: ${mainBot ? '✅ Connected' : '❌ Not Available'}\n` +
+        `Admin Bot: ✅ Running`;
+
+      await bot.sendMessage(msg.chat.id, statusMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /uptime command
+  bot.onText(/\/uptime/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const uptime = process.uptime();
+      const startTime = new Date(Date.now() - uptime * 1000);
+      
+      const days = Math.floor(uptime / 86400);
+      const hours = Math.floor((uptime % 86400) / 3600);
+      const minutes = Math.floor((uptime % 3600) / 60);
+      const seconds = Math.floor(uptime % 60);
+
+      const uptimeMessage = `⏱️ <b>Uptime Information</b>\n\n` +
+        `Started: ${startTime.toLocaleString()}\n` +
+        `Uptime: ${days} days, ${hours} hours, ${minutes} minutes, ${seconds} seconds\n` +
+        `Total Seconds: ${Math.floor(uptime)}`;
+
+      await bot.sendMessage(msg.chat.id, uptimeMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /logs_error command
+  bot.onText(/\/logs_error/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const errors = await db.query(
+        "SELECT * FROM logs WHERE status = 'error' ORDER BY timestamp DESC LIMIT 20"
+      );
+
+      if (errors.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '✅ No error logs found');
+        return;
+      }
+
+      let message = `❌ <b>Error Logs</b> (Last 20)\n\n`;
+      errors.rows.forEach((log, i) => {
+        const time = new Date(log.timestamp).toLocaleString();
+        message += `${i + 1}. <b>${time}</b>\n`;
+        message += `Account: ${log.account_id || 'N/A'}\n`;
+        message += `<code>${log.message.substring(0, 100)}${log.message.length > 100 ? '...' : ''}</code>\n\n`;
+      });
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /logs_success command
+  bot.onText(/\/logs_success/, async (msg) => {
+    if (!isAdmin(msg.from.id)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const logs = await db.query(
+        "SELECT * FROM logs WHERE status = 'success' ORDER BY timestamp DESC LIMIT 20"
+      );
+
+      if (logs.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '✅ No success logs found');
+        return;
+      }
+
+      let message = `✅ <b>Success Logs</b> (Last 20)\n\n`;
+      logs.rows.forEach((log, i) => {
+        const time = new Date(log.timestamp).toLocaleString();
+        message += `${i + 1}. <b>${time}</b>\n`;
+        message += `Account: ${log.account_id || 'N/A'}\n`;
+        message += `${log.message.substring(0, 80)}${log.message.length > 80 ? '...' : ''}\n\n`;
+      });
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -325,7 +916,9 @@ function registerAdminCommands(bot) {
       await adminNotifier.notify(`📢 <b>Admin Notification</b>\n\n${notification}`, { parseMode: 'HTML' });
       await bot.sendMessage(msg.chat.id, '✅ Notification sent to all admins');
     } catch (error) {
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
@@ -395,22 +988,65 @@ function registerAdminCommands(bot) {
       let failedCount = 0;
       const failedUsers = [];
 
-      // Send message to each user
+      // CRITICAL: Rate limiting for admin broadcasts
+      // Telegram allows ~30 messages/second, but we use ULTRA-CONSERVATIVE limits to prevent bot deletion
+      // Reduced to 10 messages/minute (1 per 6 seconds) to stay well below limits and avoid spam detection
+      const MIN_DELAY_BETWEEN_MESSAGES = 6000; // 6 seconds between messages (10 messages/minute max) - INCREASED for safety
+      const MAX_MESSAGES_PER_MINUTE = 10; // Ultra-conservative limit (reduced from 20)
+      
+      // Track messages sent in the last minute
+      const messageTimestamps = [];
+
+      // Send message to each user with proper rate limiting
       for (const userId of userIds) {
         try {
-          await mainBot.sendMessage(userId, broadcastMessage, { parse_mode: 'HTML' });
-          successCount++;
-          logger.logChange('ADMIN_BROADCAST', msg.from.id, `Sent broadcast to user ${userId}`);
+          // Update current time on each iteration
+          const now = Date.now();
+          const oneMinuteAgo = now - 60000;
+          
+          // Clean up old timestamps (older than 1 minute) to prevent memory leak
+          const validTimestamps = messageTimestamps.filter(ts => ts > oneMinuteAgo);
+          messageTimestamps.splice(0, messageTimestamps.length, ...validTimestamps);
+          
+          // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+          if (messageTimestamps.length >= MAX_MESSAGES_PER_MINUTE) {
+            // Calculate wait time until oldest message is 1 minute old
+            const oldestMessage = Math.min(...messageTimestamps);
+            const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+            console.log(`[ADMIN_BROADCAST] Rate limit reached (${messageTimestamps.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            // Clean up timestamps after waiting
+            const newNow = Date.now();
+            const newOneMinuteAgo = newNow - 60000;
+            messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
+          }
+
+          // Use safeBotApiCall to properly handle flood waits
+          const sendResult = await safeBotApiCall(
+            () => mainBot.sendMessage(userId, broadcastMessage, { parse_mode: 'HTML' }),
+            { maxRetries: 3, bufferSeconds: 2, throwOnFailure: false }
+          );
+
+          if (sendResult) {
+            successCount++;
+            messageTimestamps.push(Date.now());
+            logger.logChange('ADMIN_BROADCAST', msg.from.id, `Sent broadcast to user ${userId}`);
+          } else {
+            failedCount++;
+            failedUsers.push(userId);
+            console.log(`[ADMIN_BROADCAST] Failed to send to user ${userId} after retries`);
+            logger.logError('ADMIN_BROADCAST', userId, new Error('Failed after retries'), `Failed to send broadcast to user ${userId}`);
+          }
         } catch (error) {
           failedCount++;
           failedUsers.push(userId);
-          // Log but don't stop - continue with other users
           console.log(`[ADMIN_BROADCAST] Failed to send to user ${userId}: ${error.message}`);
           logger.logError('ADMIN_BROADCAST', userId, error, `Failed to send broadcast to user ${userId}`);
         }
-        
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // CRITICAL: Wait at least MIN_DELAY_BETWEEN_MESSAGES between messages to avoid rate limits
+        // This ensures we never exceed Telegram's rate limits
+        await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_MESSAGES));
       }
 
       // Update status message with results
@@ -433,7 +1069,9 @@ function registerAdminCommands(bot) {
       console.error('[ADMIN_BROADCAST] Error:', error);
       logger.logError('ADMIN_BROADCAST', msg.from.id, error, 'Admin broadcast error');
       try {
-        await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+        // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
       } catch (sendError) {
         console.error('[ADMIN_BROADCAST] Failed to send error message:', sendError);
       }
@@ -496,20 +1134,63 @@ function registerAdminCommands(bot) {
       let successCount = 0;
       let failedCount = 0;
 
-      // Send message to each user
+      // CRITICAL: Rate limiting for admin broadcasts
+      // Telegram allows ~30 messages/second, but we use ULTRA-CONSERVATIVE limits to prevent bot deletion
+      // Reduced to 10 messages/minute (1 per 6 seconds) to stay well below limits and avoid spam detection
+      const MIN_DELAY_BETWEEN_MESSAGES = 6000; // 6 seconds between messages (10 messages/minute max) - INCREASED for safety
+      const MAX_MESSAGES_PER_MINUTE = 10; // Ultra-conservative limit (reduced from 20)
+      
+      // Track messages sent in the last minute
+      const messageTimestamps = [];
+
+      // Send message to each user with proper rate limiting
       for (const userId of userIds) {
         try {
-          await mainBot.sendMessage(userId, lastAdminBroadcast, { parse_mode: 'HTML' });
-          successCount++;
-          logger.logChange('ADMIN_BROADCAST', msg.from.id, `Resent broadcast to user ${userId}`);
+          // Update current time on each iteration
+          const now = Date.now();
+          const oneMinuteAgo = now - 60000;
+          
+          // Clean up old timestamps (older than 1 minute) to prevent memory leak
+          const validTimestamps = messageTimestamps.filter(ts => ts > oneMinuteAgo);
+          messageTimestamps.splice(0, messageTimestamps.length, ...validTimestamps);
+          
+          // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+          if (messageTimestamps.length >= MAX_MESSAGES_PER_MINUTE) {
+            // Calculate wait time until oldest message is 1 minute old
+            const oldestMessage = Math.min(...messageTimestamps);
+            const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+            console.log(`[ADMIN_BROADCAST] Rate limit reached (${messageTimestamps.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            // Clean up timestamps after waiting
+            const newNow = Date.now();
+            const newOneMinuteAgo = newNow - 60000;
+            messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
+          }
+
+          // Use safeBotApiCall to properly handle flood waits
+          const sendResult = await safeBotApiCall(
+            () => mainBot.sendMessage(userId, lastAdminBroadcast, { parse_mode: 'HTML' }),
+            { maxRetries: 3, bufferSeconds: 2, throwOnFailure: false }
+          );
+
+          if (sendResult) {
+            successCount++;
+            messageTimestamps.push(Date.now());
+            logger.logChange('ADMIN_BROADCAST', msg.from.id, `Resent broadcast to user ${userId}`);
+          } else {
+            failedCount++;
+            console.log(`[ADMIN_BROADCAST] Failed to resend to user ${userId} after retries`);
+            logger.logError('ADMIN_BROADCAST', userId, new Error('Failed after retries'), `Failed to resend broadcast to user ${userId}`);
+          }
         } catch (error) {
           failedCount++;
           console.log(`[ADMIN_BROADCAST] Failed to resend to user ${userId}: ${error.message}`);
           logger.logError('ADMIN_BROADCAST', userId, error, `Failed to resend broadcast to user ${userId}`);
         }
-        
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 50));
+
+        // CRITICAL: Wait at least MIN_DELAY_BETWEEN_MESSAGES between messages to avoid rate limits
+        // This ensures we never exceed Telegram's rate limits
+        await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_MESSAGES));
       }
 
       // Update status message with results
@@ -530,36 +1211,65 @@ function registerAdminCommands(bot) {
       logger.logChange('ADMIN_BROADCAST', msg.from.id, `Last broadcast resent. Success: ${successCount}, Failed: ${failedCount}`);
     } catch (error) {
       logger.logError('ADMIN_BROADCAST', msg.from.id, error, 'Resend last broadcast error');
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${error.message}`);
+      // SECURITY: Sanitize error message to prevent information leakage
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
 
-  // /help command
+  // /help command - Make sure it's registered early and works
   bot.onText(/\/help/, async (msg) => {
-    if (!isAdmin(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
+    try {
+      if (!msg || !msg.from || !msg.chat) {
+        console.error('[ADMIN BOT] Invalid message object in /help');
+        return;
+      }
+
+      if (!isAdmin(msg.from.id)) {
+        await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+        return;
+      }
+
+      const helpMessage = `👑 <b>Admin Bot Commands</b>\n\n` +
+        `<b>📊 Statistics:</b>\n` +
+        `/stats - View bot statistics\n` +
+        `/users - List recent users (last 20)\n` +
+        `/accounts - List recent accounts (last 20)\n` +
+        `/broadcasts - View active broadcasts\n` +
+        `/groups - List all groups\n` +
+        `/database - Database statistics\n\n` +
+        `<b>👁️ Monitoring:</b>\n` +
+        `/logs - View recent logs (last 10)\n` +
+        `/logs_error - View error logs only\n` +
+        `/logs_success - View success logs only\n` +
+        `/errors - View recent errors (last 10)\n` +
+      `/user &lt;id&gt; - Get user details\n` +
+      `/account &lt;id&gt; - Get account details\n\n` +
+      `<b>🎮 Control:</b>\n` +
+      `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
+      `/stop_all_broadcasts - Stop all active broadcasts\n` +
+      `/notify &lt;message&gt; - Send notification to all admins\n` +
+      `/abroadcast &lt;message&gt; - Broadcast to all users\n` +
+        `/abroadcast_last - Resend last broadcast\n\n` +
+        `<b>⚙️ System:</b>\n` +
+        `/status - Bot health status\n` +
+        `/uptime - Bot uptime information\n` +
+        `/test - Test admin bot connection\n\n` +
+        `<b>❓ Help:</b>\n` +
+        `/help - Show this help\n` +
+        `/start - Show welcome message`;
+
+      await bot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /help command:', error);
+      try {
+        // SECURITY: Sanitize error message
+        const safeErrorMessage = sanitizeErrorMessage(error, false);
+        await bot.sendMessage(msg.chat.id, `❌ Error showing help: ${safeErrorMessage}`);
+      } catch (sendError) {
+        console.error('[ADMIN BOT] Failed to send error message:', sendError);
+      }
     }
-
-    const helpMessage = `👑 <b>Admin Bot Commands</b>\n\n` +
-      `<b>Statistics:</b>\n` +
-      `/stats - View bot statistics\n` +
-      `/users - List all users\n` +
-      `/accounts - List all accounts\n` +
-      `/broadcasts - View active broadcasts\n\n` +
-      `<b>Monitoring:</b>\n` +
-      `/logs - View recent logs\n` +
-      `/errors - View recent errors\n` +
-      `/user <id> - Get user details\n\n` +
-      `<b>Control:</b>\n` +
-      `/stop_broadcast <user_id> - Stop user's broadcast\n` +
-      `/notify <message> - Send notification to admins\n` +
-      `/abroadcast <message> - Broadcast to all users\n` +
-      `/abroadcast_last - Resend last broadcast\n\n` +
-      `<b>Help:</b>\n` +
-      `/help - Show this help`;
-
-    await bot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'HTML' });
   });
 
   // Test command to verify bot is working

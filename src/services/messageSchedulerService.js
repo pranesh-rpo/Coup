@@ -12,14 +12,15 @@ class MessageSchedulerService {
    */
   async scheduleMessage(accountId, messageText, scheduledTime, timezone = 'Asia/Kolkata', repeatType = 'once', repeatUntil = null) {
     try {
+      // SQLite uses ? placeholders. db.js will handle RETURNING by doing a SELECT after INSERT
       const result = await db.query(
         `INSERT INTO scheduled_messages (account_id, message_text, scheduled_time, timezone, repeat_type, repeat_until)
-         VALUES ($1, $2, $3, $4, $5, $6)
+         VALUES (?, ?, ?, ?, ?, ?)
          RETURNING *`,
         [accountId, messageText, scheduledTime, timezone, repeatType, repeatUntil]
       );
       logger.logChange('SCHEDULER', accountId, `Scheduled message for ${scheduledTime}`);
-      return { success: true, scheduledMessage: result.rows[0] };
+      return { success: true, scheduledMessage: result.rows?.[0] || { accountId, messageText, scheduledTime, timezone, repeatType, repeatUntil } };
     } catch (error) {
       logger.logError('SCHEDULER', accountId, error, 'Failed to schedule message');
       return { success: false, error: error.message };
@@ -31,11 +32,12 @@ class MessageSchedulerService {
    */
   async getPendingMessages(accountId = null) {
     try {
-      let query = `SELECT * FROM scheduled_messages WHERE is_sent = FALSE AND scheduled_time <= NOW()`;
+      // SQLite uses ? placeholders, 0/1 for booleans, and datetime('now') instead of NOW()
+      let query = `SELECT * FROM scheduled_messages WHERE is_sent = 0 AND scheduled_time <= datetime('now')`;
       const params = [];
       
       if (accountId) {
-        query += ` AND account_id = $1`;
+        query += ` AND account_id = ?`;
         params.push(accountId);
       }
       
@@ -54,8 +56,9 @@ class MessageSchedulerService {
    */
   async markAsSent(scheduledMessageId) {
     try {
+      // SQLite uses ? placeholders, 0/1 for booleans
       await db.query(
-        `UPDATE scheduled_messages SET is_sent = TRUE, sent_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        `UPDATE scheduled_messages SET is_sent = 1, sent_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [scheduledMessageId]
       );
       return { success: true };
@@ -70,9 +73,10 @@ class MessageSchedulerService {
    */
   async getScheduledMessages(accountId) {
     try {
+      // SQLite uses ? placeholders
       const result = await db.query(
         `SELECT * FROM scheduled_messages 
-         WHERE account_id = $1 
+         WHERE account_id = ? 
          ORDER BY scheduled_time ASC`,
         [accountId]
       );
@@ -88,8 +92,9 @@ class MessageSchedulerService {
    */
   async deleteScheduledMessage(accountId, messageId) {
     try {
+      // SQLite uses ? placeholders
       await db.query(
-        `DELETE FROM scheduled_messages WHERE id = $1 AND account_id = $2`,
+        `DELETE FROM scheduled_messages WHERE id = ? AND account_id = ?`,
         [messageId, accountId]
       );
       logger.logChange('SCHEDULER', accountId, `Deleted scheduled message ${messageId}`);
@@ -129,10 +134,11 @@ class MessageSchedulerService {
       }
 
       if (nextScheduledTime && (!scheduledMessage.repeat_until || nextScheduledTime <= new Date(scheduledMessage.repeat_until))) {
+        // SQLite uses ? placeholders and 0/1 for booleans
         await db.query(
           `UPDATE scheduled_messages 
-           SET scheduled_time = $1, is_sent = FALSE, sent_at = NULL 
-           WHERE id = $2`,
+           SET scheduled_time = ?, is_sent = 0, sent_at = NULL 
+           WHERE id = ?`,
           [nextScheduledTime, scheduledMessage.id]
         );
         return { success: true, shouldReschedule: true, nextTime: nextScheduledTime };

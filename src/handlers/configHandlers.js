@@ -1443,7 +1443,8 @@ export async function handleConfigAutoReplyDm(bot, callbackQuery) {
   let configMessage = `💬 <b>Auto Reply to DM</b>\n\n`;
   configMessage += `Status: ${enabled ? '🟢 Enabled' : '⚪ Disabled'}\n`;
   configMessage += `Message: ${message !== 'Not set' ? message.substring(0, 50) + (message.length > 50 ? '...' : '') : 'Not set'}\n\n`;
-  configMessage += `When enabled, the bot will automatically reply to direct messages.`;
+  configMessage += `When enabled, the bot will automatically reply to direct messages.\n`;
+  configMessage += `Cooldown: 30 minutes per chat`;
 
   const keyboard = {
     inline_keyboard: [
@@ -1493,6 +1494,14 @@ export async function handleAutoReplyDmToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyDm(accountId, enabled, currentMessage);
   
   if (result.success) {
+    // Update connection manager
+    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    if (enabled) {
+      await autoReplyConnectionManager.keepAccountConnected(accountId);
+    } else {
+      await autoReplyConnectionManager.checkAllAccounts();
+    }
+    
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: enabled ? '✅ Auto reply DM enabled' : '✅ Auto reply DM disabled',
       show_alert: true,
@@ -1599,7 +1608,8 @@ export async function handleConfigAutoReplyGroups(bot, callbackQuery) {
   let configMessage = `💬 <b>Auto Reply in Groups</b>\n\n`;
   configMessage += `Status: ${enabled ? '🟢 Enabled' : '⚪ Disabled'}\n`;
   configMessage += `Message: ${message !== 'Not set' ? message.substring(0, 50) + (message.length > 50 ? '...' : '') : 'Not set'}\n\n`;
-  configMessage += `When enabled, the bot will automatically reply to messages in groups.`;
+  configMessage += `When enabled, the bot will automatically reply to messages in groups.\n`;
+  configMessage += `Cooldown: 30 minutes per chat`;
 
   const keyboard = {
     inline_keyboard: [
@@ -1649,6 +1659,14 @@ export async function handleAutoReplyGroupsToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyGroups(accountId, enabled, currentMessage);
   
   if (result.success) {
+    // Update connection manager
+    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    if (enabled) {
+      await autoReplyConnectionManager.keepAccountConnected(accountId);
+    } else {
+      await autoReplyConnectionManager.checkAllAccounts();
+    }
+    
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: enabled ? '✅ Auto reply groups enabled' : '✅ Auto reply groups disabled',
       show_alert: true,
@@ -1723,6 +1741,200 @@ export async function handleAutoReplyGroupsMessageInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ Failed to set message: ${result.error}`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    return false;
+  }
+}
+
+/**
+ * Handle auto reply check interval configuration
+ */
+export async function handleAutoReplySetInterval(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const settings = await configService.getAccountSettings(accountId);
+  const currentInterval = settings?.autoReplyCheckInterval || 0;
+
+  let message = `⏱️ <b>Auto Reply Check Interval</b>\n\n`;
+  message += `Current: ${currentInterval > 0 ? `${currentInterval} seconds` : 'Real-time (instant)'}\n\n`;
+  message += `Choose how often to check for new messages:\n`;
+  message += `• Real-time: Reply immediately when message arrives\n`;
+  message += `• Interval: Check at regular intervals (saves resources)\n\n`;
+  message += `Send the interval in seconds (0 for real-time, minimum 10 seconds):`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '⚡ Real-time (0s)', callback_data: 'auto_reply_interval_0' }],
+      [{ text: '⏱️ 10 seconds', callback_data: 'auto_reply_interval_10' }],
+      [{ text: '⏱️ 30 seconds', callback_data: 'auto_reply_interval_30' }],
+      [{ text: '⏱️ 60 seconds (1 min)', callback_data: 'auto_reply_interval_60' }],
+      [{ text: '⏱️ 300 seconds (5 min)', callback_data: 'auto_reply_interval_300' }],
+      [{ text: '✏️ Custom', callback_data: 'auto_reply_interval_custom' }],
+      [{ text: '🔙 Back', callback_data: 'btn_config' }],
+    ],
+  };
+
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    message,
+    { parse_mode: 'HTML', reply_markup: keyboard }
+  );
+  
+  await safeAnswerCallback(bot, callbackQuery.id);
+  return { accountId };
+}
+
+/**
+ * Handle auto reply interval selection
+ */
+export async function handleAutoReplyIntervalSelect(bot, callbackQuery, intervalSeconds) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const result = await configService.setAutoReplyCheckInterval(accountId, intervalSeconds);
+  
+  if (result.success) {
+    const intervalText = intervalSeconds > 0 ? `${intervalSeconds} seconds` : 'Real-time';
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: `✅ Check interval set to ${intervalText}`,
+      show_alert: true,
+    });
+    
+    // Restart interval service if needed
+    const autoReplyIntervalService = (await import('../services/autoReplyIntervalService.js')).default;
+    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    
+    if (intervalSeconds > 0) {
+      await autoReplyIntervalService.startIntervalCheck(accountId);
+      await autoReplyConnectionManager.disconnectAccount(accountId);
+    } else {
+      autoReplyIntervalService.stopIntervalCheck(accountId);
+      await autoReplyConnectionManager.keepAccountConnected(accountId);
+    }
+    
+    // Go back to auto-reply DM config
+    await handleConfigAutoReplyDm(bot, callbackQuery);
+  } else {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: result.error || 'Failed to set interval',
+      show_alert: true,
+    });
+  }
+}
+
+/**
+ * Handle auto reply interval custom input
+ */
+export async function handleAutoReplyIntervalCustom(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    '⏱️ <b>Custom Check Interval</b>\n\nSend the interval in seconds (0 for real-time, minimum 10 seconds):\n\nExample: <code>30</code> for 30 seconds',
+    { parse_mode: 'HTML', ...createBackButton() }
+  );
+  
+  await safeAnswerCallback(bot, callbackQuery.id);
+  return { accountId };
+}
+
+/**
+ * Handle auto reply interval custom input
+ */
+export async function handleAutoReplyIntervalInput(bot, msg, accountId) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  const intervalText = msg.text?.trim();
+  if (!intervalText) {
+    await bot.sendMessage(
+      chatId,
+      '❌ Please send a valid number.',
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    return false;
+  }
+
+  const intervalSeconds = parseInt(intervalText);
+  if (isNaN(intervalSeconds) || intervalSeconds < 0) {
+    await bot.sendMessage(
+      chatId,
+      '❌ Invalid interval. Please send a number (0 for real-time, minimum 10 for interval mode).',
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    return false;
+  }
+
+  if (intervalSeconds > 0 && intervalSeconds < 10) {
+    await bot.sendMessage(
+      chatId,
+      '❌ Minimum interval is 10 seconds.',
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    return false;
+  }
+
+  const result = await configService.setAutoReplyCheckInterval(accountId, intervalSeconds);
+  
+  if (result.success) {
+    const intervalText = intervalSeconds > 0 ? `${intervalSeconds} seconds` : 'Real-time';
+    await bot.sendMessage(
+      chatId,
+      `✅ Check interval set to ${intervalText}!`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+    
+    // Restart interval service if needed
+    const autoReplyIntervalService = (await import('../services/autoReplyIntervalService.js')).default;
+    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    
+    if (intervalSeconds > 0) {
+      await autoReplyIntervalService.startIntervalCheck(accountId);
+      await autoReplyConnectionManager.disconnectAccount(accountId);
+    } else {
+      autoReplyIntervalService.stopIntervalCheck(accountId);
+      await autoReplyConnectionManager.keepAccountConnected(accountId);
+    }
+    
+    return true;
+  } else {
+    await bot.sendMessage(
+      chatId,
+      `❌ Failed to set interval: ${result.error}`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
     return false;

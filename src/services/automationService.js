@@ -1538,6 +1538,7 @@ class AutomationService {
             await client.forwardMessages(group.entity, {
               messages: [forwardMessageId],
               fromPeer: savedMessagesEntity,
+              dropAuthor: false, // Preserve original author username
             });
             console.log(`[BROADCAST] Forwarded message (ID: ${forwardMessageId}) to group ${i + 1}/${groupsToSend.length}: ${group.name || 'Unknown'}`);
             
@@ -1883,6 +1884,7 @@ class AutomationService {
                 await client.forwardMessages(group.entity, {
                   messages: [forwardMessageId],
                   fromPeer: savedMessagesEntity,
+                  dropAuthor: false, // Preserve original author username
                 });
                 console.log(`[BROADCAST] ✅ Retry successful: Forwarded to group "${groupName}"`);
                 successCount++;
@@ -2250,6 +2252,7 @@ class AutomationService {
                 await client.forwardMessages(group.entity, {
                   messages: [forwardMessageId],
                   fromPeer: savedMessagesEntity,
+                  dropAuthor: false, // Preserve original author username
                 });
                 console.log(`[FLOOD_WAIT] ✅ Retry successful: Forwarded to group "${errorGroupName}"`);
                 successCount++;
@@ -2397,6 +2400,7 @@ class AutomationService {
                   await client.forwardMessages(group.entity, {
                     messages: [forwardMessageId],
                     fromPeer: savedMessagesEntity,
+                    dropAuthor: false, // Preserve original author username
                   });
                   console.log(`[BROADCAST] ✅ Retry successful: Forwarded to group "${errorGroupName}"`);
                   successCount++;

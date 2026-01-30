@@ -477,6 +477,19 @@ export async function initializeSchema() {
     } catch (error) {
       // Column already exists, ignore error
     }
+    try {
+      await db.query(`ALTER TABLE accounts ADD COLUMN auto_reply_check_interval INTEGER DEFAULT 30`);
+    } catch (error) {
+      // Column already exists, ignore error
+    }
+    
+    // Update existing accounts with NULL or 0 to default to 30 seconds
+    try {
+      await db.query(`UPDATE accounts SET auto_reply_check_interval = 30 WHERE auto_reply_check_interval IS NULL OR auto_reply_check_interval = 0`);
+    } catch (error) {
+      // Ignore error if update fails
+      console.log(`[SCHEMA] Note: Could not update existing auto_reply_check_interval values: ${error.message}`);
+    }
 
     console.log('✅ Database schema initialized');
   } catch (error) {

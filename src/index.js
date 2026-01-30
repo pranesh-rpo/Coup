@@ -205,6 +205,10 @@ import {
   handleAutoReplyGroupsToggle,
   handleAutoReplyGroupsSetMessage,
   handleAutoReplyGroupsMessageInput,
+  handleAutoReplySetInterval,
+  handleAutoReplyIntervalSelect,
+  handleAutoReplyIntervalCustom,
+  handleAutoReplyIntervalInput,
 } from './handlers/configHandlers.js';
 import {
   handleStatsButton,
@@ -324,6 +328,15 @@ function checkProcessLock() {
     console.log('[INIT] Initializing account linker...');
     await accountLinker.initialize();
     console.log('✅ Account linker initialized');
+    
+    // Auto-reply interval service disabled - using real-time mode only
+    console.log('[INIT] Auto-reply using real-time mode (interval service disabled)');
+    
+    // Start auto-reply connection manager (keeps clients connected for real-time auto-reply)
+    console.log('[INIT] Starting auto-reply connection manager...');
+    const autoReplyConnectionManager = (await import('./services/autoReplyConnectionManager.js')).default;
+    autoReplyConnectionManager.start();
+    console.log('✅ Auto-reply connection manager started');
     
     // Start periodic cleanup for stopped broadcasts (every hour)
     setInterval(() => {
@@ -559,6 +572,7 @@ const pendingGroupDelayInputs = new Map(); // userId -> { accountId }
 const pendingBlacklistSearchInputs = new Map(); // userId -> { accountId }
 const pendingAutoReplyDmMessageInputs = new Map(); // userId -> { accountId }
 const pendingAutoReplyGroupsMessageInputs = new Map(); // userId -> { accountId }
+const pendingAutoReplyIntervalInputs = new Map(); // userId -> { accountId }
 
 // Set the reference in commandHandler so it can set pending state when redirecting to link
 setPendingPhoneNumbersReference(pendingPhoneNumbers);
@@ -1109,18 +1123,36 @@ bot.on('message', async (msg) => {
     const rawPhoneNumber = msg.text?.trim() || '';
     const sanitizedPhone = sanitizeString(rawPhoneNumber, 20); // Max 20 chars for phone
     
-    // Strip all spaces and other whitespace characters from phone number
-    // Users might type "+1 234 567 8900" which should be normalized to "+12345678900"
-    const phoneNumber = sanitizedPhone.replace(/\s+/g, '');
+    // Strip all spaces, dashes, parentheses, and other formatting characters
+    // Users might type "+1 234 567 8900", "+1-234-567-8900", or "(+1) 234 567 8900"
+    let phoneNumber = sanitizedPhone.replace(/[\s\-\(\)\.]/g, '');
     
-    // Validate phone number format (E.164: + followed by 1-15 digits)
+    // If phone number doesn't start with +, try to add it
+    // Some users might enter "1234567890" or "1 234 567 8900"
+    if (phoneNumber && !phoneNumber.startsWith('+')) {
+      // If it starts with a digit, add +
+      if (/^\d/.test(phoneNumber)) {
+        phoneNumber = '+' + phoneNumber;
+      }
+    }
+    
+    // Validate phone number format (E.164: + followed by 1-15 digits, first digit after + should be 1-9)
     const phoneRegex = /^\+[1-9]\d{1,14}$/;
     if (phoneNumber && phoneRegex.test(phoneNumber)) {
       await handlePhoneNumber(bot, msg, phoneNumber);
     } else {
+      // Provide more helpful error message
+      let errorMsg = '❌ Invalid phone number format.\n\n';
+      errorMsg += 'Please use international format:\n';
+      errorMsg += '• Must start with +\n';
+      errorMsg += '• Followed by country code and number\n';
+      errorMsg += '• Examples: +1234567890, +1 234 567 8900, +919876543210\n\n';
+      errorMsg += 'Your input: ' + (msg.text || 'empty') + '\n\n';
+      errorMsg += 'Try the "Link Account" button again.';
+      
       await bot.sendMessage(
         chatId,
-        '❌ Invalid phone number format. Please use international format (e.g., +1234567890 or +1 234 567 8900)\n\nTry the "Link Account" button again.',
+        errorMsg,
         { parse_mode: 'HTML', ...createMainMenu() }
       );
     }
@@ -1264,6 +1296,17 @@ bot.on('message', async (msg) => {
     const result = await handleAutoReplyGroupsMessageInput(bot, msg, accountId);
     if (result) {
       pendingAutoReplyGroupsMessageInputs.delete(userId);
+    }
+  } else if (pendingAutoReplyIntervalInputs.has(userId)) {
+    const pendingData = pendingAutoReplyIntervalInputs.get(userId);
+    if (!pendingData || !pendingData.accountId) {
+      pendingAutoReplyIntervalInputs.delete(userId);
+      return;
+    }
+    const accountId = pendingData.accountId;
+    const result = await handleAutoReplyIntervalInput(bot, msg, accountId);
+    if (result) {
+      pendingAutoReplyIntervalInputs.delete(userId);
     }
   } else {
     // Normal message not in any pending state - ignore it
@@ -1636,6 +1679,32 @@ bot.on('callback_query', async (callbackQuery) => {
       const result = await handleAutoReplyGroupsSetMessage(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingAutoReplyGroupsMessageInputs, userId, result);
+      }
+    } else if (data === 'auto_reply_set_interval') {
+      // Interval mode removed - always uses real-time with 30-minute cooldown
+      await safeAnswerCallback(bot, callbackQuery.id, {
+        text: 'ℹ️ Interval mode has been removed. Auto-reply now uses real-time mode with a 30-minute cooldown per chat.',
+        show_alert: true,
+      });
+    } else if (data.startsWith('auto_reply_interval_')) {
+      // Interval mode removed - always uses real-time with 30-minute cooldown
+      await safeAnswerCallback(bot, callbackQuery.id, {
+        text: 'ℹ️ Interval mode has been removed. Auto-reply now uses real-time mode with a 30-minute cooldown per chat.',
+        show_alert: true,
+      });
+      return;
+      // Old code below (disabled)
+      const intervalStr = data.replace('auto_reply_interval_', '');
+      if (intervalStr === 'custom') {
+        const result = await handleAutoReplyIntervalCustom(bot, callbackQuery);
+        if (result && result.accountId) {
+          addPendingStateWithTimeout(pendingAutoReplyIntervalInputs, userId, result);
+        }
+      } else {
+        const intervalSeconds = parseInt(intervalStr);
+        if (!isNaN(intervalSeconds)) {
+          await handleAutoReplyIntervalSelect(bot, callbackQuery, intervalSeconds);
+        }
       }
     }
   } catch (error) {

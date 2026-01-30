@@ -33,7 +33,8 @@ class ConfigService {
           auto_reply_dm_enabled,
           auto_reply_dm_message,
           auto_reply_groups_enabled,
-          auto_reply_groups_message
+          auto_reply_groups_message,
+          auto_reply_check_interval
          FROM accounts 
          WHERE account_id = $1`,
         [accountId]
@@ -64,6 +65,7 @@ class ConfigService {
         autoReplyDmMessage: row.auto_reply_dm_message,
         autoReplyGroupsEnabled: row.auto_reply_groups_enabled === 1,
         autoReplyGroupsMessage: row.auto_reply_groups_message,
+        autoReplyCheckInterval: row.auto_reply_check_interval !== null && row.auto_reply_check_interval !== undefined ? row.auto_reply_check_interval : 30, // Default 30 seconds, 0 = real-time, >0 = interval in seconds
       };
     } catch (error) {
       logger.logError('CONFIG', null, error, `Failed to get account settings for account ${accountId}`);
@@ -526,6 +528,25 @@ class ConfigService {
       return { success: true };
     } catch (error) {
       logger.logError('CONFIG', accountId, error, 'Failed to set auto reply groups');
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Set auto reply check interval (0 = real-time, >0 = interval in seconds)
+   */
+  async setAutoReplyCheckInterval(accountId, intervalSeconds) {
+    try {
+      await db.query(
+        `UPDATE accounts 
+         SET auto_reply_check_interval = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = $2`,
+        [intervalSeconds, accountId]
+      );
+      logger.logChange('CONFIG', accountId, `Auto reply check interval set to ${intervalSeconds} seconds`);
+      return { success: true };
+    } catch (error) {
+      logger.logError('CONFIG', accountId, error, 'Failed to set auto reply check interval');
       return { success: false, error: error.message };
     }
   }

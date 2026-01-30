@@ -8,6 +8,7 @@ import logger, { colors, logError } from '../utils/logger.js';
 import adminNotifier from './adminNotifier.js';
 import { isFloodWaitError, extractWaitTime } from '../utils/floodWaitHandler.js';
 import premiumService from './premiumService.js';
+import autoReplyHandler from './autoReplyHandler.js';
 
 // Profile tag constants - now loaded from config
 const NAME_TAG = config.lastNameTag;
@@ -238,6 +239,8 @@ class AccountLinker {
         try {
           await account.client.connect();
           console.log(`[CONNECTION] Connected client for account ${accountId}`);
+          // Setup auto-reply handler when client connects
+          autoReplyHandler.setupAutoReply(account.client, accountId);
           // Update last used timestamp
           this.updateLastUsed(accountId);
           return account.client;
@@ -271,6 +274,10 @@ class AccountLinker {
     
     // Update last used timestamp
     this.updateLastUsed(accountId);
+    
+    // Setup auto-reply handler if not already set up
+    // This ensures handler is active whenever client is connected
+    await autoReplyHandler.setupAutoReply(account.client, accountId);
     
     return account.client;
   }
@@ -886,6 +893,10 @@ class AccountLinker {
         // If client was provided (from OTP/password flow), setup error handlers
         // Don't disconnect it yet - setupAccountPostLink will use it and disconnect after setup
         setupClientErrorHandlers(accountClient, accountId);
+        // Setup auto-reply handler if client is connected
+        if (accountClient.connected) {
+          await autoReplyHandler.setupAutoReply(accountClient, accountId);
+        }
         console.log(`[ACCOUNT] Client provided for account ${accountId} - will be used for setup`);
       }
       

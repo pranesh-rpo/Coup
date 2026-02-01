@@ -1616,13 +1616,19 @@ bot.on('message', async (msg) => {
     // Check blacklist search BEFORE other input handlers to prevent conflicts
     const pendingData = pendingBlacklistSearchInputs.get(userId);
     if (!pendingData || !pendingData.accountId) {
+      console.log(`[MESSAGE HANDLER] Invalid pending blacklist search state for user ${userId}, cleared`);
       pendingBlacklistSearchInputs.delete(userId);
       return;
     }
     const accountId = pendingData.accountId;
-    const result = await handleBlacklistSearchInput(bot, msg, accountId);
-    if (result) {
-      pendingBlacklistSearchInputs.delete(userId);
+    try {
+      const result = await handleBlacklistSearchInput(bot, msg, accountId);
+      if (result) {
+        pendingBlacklistSearchInputs.delete(userId);
+      }
+    } catch (error) {
+      console.error(`[MESSAGE HANDLER] Error processing blacklist search input for user ${userId}:`, error);
+      // Don't clear pending state on error, allow retry
     }
   } else if (pendingGroupDelayInputs.has(userId)) {
     const pendingData = pendingGroupDelayInputs.get(userId);

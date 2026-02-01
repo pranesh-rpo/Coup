@@ -124,6 +124,17 @@ class AutoReplyPollingService {
             // Skip if message is empty or not text
             if (!lastMessage.text || lastMessage.text.trim().length === 0) continue;
 
+            // CRITICAL: Skip Saved Messages (user's own chat with themselves)
+            if (isDM) {
+              const chatIdNum = typeof chat.id === 'bigint' ? Number(chat.id) : Number(chat.id);
+              const meIdNum = typeof me.id === 'bigint' ? Number(me.id) : Number(me.id);
+              
+              if (chatIdNum === meIdNum || chat.firstName === 'Saved Messages' || chat.username === 'savedmessages') {
+                console.log(`[AUTO_REPLY_POLLING] Skipping Saved Messages for account ${accountId}`);
+                continue;
+              }
+            }
+
             // Get chat ID and message ID
             const chatId = this.extractChatId(chat, lastMessage);
             if (!chatId) continue;

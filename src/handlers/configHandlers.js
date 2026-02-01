@@ -10,7 +10,7 @@ import groupBlacklistService from '../services/groupBlacklistService.js';
 import { config } from '../config.js';
 import logger from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
-import { createConfigMenu, createQuietHoursKeyboard, createScheduleKeyboard, createMainMenu, createBackButton, createBackToGroupsButton, createGroupsMenu, createAutoReplyMenu, createIntervalMenu } from './keyboardHandler.js';
+import { createConfigMenu, createQuietHoursKeyboard, createScheduleKeyboard, createMainMenu, createBackButton, createBackToGroupsButton, createGroupsMenu, createAutoReplyMenu, createIntervalMenu, createMessagesMenu } from './keyboardHandler.js';
 
 // Helper function to show verification required (imported from commandHandler)
 // Helper function to create channel buttons keyboard
@@ -101,7 +101,6 @@ export async function handleConfigButton(bot, callbackQuery) {
     ? { start: settings.quietStart, end: settings.quietEnd }
     : null;
   
-  const forwardModeText = settings?.forwardMode ? '🟢 Enabled' : '⚪ Disabled';
   const poolModeText = settings?.useMessagePool ? `${settings.messagePoolMode === 'random' ? '🎲 Random' : settings.messagePoolMode === 'rotate' ? '🔄 Rotate' : settings.messagePoolMode === 'sequential' ? '➡️ Sequential' : 'Random'}` : '⚪ Disabled';
 
   const autoReplyDmText = settings?.autoReplyDmEnabled ? '🟢 Enabled' : '⚪ Disabled';
@@ -111,7 +110,6 @@ export async function handleConfigButton(bot, callbackQuery) {
   const configMessage = `⚙️ <b>Settings</b>\n\n` +
     `📱 <b>Account:</b> ${accountPhone}\n\n` +
     `⏱️ <b>Broadcast Interval:</b> ${currentInterval} min\n` +
-    `📤 <b>Forward Mode:</b> ${forwardModeText}\n` +
     `🎲 <b>Message Pool:</b> ${poolModeText}\n` +
     `🌙 <b>Quiet Hours:</b> ${quietHours ? `${quietHours.start} - ${quietHours.end}` : 'Not set'}\n` +
     `💬 <b>Auto Reply DM:</b> ${autoReplyDmText}\n` +
@@ -123,7 +121,7 @@ export async function handleConfigButton(bot, callbackQuery) {
     chatId,
     callbackQuery.message.message_id,
     configMessage,
-    { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours, settings?.forwardMode || false) }
+    { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours) }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -266,8 +264,8 @@ export async function handleCustomIntervalInput(bot, msg, accountId) {
   if (result.success) {
     await bot.sendMessage(
       chatId,
-      `✅ <b>Broadcast Interval Set!</b>\n\n⏱️ <b>Interval:</b> ${intervalMinutes} minutes\n\nYour broadcasts will run every ${intervalMinutes} minutes.`,
-      { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      `✅ <b>Broadcast Interval Set!</b>\n\n⏱️ <b>Interval:</b> ${intervalMinutes} minutes\n\nYour broadcasts will run every ${intervalMinutes} minutes.\n\nNote: If a broadcast is currently running, the new interval will take effect on the next cycle.`,
+      { parse_mode: 'HTML', ...createIntervalMenu() }
     );
     console.log(`[CUSTOM_INTERVAL] User ${userId} successfully set interval to ${intervalMinutes} minutes`);
     return true; // Success - clear pending state
@@ -325,7 +323,7 @@ export async function handleConfigGroupDelay(bot, callbackQuery) {
     chatId,
     callbackQuery.message.message_id,
     delayMessage,
-    { parse_mode: 'HTML', ...createBackToGroupsButton() }
+    { parse_mode: 'HTML', ...createBackButton() }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -345,7 +343,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `⏳ <b>Group Delay Configuration</b>\n\nPlease enter the delay range in format: <code>min-max</code>\n\nExamples:\n• <code>5-10</code> for 5 to 10 seconds\n• <code>default</code> to use default\n\nSend your delay range now:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     return false; // Keep pending state
   }
@@ -355,15 +353,10 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     const result = await configService.setGroupDelay(accountId, null, null);
     
     if (result.success) {
-      // Get updated settings and show groups menu
-      const settings = await configService.getAccountSettings(accountId);
-      const blacklistResult = await groupBlacklistService.getBlacklistedGroups(accountId);
-      const blacklistCount = blacklistResult.groups?.length || 0;
-      
       await bot.sendMessage(
         chatId,
         `✅ <b>Group Delay Reset to Default</b>\n\n⏳ Using default delay: 5-10 seconds`,
-        { parse_mode: 'HTML', ...createGroupsMenu(null, null, blacklistCount) }
+        { parse_mode: 'HTML', ...createIntervalMenu() }
       );
       logger.logChange('CONFIG', userId, 'Group delay reset to default');
       return true; // Success - clear pending state
@@ -371,7 +364,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
       await bot.sendMessage(
         chatId,
         `❌ <b>Failed to Reset Delay</b>\n\n<b>Error:</b> ${result.error}\n\nTry again:`,
-        { parse_mode: 'HTML', ...createBackToGroupsButton() }
+        { parse_mode: 'HTML', ...createBackButton() }
       );
       return false; // Keep pending state
     }
@@ -383,7 +376,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ Invalid format. Please use format: <code>min-max</code>\n\nExamples:\n• <code>5-10</code> for 5 to 10 seconds\n• <code>3-7</code> for 3 to 7 seconds\n\nTry again:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     return false; // Keep pending state
   }
@@ -395,7 +388,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ Invalid values. Minimum and maximum must be at least 1 second.\n\nTry again:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     return false; // Keep pending state
   }
@@ -404,7 +397,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ Invalid range. Minimum (${minSeconds}) cannot be greater than maximum (${maxSeconds}).\n\nTry again:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     return false; // Keep pending state
   }
@@ -413,7 +406,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ Values too large. Maximum delay is 300 seconds (5 minutes).\n\nTry again:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     return false; // Keep pending state
   }
@@ -422,15 +415,10 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
   const result = await configService.setGroupDelay(accountId, minSeconds, maxSeconds);
   
   if (result.success) {
-    // Get updated settings and show groups menu
-    const settings = await configService.getAccountSettings(accountId);
-    const blacklistResult = await groupBlacklistService.getBlacklistedGroups(accountId);
-    const blacklistCount = blacklistResult.groups?.length || 0;
-    
     await bot.sendMessage(
       chatId,
       `✅ <b>Group Delay Set Successfully!</b>\n\n⏳ <b>Delay Range:</b> ${minSeconds}-${maxSeconds} seconds\n\nMessages will wait a random delay between ${minSeconds} and ${maxSeconds} seconds before sending to the next group.`,
-      { parse_mode: 'HTML', ...createGroupsMenu(minSeconds, maxSeconds, blacklistCount) }
+      { parse_mode: 'HTML', ...createIntervalMenu() }
     );
     console.log(`[GROUP_DELAY] User ${userId} successfully set delay to ${minSeconds}-${maxSeconds} seconds`);
     return true; // Success - clear pending state
@@ -438,7 +426,7 @@ export async function handleGroupDelayInput(bot, msg, accountId) {
     await bot.sendMessage(
       chatId,
       `❌ <b>Failed to Set Delay</b>\n\n<b>Error:</b> ${result.error}\n\nTry again:`,
-      { parse_mode: 'HTML', ...createBackToGroupsButton() }
+      { parse_mode: 'HTML', ...createBackButton() }
     );
     console.log(`[GROUP_DELAY] User ${userId} failed to set delay: ${result.error}`);
     return false; // Keep pending state
@@ -471,8 +459,9 @@ export async function handleConfigForwardMode(bot, callbackQuery) {
   const result = await configService.setForwardMode(accountId, newForwardMode);
 
   if (result.success) {
-    // Refresh config menu
-    await handleConfigButton(bot, callbackQuery);
+    // Refresh messages menu (forward mode is now in messages menu)
+    const { handleMessagesMenu } = await import('./commandHandler.js');
+    await handleMessagesMenu(bot, callbackQuery);
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: `Forward mode ${newForwardMode ? 'enabled' : 'disabled'}`,
       show_alert: false,

@@ -9,6 +9,7 @@ import groupBlacklistService from '../services/groupBlacklistService.js';
 import adminNotifier from '../services/adminNotifier.js';
 import premiumService from '../services/premiumService.js';
 import paymentVerificationService from '../services/paymentVerificationService.js';
+import loggerBotService from '../services/loggerBotService.js';
 import otpHandler, { createOTPKeypad } from './otpHandler.js';
 import { createMainMenu, createBackButton, createStopButton, createAccountSwitchKeyboard, createGroupsMenu, createConfigMenu, createQuietHoursKeyboard, createScheduleKeyboard, createMessagePoolKeyboard, createMessagePoolListKeyboard, generateStatusText, createLoginOptionsKeyboard, createMessagesMenu } from './keyboardHandler.js';
 import { config } from '../config.js';
@@ -16,6 +17,7 @@ import logger, { logError } from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
 import { safeBotApiCall } from '../utils/floodWaitHandler.js';
 import { Api } from 'telegram/tl/index.js';
+import db from '../database/db.js';
 
 // Store reference to pending phone numbers set for setting pending state
 // This will be set by index.js
@@ -95,6 +97,104 @@ function stripHtmlTags(text) {
   console.log(`[STRIP_HTML] Stripped: ${stripped.substring(0, 100)}...`);
   
   return stripped.trim();
+}
+
+/**
+ * Extract message entities with comprehensive fallback methods
+ * This function tries multiple locations to find entities, especially for premium emojis
+ * @param {Object} msg - Telegram Bot API message object
+ * @returns {Array|null} Extracted entities array or null
+ */
+function extractMessageEntities(msg) {
+  if (!msg) {
+    console.log(`[EXTRACT_ENTITIES] No message object provided`);
+    return null;
+  }
+
+  // Log all available properties in the message object for debugging
+  const msgKeys = Object.keys(msg);
+  console.log(`[EXTRACT_ENTITIES] Message object keys:`, msgKeys);
+  console.log(`[EXTRACT_ENTITIES] Has entities: ${!!msg.entities}, Has caption_entities: ${!!msg.caption_entities}`);
+  
+  let entities = null;
+  let source = 'none';
+
+  // Method 1: Try msg.entities (standard location for text messages)
+  if (msg.entities && Array.isArray(msg.entities) && msg.entities.length > 0) {
+    entities = msg.entities;
+    source = 'msg.entities';
+    console.log(`[EXTRACT_ENTITIES] ✅ Found ${entities.length} entities in msg.entities`);
+  }
+  // Method 2: Try msg.caption_entities (for media messages with captions)
+  else if (msg.caption_entities && Array.isArray(msg.caption_entities) && msg.caption_entities.length > 0) {
+    entities = msg.caption_entities;
+    source = 'msg.caption_entities';
+    console.log(`[EXTRACT_ENTITIES] ✅ Found ${entities.length} entities in msg.caption_entities`);
+  }
+  // Method 3: Check if entities are nested in other properties
+  else if (msg.message && msg.message.entities && Array.isArray(msg.message.entities) && msg.message.entities.length > 0) {
+    entities = msg.message.entities;
+    source = 'msg.message.entities';
+    console.log(`[EXTRACT_ENTITIES] ✅ Found ${entities.length} entities in msg.message.entities`);
+  }
+  // Method 4: Check reply_to_message for forwarded entities
+  else if (msg.reply_to_message) {
+    if (msg.reply_to_message.entities && Array.isArray(msg.reply_to_message.entities) && msg.reply_to_message.entities.length > 0) {
+      entities = msg.reply_to_message.entities;
+      source = 'msg.reply_to_message.entities';
+      console.log(`[EXTRACT_ENTITIES] ✅ Found ${entities.length} entities in reply_to_message.entities`);
+    } else if (msg.reply_to_message.caption_entities && Array.isArray(msg.reply_to_message.caption_entities) && msg.reply_to_message.caption_entities.length > 0) {
+      entities = msg.reply_to_message.caption_entities;
+      source = 'msg.reply_to_message.caption_entities';
+      console.log(`[EXTRACT_ENTITIES] ✅ Found ${entities.length} entities in reply_to_message.caption_entities`);
+    }
+  }
+
+  if (!entities || entities.length === 0) {
+    console.log(`[EXTRACT_ENTITIES] ⚠️ No entities found in any location. Full message structure:`, JSON.stringify(msg, null, 2).substring(0, 500));
+    return null;
+  }
+
+  // Log raw entities for debugging
+  console.log(`[EXTRACT_ENTITIES] Raw entities from ${source}:`, JSON.stringify(entities, null, 2));
+
+  // Map entities to our format, preserving all important properties
+  const mappedEntities = entities.map((e, index) => {
+    const entity = {
+      type: e.type,
+      offset: e.offset,
+      length: e.length,
+    };
+
+    // Preserve optional properties
+    if (e.language !== undefined) entity.language = e.language;
+    if (e.url !== undefined) entity.url = e.url;
+    if (e.user !== undefined) entity.user = e.user;
+
+    // CRITICAL: Preserve custom_emoji_id as string to avoid precision loss
+    // Telegram Bot API returns custom_emoji_id as string for large numbers
+    // This is essential for premium emojis to work correctly
+    if (e.custom_emoji_id !== undefined && e.custom_emoji_id !== null) {
+      entity.custom_emoji_id = String(e.custom_emoji_id); // Always store as string
+      console.log(`[EXTRACT_ENTITIES] ✅ Entity ${index}: Found custom_emoji_id="${entity.custom_emoji_id}" (original type: ${typeof e.custom_emoji_id}, type: ${e.type}, offset: ${e.offset}, length: ${e.length})`);
+    }
+
+    return entity;
+  });
+
+  // Count premium emojis
+  const premiumEmojiCount = mappedEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id).length;
+  const totalEntities = mappedEntities.length;
+
+  console.log(`[EXTRACT_ENTITIES] ✅ Extracted ${totalEntities} entities from ${source} (${premiumEmojiCount} premium emojis)`);
+  
+  if (premiumEmojiCount > 0) {
+    const emojiIds = mappedEntities.filter(e => e.custom_emoji_id).map(e => e.custom_emoji_id);
+    console.log(`[EXTRACT_ENTITIES] 🎨 Premium emoji IDs preserved: ${emojiIds.join(', ')}`);
+    console.log(`[EXTRACT_ENTITIES] Full mapped entity data:`, JSON.stringify(mappedEntities, null, 2));
+  }
+
+  return mappedEntities;
 }
 
 // Helper function to check if user is verified
@@ -636,8 +736,20 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
           errorMessage += `⏰ <b>Please wait:</b> 10-15 minutes before trying again.\n\n`;
           errorMessage += `💡 <b>Tip:</b> This is a security measure to prevent unauthorized access.`;
         } else if (result.error.includes('PHONE') || result.error.includes('phone')) {
+          if (result.error.includes('PHONE_NUMBER_INVALID') || result.error.includes('invalid')) {
+            errorMessage += `📱 <b>Invalid Phone Number:</b> The phone number format is incorrect.\n\n`;
+            errorMessage += `Please ensure:\n`;
+            errorMessage += `• Phone number starts with + (e.g., +1234567890)\n`;
+            errorMessage += `• Includes country code (e.g., +1 for US, +91 for India)\n`;
+            errorMessage += `• No spaces, dashes, or special characters\n`;
+            errorMessage += `• Valid format: <code>+1234567890</code>\n\n`;
+          } else {
+            errorMessage += `📱 <b>Phone Number Error:</b> ${result.error}\n\n`;
+          }
         } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
+          errorMessage += `⏳ <b>Rate Limited:</b> Too many requests. Please wait a few minutes before trying again.\n\n`;
         } else if (result.error.includes('invalid') || result.error.includes('Invalid')) {
+          errorMessage += `❌ <b>Invalid Input:</b> ${result.error}\n\n`;
         }
         
         errorMessage += `Click "🔗 Link Account" to try again.`;
@@ -893,19 +1005,16 @@ export async function handleSetStartMessage(bot, msg) {
     return false; // Keep pending state so user can retry
   }
 
-  // Extract entities (for premium emoji support)
-  let messageEntities = null;
-  if (msg.entities && msg.entities.length > 0) {
-    messageEntities = msg.entities.map(e => ({
-      type: e.type,
-      offset: e.offset,
-      length: e.length,
-      language: e.language,
-      url: e.url,
-      user: e.user,
-      custom_emoji_id: e.custom_emoji_id, // For premium emojis
-    }));
-    console.log(`[handleSetStartMessage] Extracted ${messageEntities.length} entities from message (including premium emojis)`);
+  // Extract entities (for premium emoji support) using comprehensive helper function
+  // This function tries multiple fallback methods to find entities
+  console.log(`[handleSetStartMessage] Extracting entities from message for user ${userId}...`);
+  const messageEntities = extractMessageEntities(msg);
+  
+  if (messageEntities && messageEntities.length > 0) {
+    const premiumEmojiCount = messageEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id).length;
+    console.log(`[handleSetStartMessage] ✅ Successfully extracted ${messageEntities.length} entities (${premiumEmojiCount} premium emojis)`);
+  } else {
+    console.log(`[handleSetStartMessage] ⚠️ No entities found in message - premium emojis may not be preserved`);
   }
 
   // Check if message contains HTML tags (from forwarded messages with formatting)
@@ -928,13 +1037,28 @@ export async function handleSetStartMessage(bot, msg) {
   }
 
   logger.logChange('MESSAGE_SET', userId, `Broadcast message set: ${text.substring(0, 50)}...`);
+  
+  // Save message with metadata (entities including premium emojis)
+  // The entities are extracted from the original message and saved to database
+  // When broadcasting, these entities will be used to preserve premium emojis
   const result = await messageService.saveMessage(accountId, text, 'A', messageEntities);
   
   if (result.success) {
-    // Note: Forward mode will use the last message from Saved Messages
-    // User should manually forward a message (with premium emojis) to Saved Messages first
-    // The bot will then forward that message to groups
-    // No need to send message to Saved Messages here - just save to database
+    // Log entity information for debugging
+    if (messageEntities && messageEntities.length > 0) {
+      const premiumEmojis = messageEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+      if (premiumEmojis.length > 0) {
+        console.log(`[MESSAGE_SET] ✅ Message saved with ${premiumEmojis.length} premium emoji entities preserved`);
+        console.log(`[MESSAGE_SET] Premium emoji IDs: ${premiumEmojis.map(e => e.custom_emoji_id).join(', ')}`);
+        
+        // Note: For premium emojis to work, user should forward the message to account's Saved Messages
+        // This is handled separately via the "Forward to Saved Messages" option
+      } else {
+        console.log(`[MESSAGE_SET] ✅ Message saved with ${messageEntities.length} entities`);
+      }
+    } else {
+      console.log(`[MESSAGE_SET] ✅ Message saved (no entities)`);
+    }
     
     // Notify admins
     adminNotifier.notifyUserAction('MESSAGE_SET', userId, {
@@ -1212,14 +1336,33 @@ export async function handleMessagesMenu(bot, callbackQuery) {
   const pool = await messageService.getMessagePool(accountId);
   const settings = await configService.getAccountSettings(accountId);
   const usePool = settings?.useMessagePool || false;
+  const forwardMode = settings?.forwardMode || false;
 
   // Handle both object format {text, entities} and string format for backward compatibility
   const messageText = currentMessage ? (typeof currentMessage === 'string' ? currentMessage : currentMessage.text) : null;
 
+  // Get account username for Saved Messages button
+  let accountUsername = null;
+  let savedMessagesUrl = 'tg://search?query=Saved Messages';
+  try {
+    const client = await accountLinker.ensureConnected(accountId);
+    if (client) {
+      const me = await client.getMe();
+      if (me && me.username) {
+        accountUsername = me.username;
+        savedMessagesUrl = `tg://resolve?domain=${accountUsername}`;
+      }
+    }
+  } catch (error) {
+    // If we can't get username, use search as fallback
+    console.log(`[MESSAGES_MENU] Could not get account username: ${error.message}`);
+  }
+
   let menuMessage = `💬 <b>Messages</b>\n\n`;
   menuMessage += `Manage your broadcast messages and message pool.\n\n`;
   menuMessage += `✍️ <b>Current Message:</b> ${messageText ? `"${escapeHtml(messageText.substring(0, 50))}${messageText.length > 50 ? '...' : ''}"` : 'Not set'}\n`;
-  menuMessage += `🎲 <b>Message Pool:</b> ${pool.length} messages ${usePool ? '(Enabled)' : '(Disabled)'}\n\n`;
+  menuMessage += `🎲 <b>Message Pool:</b> ${pool.length} messages ${usePool ? '(Enabled)' : '(Disabled)'}\n`;
+  menuMessage += `📤 <b>Forward Mode:</b> ${forwardMode ? '🟢 Enabled' : '⚪ Disabled'}\n\n`;
   menuMessage += `Select an option below:`;
 
   await safeEditMessage(
@@ -1227,7 +1370,7 @@ export async function handleMessagesMenu(bot, callbackQuery) {
     chatId,
     callbackQuery.message.message_id,
     menuMessage,
-    { parse_mode: 'HTML', ...createMessagesMenu() }
+    { parse_mode: 'HTML', ...createMessagesMenu(forwardMode, savedMessagesUrl) }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -1268,13 +1411,436 @@ export async function handleSetStartMessageButton(bot, callbackQuery) {
     return;
   }
 
-  const currentMessage = await messageService.getActiveMessage(accountId);
-  const prompt = currentMessage 
-    ? `📝 <b>Set Broadcast Message</b>\n\n<b>Current message:</b>\n<i>"${escapeHtml(currentMessage.length > 100 ? currentMessage.substring(0, 100) + '...' : currentMessage)}"</i>\n\nSend your new message to replace it:`
-    : `📝 <b>Set Broadcast Message</b>\n\nPlease send your broadcast message:`;
+  // Automatically detect and set the last message from Saved Messages
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: 'Checking Saved Messages...',
+    show_alert: false,
+  });
 
-  await safeEditMessage(bot, chatId, callbackQuery.message.message_id, prompt, { parse_mode: 'HTML', ...createBackButton() });
-  await safeAnswerCallback(bot, callbackQuery.id);
+  try {
+    const accountLinker = (await import('../services/accountLinker.js')).default;
+    
+    // Check if account exists in database
+    const accounts = await accountLinker.getAccounts(userId);
+    const account = accounts.find(a => a.accountId === accountId);
+    
+    if (!account) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Account Not Found</b>\n\n' +
+        `The account (ID: ${accountId}) is no longer linked or has been deleted.\n\n` +
+        `Please link your account again from the Account menu.`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+    
+    // Try to get client and connect
+    let client;
+    try {
+      client = await accountLinker.getClientAndConnect(userId, accountId);
+      
+      // If client is null, account might not be in memory - try reloading
+      if (!client) {
+        console.log(`[SET_MESSAGE] Account ${accountId} not in memory, reloading accounts...`);
+        try {
+          // Reload all accounts to ensure this one is loaded
+          await accountLinker.loadLinkedAccounts();
+          console.log(`[SET_MESSAGE] Accounts reloaded, retrying connection...`);
+          // Retry after reload
+          client = await accountLinker.getClientAndConnect(userId, accountId);
+        } catch (reloadError) {
+          console.log(`[SET_MESSAGE] Error reloading accounts: ${reloadError.message}`);
+        }
+      }
+    } catch (connectError) {
+      console.log(`[SET_MESSAGE] Connection error for account ${accountId}: ${connectError.message}`);
+      
+      // Check if it's a session revocation error
+      const errorMessage = connectError.message || connectError.toString() || '';
+      const errorCode = connectError.code || connectError.errorCode || connectError.response?.error_code;
+      const isSessionRevoked = connectError.errorMessage === 'SESSION_REVOKED' || 
+                                connectError.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                                (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                                errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                                errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[SET_MESSAGE] Session revoked for account ${accountId} during connection, handling revocation...`);
+        await accountLinker.handleSessionRevoked(accountId);
+        
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          '🔐 <b>Session Expired</b>\n\n' +
+          `Your account session has expired or been revoked.\n\n` +
+          `Please re-link your account:\n\n` +
+          `1️⃣ Go to Account menu\n` +
+          `2️⃣ Delete the old account\n` +
+          `3️⃣ Link your account again\n\n` +
+          `After re-linking, you can set your message again.`,
+          { parse_mode: 'HTML', ...await createMainMenu(userId) }
+        );
+        return;
+      }
+      
+      // Check if it's an "Account not found" error - try reloading once
+      if (connectError.message && connectError.message.includes('not found')) {
+        try {
+          console.log(`[SET_MESSAGE] Account not found, attempting to reload accounts...`);
+          await accountLinker.loadLinkedAccounts();
+          // Retry after reload
+          client = await accountLinker.getClientAndConnect(userId, accountId);
+        } catch (retryError) {
+          // If retry also fails, show error message
+          await safeEditMessage(
+            bot,
+            chatId,
+            callbackQuery.message.message_id,
+            '❌ <b>Account Connection Error</b>\n\n' +
+            `Unable to connect to account ${accountId}.\n\n` +
+            `This might happen if:\n` +
+            `• The account session expired\n` +
+            `• The account was deleted\n` +
+            `• There's a connection issue\n\n` +
+            `Please try:\n` +
+            `1. Switch to another account\n` +
+            `2. Re-link this account\n` +
+            `3. Try again later`,
+            { parse_mode: 'HTML', ...await createMainMenu(userId) }
+          );
+          return;
+        }
+      } else {
+        throw connectError; // Re-throw other errors
+      }
+    }
+    
+    if (!client) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Account Connection Error</b>\n\n' +
+        `Unable to connect to account ${accountId}.\n\n` +
+        `Please try:\n` +
+        `1. Switch to another account\n` +
+        `2. Re-link this account`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+
+    // Get Saved Messages entity
+    let me;
+    let savedMessagesEntity;
+    try {
+      me = await client.getMe();
+    } catch (error) {
+      // Check if it's a session revocation error
+      const errorMessage = error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || error.response?.error_code;
+      const isSessionRevoked = error.errorMessage === 'SESSION_REVOKED' || 
+                                error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                                (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                                errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                                errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[SET_MESSAGE] Session revoked for account ${accountId}, handling revocation...`);
+        await accountLinker.handleSessionRevoked(accountId);
+        
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          '🔐 <b>Session Expired</b>\n\n' +
+          `Your account session has expired or been revoked.\n\n` +
+          `Please re-link your account:\n\n` +
+          `1️⃣ Go to Account menu\n` +
+          `2️⃣ Delete the old account\n` +
+          `3️⃣ Link your account again\n\n` +
+          `After re-linking, you can set your message again.`,
+          { parse_mode: 'HTML', ...await createMainMenu(userId) }
+        );
+        return;
+      }
+      
+      throw error;
+    }
+    
+    try {
+      savedMessagesEntity = await client.getEntity(me);
+    } catch (error) {
+      // Check if it's a session revocation error
+      const errorMessage = error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || error.response?.error_code;
+      const isSessionRevoked = error.errorMessage === 'SESSION_REVOKED' || 
+                                error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                                (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                                errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                                errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[SET_MESSAGE] Session revoked for account ${accountId} while getting entity, handling revocation...`);
+        await accountLinker.handleSessionRevoked(accountId);
+        
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          '🔐 <b>Session Expired</b>\n\n' +
+          `Your account session has expired or been revoked.\n\n` +
+          `Please re-link your account:\n\n` +
+          `1️⃣ Go to Account menu\n` +
+          `2️⃣ Delete the old account\n` +
+          `3️⃣ Link your account again\n\n` +
+          `After re-linking, you can set your message again.`,
+          { parse_mode: 'HTML', ...await createMainMenu(userId) }
+        );
+        return;
+      }
+      
+      // Try alternative method
+      try {
+        const dialogs = await client.getDialogs();
+        const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+        if (savedDialog) {
+          savedMessagesEntity = savedDialog.entity;
+        } else {
+          throw new Error('Saved Messages not found');
+        }
+      } catch (dialogError) {
+        const dialogErrorMessage = dialogError.message || dialogError.toString() || '';
+        const dialogErrorCode = dialogError.code || dialogError.errorCode || dialogError.response?.error_code;
+        const isDialogSessionRevoked = dialogError.errorMessage === 'SESSION_REVOKED' || 
+                                       dialogError.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                                       (dialogErrorCode === 401 && (dialogErrorMessage.includes('SESSION_REVOKED') || dialogErrorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                                       dialogErrorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                                       dialogErrorMessage.includes('SESSION_REVOKED');
+        
+        if (isDialogSessionRevoked) {
+          console.log(`[SET_MESSAGE] Session revoked for account ${accountId} while getting dialogs, handling revocation...`);
+          await accountLinker.handleSessionRevoked(accountId);
+          
+          await safeEditMessage(
+            bot,
+            chatId,
+            callbackQuery.message.message_id,
+            '🔐 <b>Session Expired</b>\n\n' +
+            `Your account session has expired or been revoked.\n\n` +
+            `Please re-link your account:\n\n` +
+            `1️⃣ Go to Account menu\n` +
+            `2️⃣ Delete the old account\n` +
+            `3️⃣ Link your account again\n\n` +
+            `After re-linking, you can set your message again.`,
+            { parse_mode: 'HTML', ...await createMainMenu(userId) }
+          );
+          return;
+        }
+        
+        throw dialogError;
+      }
+    }
+
+    // Get the last message from Saved Messages
+    let messages;
+    try {
+      messages = await client.getMessages(savedMessagesEntity, { limit: 1 });
+    } catch (error) {
+      // Check if it's a session revocation error
+      const errorMessage = error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || error.response?.error_code;
+      const isSessionRevoked = error.errorMessage === 'SESSION_REVOKED' || 
+                                error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                                (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                                errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                                errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[SET_MESSAGE] Session revoked for account ${accountId} while getting messages, handling revocation...`);
+        await accountLinker.handleSessionRevoked(accountId);
+        
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          '🔐 <b>Session Expired</b>\n\n' +
+          `Your account session has expired or been revoked.\n\n` +
+          `Please re-link your account:\n\n` +
+          `1️⃣ Go to Account menu\n` +
+          `2️⃣ Delete the old account\n` +
+          `3️⃣ Link your account again\n\n` +
+          `After re-linking, you can set your message again.`,
+          { parse_mode: 'HTML', ...await createMainMenu(userId) }
+        );
+        return;
+      }
+      
+      throw error;
+    }
+    
+    if (!messages || messages.length === 0) {
+      const instructions = `📝 <b>Set Broadcast Message</b>\n\n` +
+        `No message found in Saved Messages.\n\n` +
+        `To set your broadcast message:\n\n` +
+        `1️⃣ Open your account's Telegram app\n` +
+        `2️⃣ Go to <b>Saved Messages</b>\n` +
+        `3️⃣ Send your message there (with premium emojis if you want)\n` +
+        `4️⃣ Come back and click "Set Message" again\n\n` +
+        `The bot will automatically use the <b>last message</b> from your Saved Messages.`;
+
+      const keyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📖 How to Open Saved Messages', callback_data: 'btn_show_saved_instructions' }],
+            [{ text: '🔄 Try Again', callback_data: 'btn_set_start_msg' }],
+            [{ text: '🔙 Back', callback_data: 'btn_messages_menu' }]
+          ]
+        }
+      };
+
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        instructions,
+        { parse_mode: 'HTML', ...keyboard }
+      );
+      return;
+    }
+
+    const savedMessage = messages[0];
+    const savedMessageId = savedMessage.id;
+    const messageText = savedMessage.text || '';
+    
+    // Extract entities from the saved message
+    let messageEntities = null;
+    if (savedMessage.entities && savedMessage.entities.length > 0) {
+      messageEntities = savedMessage.entities.map(e => {
+        let entityType = 'unknown';
+        
+        if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+          entityType = 'custom_emoji';
+        } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+          entityType = 'bold';
+        } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+          entityType = 'italic';
+        } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+          entityType = 'code';
+        } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+          entityType = 'pre';
+        }
+
+        const entity = {
+          type: entityType,
+          offset: e.offset,
+          length: e.length,
+        };
+
+        if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+          entity.custom_emoji_id = String(e.documentId);
+        }
+
+        if (entityType === 'pre' && e.language !== undefined) {
+          entity.language = e.language;
+        }
+
+        return entity;
+      });
+    }
+
+    // Deactivate existing messages
+    await db.query(
+      `UPDATE messages SET is_active = FALSE WHERE account_id = $1`,
+      [accountId]
+    );
+
+    // Save new active message
+    const result = await messageService.saveMessage(accountId, messageText, 'A', messageEntities);
+    
+    if (result.success) {
+      // Update with saved_message_id
+      await db.query(
+        `UPDATE messages 
+         SET saved_message_id = $1
+         WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [savedMessageId, accountId]
+      );
+
+      const premiumEmojiCount = messageEntities ? messageEntities.filter(e => e.type === 'custom_emoji').length : 0;
+      const previewText = messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText;
+
+      let successMessage = `✅ <b>Broadcast Message Set!</b>\n\n`;
+      successMessage += `Your message from Saved Messages has been set as the broadcast message.\n\n`;
+      successMessage += `📝 <b>Preview:</b> ${escapeHtml(previewText)}\n`;
+      if (premiumEmojiCount > 0) {
+        successMessage += `🎨 <b>Premium Emojis:</b> ${premiumEmojiCount} found\n\n`;
+      }
+      successMessage += `✅ The bot will use the <b>last message</b> from Saved Messages when broadcasting.`;
+
+      console.log(`[SET_MESSAGE] ✅ Message set from Saved Messages (ID: ${savedMessageId}, ${premiumEmojiCount} premium emojis)`);
+
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        successMessage,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+
+      logger.logChange('MESSAGE_SET', userId, `Message set from Saved Messages (ID: ${savedMessageId})`);
+    } else {
+      throw new Error(result.error || 'Failed to save message');
+    }
+  } catch (error) {
+    console.log(`[SET_MESSAGE] Error: ${error.message}`);
+    
+    // Check if it's a session revocation error
+    const errorMessage = error.message || error.toString() || '';
+    const errorCode = error.code || error.errorCode || error.response?.error_code;
+    const isSessionRevoked = error.errorMessage === 'SESSION_REVOKED' || 
+                              error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+                              (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                              errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                              errorMessage.includes('SESSION_REVOKED');
+    
+    if (isSessionRevoked) {
+      console.log(`[SET_MESSAGE] Session revoked for account ${accountId} in catch block, handling revocation...`);
+      try {
+        await accountLinker.handleSessionRevoked(accountId);
+      } catch (revokeError) {
+        console.log(`[SET_MESSAGE] Error handling session revocation: ${revokeError.message}`);
+      }
+      
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '🔐 <b>Session Expired</b>\n\n' +
+        `Your account session has expired or been revoked.\n\n` +
+        `Please re-link your account:\n\n` +
+        `1️⃣ Go to Account menu\n` +
+        `2️⃣ Delete the old account\n` +
+        `3️⃣ Link your account again\n\n` +
+        `After re-linking, you can set your message again.`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+    
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      `❌ <b>Error</b>\n\nFailed to set message from Saved Messages: ${error.message}\n\nPlease make sure you have sent a message to Saved Messages first.`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+  }
 }
 
 
@@ -1331,12 +1897,49 @@ export async function handleStartBroadcast(bot, msg) {
     return;
   }
 
+  // Check if logger bot is started (only on first time - check if user has ever started broadcast before)
+  const hasLoggerBotStarted = await loggerBotService.hasLoggerBotStarted(userId);
+  if (!hasLoggerBotStarted) {
+    // Check if this is the first time starting broadcast (no previous broadcast history)
+    const hasPreviousBroadcast = await db.query(
+      'SELECT 1 FROM accounts WHERE user_id = ? AND broadcast_start_time IS NOT NULL LIMIT 1',
+      [userId]
+    );
+    
+    // Only show warning on first time
+    if (!hasPreviousBroadcast.rows || hasPreviousBroadcast.rows.length === 0) {
+      const loggerBotUsername = config.userLoggerBotToken ? 'your logger bot' : 'the logger bot';
+      await bot.sendMessage(
+        chatId,
+        `❌ <b>Logger Bot Required</b>\n\n` +
+        `Please start the logger bot before starting broadcast.\n\n` +
+        `The logger bot sends you important logs about your account activity.\n\n` +
+        `Click the button below to start the logger bot:`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📝 Start Logger Bot', callback_data: 'btn_logger_bot' }],
+              [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+            ]
+          }
+        }
+      );
+      return;
+    }
+  }
+
   // automationService.startBroadcast will get message from messageService if not provided
   const result = await automationService.startBroadcast(userId, null);
 
   if (result.success) {
     const accountId = accountLinker.getActiveAccountId(userId);
     logger.logSuccess('BROADCAST_STARTED', userId, `Broadcast started for account ${accountId}`);
+    
+    // Send log to logger bot
+    loggerBotService.logBroadcastStarted(userId, accountId).catch(() => {
+      // Silently fail - logger bot may not be started or user may have blocked it
+    });
     
     // Notify admins
     adminNotifier.notifyUserAction('BROADCAST_STARTED', userId, {
@@ -1429,6 +2032,45 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
     return;
   }
 
+  // Check if logger bot is started (only on first time - check if user has ever started broadcast before)
+  if (!automationService.isBroadcasting(userId, accountId)) {
+    const hasLoggerBotStarted = await loggerBotService.hasLoggerBotStarted(userId);
+    if (!hasLoggerBotStarted) {
+      // Check if this is the first time starting broadcast (no previous broadcast history)
+      const hasPreviousBroadcast = await db.query(
+        'SELECT 1 FROM accounts WHERE user_id = ? AND broadcast_start_time IS NOT NULL LIMIT 1',
+        [userId]
+      );
+      
+      // Only show warning on first time
+      if (!hasPreviousBroadcast.rows || hasPreviousBroadcast.rows.length === 0) {
+        await safeAnswerCallback(bot, callbackQuery.id, {
+          text: 'Please start the logger bot first!',
+          show_alert: true,
+        });
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          `❌ <b>Logger Bot Required</b>\n\n` +
+          `Please start the logger bot before starting broadcast.\n\n` +
+          `The logger bot sends you important logs about your account activity.\n\n` +
+          `Click the button below to start the logger bot:`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '📝 Start Logger Bot', callback_data: 'btn_logger_bot' }],
+                [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+              ]
+            }
+          }
+        );
+        return;
+      }
+    }
+  }
+
   // Answer callback immediately for better UX
   await safeAnswerCallback(bot, callbackQuery.id);
   
@@ -1451,6 +2093,11 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
         if (result.success) {
           logger.logSuccess('BROADCAST_STOPPED', userId, `Broadcast stopped for account ${accountId}`);
           console.log(`[BROADCAST_STOP] Broadcast successfully stopped for user ${userId}, account ${accountId}`);
+          
+          // Send log to logger bot
+          loggerBotService.logBroadcastStopped(userId, accountId).catch(() => {
+            // Silently fail - logger bot may not be started or user may have blocked it
+          });
           
           // Notify admins
           adminNotifier.notifyUserAction('BROADCAST_STOPPED', userId, {
@@ -1660,6 +2307,11 @@ export async function handleStopBroadcast(bot, msg) {
   if (result.success) {
     logger.logSuccess('BROADCAST_STOPPED', userId, `Broadcast stopped for account ${accountId}`);
     
+    // Send log to logger bot
+    loggerBotService.logBroadcastStopped(userId, accountId).catch(() => {
+      // Silently fail - logger bot may not be started or user may have blocked it
+    });
+    
     // Notify admins
     adminNotifier.notifyUserAction('BROADCAST_STOPPED', userId, {
       username: msg.from.username || null,
@@ -1751,6 +2403,11 @@ export async function handleStopCallback(bot, callbackQuery) {
 
   if (result.success) {
     logger.logSuccess('BROADCAST_STOPPED', userId, `Broadcast stopped for account ${accountId}`);
+    
+    // Send log to logger bot
+    loggerBotService.logBroadcastStopped(userId, accountId).catch(() => {
+      // Silently fail - logger bot may not be started or user may have blocked it
+    });
     
     // Notify admins
     adminNotifier.notifyUserAction('BROADCAST_STOPPED', userId, {
@@ -1881,6 +2538,107 @@ export async function handleStatusButton(bot, callbackQuery) {
 }
 
 // Unified account management handler
+export async function handleLoggerBotButton(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+
+  if (!config.userLoggerBotToken) {
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      '❌ <b>Logger Bot Not Configured</b>\n\nThe logger bot is not configured. Please contact support.',
+      { parse_mode: 'HTML', ...await createMainMenu(userId) }
+    );
+    return;
+  }
+
+  // Get logger bot info
+  try {
+    if (!loggerBotService.bot || !loggerBotService.initialized) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Logger Bot Not Available</b>\n\nThe logger bot is not initialized. Please contact support.',
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+
+    const botInfo = await safeBotApiCall(
+      () => loggerBotService.bot.getMe(),
+      { maxRetries: 2, bufferSeconds: 1, throwOnFailure: false }
+    );
+
+    if (!botInfo) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Logger Bot Error</b>\n\nCould not connect to logger bot. Please try again later.',
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+
+    const loggerBotUsername = botInfo.username || 'logger bot';
+    const hasStarted = await loggerBotService.hasLoggerBotStarted(userId);
+
+    if (hasStarted) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        `✅ <b>Logger Bot Active</b>\n\n` +
+        `You are receiving logs from the logger bot.\n\n` +
+        `Bot: @${loggerBotUsername}\n\n` +
+        `To stop receiving logs, you can block the logger bot.`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+            ]
+          }
+        }
+      );
+    } else {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        `📝 <b>Start Logger Bot</b>\n\n` +
+        `The logger bot sends you important logs about your account activity, including:\n\n` +
+        `• Broadcast status updates\n` +
+        `• Account activity notifications\n` +
+        `• Important system messages\n\n` +
+        `To start the logger bot, click the button below and send /start to @${loggerBotUsername}:`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `📝 Start @${loggerBotUsername}`, url: `https://t.me/${loggerBotUsername}?start=start` }],
+              [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+            ]
+          }
+        }
+      );
+    }
+  } catch (error) {
+    logError('[LOGGER_BOT] Error handling logger bot button:', error);
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      '❌ <b>Error</b>\n\nFailed to get logger bot information. Please try again later.',
+      { parse_mode: 'HTML', ...await createMainMenu(userId) }
+    );
+  }
+}
+
 export async function handleAccountButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
@@ -2004,16 +2762,109 @@ export async function handleMessagePoolButton(bot, callbackQuery) {
     return;
   }
 
-  const pool = await messageService.getMessagePool(accountId);
+  // Automatically sync messages from Saved Messages
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: 'Syncing messages from Saved Messages...',
+    show_alert: false,
+  });
+
+  try {
+    const client = await accountLinker.ensureConnected(accountId);
+    if (client) {
+      const me = await client.getMe();
+      let savedMessagesEntity;
+      try {
+        savedMessagesEntity = await client.getEntity(me);
+      } catch (error) {
+        const dialogs = await client.getDialogs();
+        const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+        if (savedDialog) {
+          savedMessagesEntity = savedDialog.entity;
+        }
+      }
+
+      if (savedMessagesEntity) {
+        // Get the last 7 messages from Saved Messages
+        const messages = await client.getMessages(savedMessagesEntity, { limit: 7 });
+        if (messages && messages.length > 0) {
+          let addedCount = 0;
+          let duplicateCount = 0;
+          let skippedCount = 0;
+
+          for (const savedMessage of messages) {
+            const messageText = savedMessage.text || '';
+            
+            if (!messageText || messageText.trim().length === 0 || messageText.length > 4096) {
+              skippedCount++;
+              continue;
+            }
+            
+            let messageEntities = null;
+            if (savedMessage.entities && savedMessage.entities.length > 0) {
+              messageEntities = savedMessage.entities.map(e => {
+                let entityType = 'unknown';
+                if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+                  entityType = 'custom_emoji';
+                } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+                  entityType = 'bold';
+                } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+                  entityType = 'italic';
+                } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+                  entityType = 'code';
+                } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+                  entityType = 'pre';
+                }
+
+                const entity = {
+                  type: entityType,
+                  offset: e.offset,
+                  length: e.length,
+                };
+
+                if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+                  entity.custom_emoji_id = String(e.documentId);
+                }
+
+                if (entityType === 'pre' && e.language !== undefined) {
+                  entity.language = e.language;
+                }
+
+                return entity;
+              });
+            }
+
+            const result = await messageService.addToMessagePool(accountId, messageText, messageEntities);
+            if (result.success) {
+              addedCount++;
+            } else if (result.isDuplicate) {
+              duplicateCount++;
+            } else {
+              skippedCount++;
+            }
+          }
+
+          if (addedCount > 0) {
+            logger.logChange('MESSAGE_POOL', userId, `Auto-synced ${addedCount} message(s) from Saved Messages`);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.log(`[POOL_SYNC] Error syncing messages: ${error.message}`);
+    // Continue anyway - show pool even if sync fails
+  }
+
+  const pool = await messageService.getMessagePool(accountId, true); // Get all messages including inactive
   const settings = await configService.getAccountSettings(accountId);
   const usePool = settings?.useMessagePool || false;
   const poolMode = settings?.messagePoolMode || 'random';
+  const activePool = pool.filter(msg => msg.is_active);
 
   const poolMessage = `🎲 <b>Message Pool</b>\n\n` +
-    `📊 <b>Messages in Pool:</b> ${pool.length}\n` +
+    `📊 <b>Total Messages:</b> ${pool.length} (${activePool.length} active, ${pool.length - activePool.length} disabled)\n` +
     `⚙️ <b>Mode:</b> ${usePool ? `✅ ${poolMode === 'random' ? '🎲 Random' : poolMode === 'rotate' ? '🔄 Rotate' : poolMode === 'sequential' ? '➡️ Sequential' : '🎲 Random'}` : '❌ Disabled'}\n\n` +
-    `${pool.length === 0 ? '⚠️ Add messages to the pool to start using it.\n\n' : ''}` +
-    `The message pool allows you to add multiple messages. Each broadcast will ${poolMode === 'random' ? 'randomly select' : poolMode === 'rotate' ? 'rotate through in order' : poolMode === 'sequential' ? 'send sequentially (one per group)' : 'randomly select'} one from the pool.\n\n` +
+    `${pool.length === 0 ? '⚠️ No messages in pool. Send messages to Saved Messages and they will be auto-synced.\n\n' : ''}` +
+    `The message pool automatically syncs the <b>last 7 messages</b> from your Saved Messages. Each broadcast will ${poolMode === 'random' ? 'randomly select' : poolMode === 'rotate' ? 'rotate through in order' : poolMode === 'sequential' ? 'send sequentially (one per group)' : 'randomly select'} one from the active pool.\n\n` +
     `${usePool ? '✅ Pool is <b>enabled</b> and will be used for broadcasts.\n\n' : '⚠️ Pool is <b>disabled</b>. Enable it to use pool messages.\n\n'}` +
     `Use buttons below to manage your message pool.`;
 
@@ -2022,10 +2873,8 @@ export async function handleMessagePoolButton(bot, callbackQuery) {
     chatId,
     callbackQuery.message.message_id,
     poolMessage,
-    { parse_mode: 'HTML', ...createMessagePoolKeyboard(pool.length, poolMode, usePool) }
+    { parse_mode: 'HTML', ...createMessagePoolKeyboard(activePool.length, poolMode, usePool) }
   );
-  
-  await safeAnswerCallback(bot, callbackQuery.id);
 }
 
 export async function handlePoolAddMessage(bot, callbackQuery) {
@@ -2052,92 +2901,478 @@ export async function handlePoolAddMessage(bot, callbackQuery) {
     return;
   }
 
-  const prompt = `📝 <b>Add Message to Pool</b>\n\nSend your message to add it to the pool:`;
+  // Automatically detect and add the last message from Saved Messages to pool
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: 'Checking Saved Messages...',
+    show_alert: false,
+  });
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    prompt,
-    { parse_mode: 'HTML', ...createBackButton() }
-  );
-  
-  // Store pending state
-  if (typeof global !== 'undefined' && !global.pendingPoolMessages) {
-    global.pendingPoolMessages = new Map();
-  }
-  if (typeof global !== 'undefined') {
-    global.pendingPoolMessages.set(userId, { accountId });
+  try {
+    const accountLinker = (await import('../services/accountLinker.js')).default;
+    
+    // Check if account exists and is linked
+    const accounts = await accountLinker.getAccounts(userId);
+    const account = accounts.find(a => a.accountId === accountId);
+    
+    if (!account) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Account Not Found</b>\n\n' +
+        `The account (ID: ${accountId}) is no longer linked or has been deleted.\n\n` +
+        `Please link your account again from the Account menu.`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+    
+    // Try to get client and connect
+    let client;
+    try {
+      client = await accountLinker.getClientAndConnect(userId, accountId);
+      
+      // If client is null, account might not be in memory - try reloading
+      if (!client) {
+        console.log(`[POOL_ADD] Account ${accountId} not in memory, reloading accounts...`);
+        try {
+          // Reload all accounts to ensure this one is loaded
+          await accountLinker.loadLinkedAccounts();
+          console.log(`[POOL_ADD] Accounts reloaded, retrying connection...`);
+          // Retry after reload
+          client = await accountLinker.getClientAndConnect(userId, accountId);
+        } catch (reloadError) {
+          console.log(`[POOL_ADD] Error reloading accounts: ${reloadError.message}`);
+        }
+      }
+    } catch (connectError) {
+      console.log(`[POOL_ADD] Connection error for account ${accountId}: ${connectError.message}`);
+      
+      // Check if it's an "Account not found" error - try reloading once
+      if (connectError.message && connectError.message.includes('not found')) {
+        try {
+          console.log(`[POOL_ADD] Account not found, attempting to reload accounts...`);
+          await accountLinker.loadLinkedAccounts();
+          // Retry after reload
+          client = await accountLinker.getClientAndConnect(userId, accountId);
+        } catch (retryError) {
+          // If retry also fails, show error message
+          await safeEditMessage(
+            bot,
+            chatId,
+            callbackQuery.message.message_id,
+            '❌ <b>Account Connection Error</b>\n\n' +
+            `Unable to connect to account ${accountId}.\n\n` +
+            `This might happen if:\n` +
+            `• The account session expired\n` +
+            `• The account was deleted\n` +
+            `• There's a connection issue\n\n` +
+            `Please try:\n` +
+            `1. Switch to another account\n` +
+            `2. Re-link this account\n` +
+            `3. Try again later`,
+            { parse_mode: 'HTML', ...await createMainMenu(userId) }
+          );
+          return;
+        }
+      } else {
+        throw connectError; // Re-throw other errors
+      }
+    }
+    
+    if (!client) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Account Connection Error</b>\n\n' +
+        `Unable to connect to account ${accountId}.\n\n` +
+        `Please try:\n` +
+        `1. Switch to another account\n` +
+        `2. Re-link this account`,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+      return;
+    }
+    
+    if (!client) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ Account client not available. Please try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    // Get Saved Messages entity
+    const me = await client.getMe();
+    let savedMessagesEntity;
+    try {
+      savedMessagesEntity = await client.getEntity(me);
+    } catch (error) {
+      const dialogs = await client.getDialogs();
+      const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+      if (savedDialog) {
+        savedMessagesEntity = savedDialog.entity;
+      } else {
+        throw new Error('Saved Messages not found');
+      }
+    }
+
+    // Get the last 7 messages from Saved Messages
+    const messages = await client.getMessages(savedMessagesEntity, { limit: 7 });
+    if (!messages || messages.length === 0) {
+      const instructions = `📝 <b>Add Messages to Pool</b>\n\n` +
+        `No messages found in Saved Messages.\n\n` +
+        `To add messages to the pool:\n\n` +
+        `1️⃣ Open your account's Telegram app\n` +
+        `2️⃣ Go to <b>Saved Messages</b>\n` +
+        `3️⃣ Send your messages there (with premium emojis if you want)\n` +
+        `4️⃣ Come back and click "Add to Pool" again\n\n` +
+        `The bot will automatically add the <b>last 7 messages</b> from your Saved Messages.`;
+
+      const keyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📱 How to Open Saved Messages', callback_data: 'btn_show_saved_instructions' }],
+            [{ text: '🔄 Try Again', callback_data: 'pool_add_message' }],
+            [{ text: '🔙 Back', callback_data: 'btn_message_pool' }]
+          ]
+        }
+      };
+
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        instructions,
+        { parse_mode: 'HTML', ...keyboard }
+      );
+      return;
+    }
+
+    // Process all messages (up to 5)
+    let addedCount = 0;
+    let duplicateCount = 0;
+    let skippedCount = 0;
+    const results = [];
+
+    for (const savedMessage of messages) {
+      const messageText = savedMessage.text || '';
+      
+      // Skip empty messages
+      if (!messageText || messageText.trim().length === 0) {
+        skippedCount++;
+        continue;
+      }
+
+      // Validate message length
+      if (messageText.length > 4096) {
+        skippedCount++;
+        continue;
+      }
+      
+      // Extract entities from the saved message
+      let messageEntities = null;
+      if (savedMessage.entities && savedMessage.entities.length > 0) {
+        messageEntities = savedMessage.entities.map(e => {
+          let entityType = 'unknown';
+          
+          if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+            entityType = 'custom_emoji';
+          } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+            entityType = 'bold';
+          } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+            entityType = 'italic';
+          } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+            entityType = 'code';
+          } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+            entityType = 'pre';
+          }
+
+          const entity = {
+            type: entityType,
+            offset: e.offset,
+            length: e.length,
+          };
+
+          if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+            entity.custom_emoji_id = String(e.documentId);
+          }
+
+          if (entityType === 'pre' && e.language !== undefined) {
+            entity.language = e.language;
+          }
+
+          return entity;
+        });
+      }
+
+      // Add to pool
+      logger.logChange('MESSAGE_POOL', userId, `Message added to pool from Saved Messages: ${messageText.substring(0, 50)}...`);
+      const result = await messageService.addToMessagePool(accountId, messageText, messageEntities);
+      
+      if (result.success) {
+        addedCount++;
+        results.push({ success: true, text: messageText, entities: messageEntities });
+      } else if (result.isDuplicate) {
+        duplicateCount++;
+      } else {
+        skippedCount++;
+      }
+    }
+
+    // Show summary
+    const pool = await messageService.getMessagePool(accountId);
+    let successMessage = `✅ <b>Messages Added to Pool!</b>\n\n`;
+    successMessage += `✅ <b>Added:</b> ${addedCount} message(s)\n`;
+    if (duplicateCount > 0) {
+      successMessage += `⚠️ <b>Duplicates skipped:</b> ${duplicateCount} message(s)\n`;
+    }
+    if (skippedCount > 0) {
+      successMessage += `⏭️ <b>Skipped:</b> ${skippedCount} message(s) (empty or too long)\n`;
+    }
+    successMessage += `\n📊 <b>Total messages in pool:</b> ${pool.length}\n`;
+    
+    const totalPremiumEmojis = results.reduce((sum, r) => {
+      return sum + (r.entities ? r.entities.filter(e => e.type === 'custom_emoji').length : 0);
+    }, 0);
+    if (totalPremiumEmojis > 0) {
+      successMessage += `🎨 <b>Premium Emojis found:</b> ${totalPremiumEmojis}\n`;
+    }
+    
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      successMessage,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+  } catch (error) {
+    console.log(`[POOL_ADD] Error: ${error.message}`);
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      `❌ <b>Error</b>\n\nFailed to add message from Saved Messages: ${error.message}\n\nPlease make sure you have sent a message to Saved Messages first.`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
   }
   
   await safeAnswerCallback(bot, callbackQuery.id);
   return { accountId };
 }
 
-export async function handlePoolMessageInput(bot, msg, accountId) {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
+/**
+ * Handle adding last message from Saved Messages to pool
+ */
+export async function handlePoolAddFromSaved(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
 
-  let text = msg.text?.trim();
-  
-  if (!text) {
-    await bot.sendMessage(
-      chatId,
-      `📝 <b>Add Message to Pool</b>\n\nPlease send your message:`,
-      { parse_mode: 'HTML', ...createBackButton() }
-    );
+  logger.logButtonClick(userId, username, 'Add from Saved to Pool', chatId);
+
+  if (!accountLinker.isLinked(userId)) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'Please link an account first!',
+      show_alert: true,
+    });
     return;
   }
 
-  // Extract entities (for premium emoji support)
-  let messageEntities = null;
-  if (msg.entities && msg.entities.length > 0) {
-    messageEntities = msg.entities.map(e => ({
-      type: e.type,
-      offset: e.offset,
-      length: e.length,
-      language: e.language,
-      url: e.url,
-      user: e.user,
-      custom_emoji_id: e.custom_emoji_id,
-    }));
-  }
-
-  // Strip HTML tags if present
-  if (text.includes('<') && text.includes('>')) {
-    text = stripHtmlTags(text);
-  }
-
-  // Validate message length
-  if (text.length > 4096) {
-    await bot.sendMessage(
-      chatId,
-      `❌ Message is too long. Telegram messages have a maximum length of 4096 characters.\n\nPlease shorten your message and try again.`,
-      createBackButton()
-    );
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
     return;
   }
 
-  logger.logChange('MESSAGE_POOL', userId, `Message added to pool: ${text.substring(0, 50)}...`);
-  const result = await messageService.addToMessagePool(accountId, text, messageEntities);
-  
-  if (result.success) {
-    const pool = await messageService.getMessagePool(accountId);
-    await bot.sendMessage(
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: 'Checking Saved Messages...',
+    show_alert: false,
+  });
+
+  try {
+    const accountLinker = (await import('../services/accountLinker.js')).default;
+    const client = await accountLinker.ensureConnected(accountId);
+    
+    if (!client) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ Account client not available. Please try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    // Get Saved Messages entity
+    const me = await client.getMe();
+    let savedMessagesEntity;
+    try {
+      savedMessagesEntity = await client.getEntity(me);
+    } catch (error) {
+      const dialogs = await client.getDialogs();
+      const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+      if (savedDialog) {
+        savedMessagesEntity = savedDialog.entity;
+      } else {
+        throw new Error('Saved Messages not found');
+      }
+    }
+
+    // Get the last message from Saved Messages
+    const messages = await client.getMessages(savedMessagesEntity, { limit: 1 });
+    if (!messages || messages.length === 0) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>No Message Found</b>\n\nPlease send your message to Saved Messages first, then try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    const savedMessage = messages[0];
+    const messageText = savedMessage.text || '';
+    
+    // Extract entities from the saved message
+    let messageEntities = null;
+    if (savedMessage.entities && savedMessage.entities.length > 0) {
+      messageEntities = savedMessage.entities.map(e => {
+        let entityType = 'unknown';
+        
+        if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+          entityType = 'custom_emoji';
+        } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+          entityType = 'bold';
+        } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+          entityType = 'italic';
+        } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+          entityType = 'code';
+        } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+          entityType = 'pre';
+        }
+
+        const entity = {
+          type: entityType,
+          offset: e.offset,
+          length: e.length,
+        };
+
+        if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+          entity.custom_emoji_id = String(e.documentId);
+        }
+
+        if (entityType === 'pre' && e.language !== undefined) {
+          entity.language = e.language;
+        }
+
+        return entity;
+      });
+    }
+
+    // Validate message length
+    if (messageText.length > 4096) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>Message Too Long</b>\n\nMessage exceeds 4096 characters. Please shorten it and try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    // Add to pool
+    logger.logChange('MESSAGE_POOL', userId, `Message added to pool from Saved Messages: ${messageText.substring(0, 50)}...`);
+    const result = await messageService.addToMessagePool(accountId, messageText, messageEntities);
+    
+    if (result.success) {
+      const pool = await messageService.getMessagePool(accountId);
+      const premiumEmojiCount = messageEntities ? messageEntities.filter(e => e.type === 'custom_emoji').length : 0;
+      const previewText = messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText;
+      
+      let successMessage = `✅ <b>Message Added to Pool!</b>\n\n`;
+      successMessage += `📝 <b>Preview:</b> ${escapeHtml(previewText)}\n`;
+      successMessage += `📊 <b>Total messages in pool:</b> ${pool.length}\n`;
+      if (premiumEmojiCount > 0) {
+        successMessage += `🎨 <b>Premium Emojis:</b> ${premiumEmojiCount} found\n`;
+      }
+      
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        successMessage,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+    } else {
+      // Check if it's a duplicate
+      if (result.isDuplicate) {
+        const pool = await messageService.getMessagePool(accountId);
+        const previewText = messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText;
+        
+        let errorMessage = `⚠️ <b>Message Already in Pool</b>\n\n`;
+        errorMessage += `This message is already in your message pool.\n\n`;
+        errorMessage += `📝 <b>Preview:</b> ${escapeHtml(previewText)}\n`;
+        errorMessage += `📊 <b>Total messages in pool:</b> ${pool.length}\n\n`;
+        errorMessage += `Please add a different message.`;
+        
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          errorMessage,
+          { parse_mode: 'HTML', ...createBackButton() }
+        );
+      } else {
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          `❌ <b>Failed to Add Message</b>\n\n<b>Error:</b> ${result.error}`,
+          { parse_mode: 'HTML', ...createBackButton() }
+        );
+      }
+    }
+  } catch (error) {
+    console.log(`[POOL_ADD_FROM_SAVED] Error: ${error.message}`);
+    await safeEditMessage(
+      bot,
       chatId,
-      `✅ <b>Message Added to Pool!</b>\n\n📊 Total messages in pool: ${pool.length}`,
-      { parse_mode: 'HTML', ...await createMainMenu(userId) }
-    );
-  } else {
-    await bot.sendMessage(
-      chatId,
-      `❌ <b>Failed to Add Message</b>\n\n<b>Error:</b> ${result.error}`,
+      callbackQuery.message.message_id,
+      `❌ <b>Error</b>\n\nFailed to add message from Saved Messages: ${error.message}`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
   }
 }
 
-export async function handlePoolViewMessages(bot, callbackQuery) {
+// Keep old handler for backward compatibility (but it won't be used anymore)
+export async function handlePoolMessageInput(bot, msg, accountId) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  // This handler is deprecated - users should use Saved Messages instead
+  await bot.sendMessage(
+    chatId,
+    `ℹ️ <b>Message Pool Update</b>\n\n` +
+    `To add messages to the pool, please:\n\n` +
+    `1️⃣ Send your message to <b>Saved Messages</b>\n` +
+    `2️⃣ Use the "Add to Pool" button in the Message Pool menu\n\n` +
+    `This ensures premium emojis are preserved correctly.`,
+    { parse_mode: 'HTML', ...await createMainMenu(userId) }
+  );
+}
+
+export async function handlePoolViewMessages(bot, callbackQuery, page = 0) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
   const username = callbackQuery.from.username || 'Unknown';
@@ -2153,27 +3388,46 @@ export async function handlePoolViewMessages(bot, callbackQuery) {
     return;
   }
 
-  const pool = await messageService.getMessagePool(accountId);
+  // Get all messages including inactive ones for display
+  const pool = await messageService.getMessagePool(accountId, true);
+  const activePool = pool.filter(msg => msg.is_active);
+  const inactivePool = pool.filter(msg => !msg.is_active);
 
   if (pool.length === 0) {
     await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'Pool is empty! Add messages first.',
+      text: 'Pool is empty! Send messages to Saved Messages and they will be auto-synced.',
       show_alert: true,
     });
     return;
   }
 
-  const viewMessage = `📋 <b>Message Pool (${pool.length} messages)</b>\n\n` +
-    pool.map((msg, idx) => 
-      `${idx + 1}. <i>"${escapeHtml(msg.text.length > 100 ? msg.text.substring(0, 100) + '...' : msg.text)}"</i>`
-    ).join('\n\n');
+  // Validate page number
+  const pageSize = 3;
+  const maxPage = Math.max(0, Math.ceil(pool.length / pageSize) - 1);
+  const currentPage = Math.max(0, Math.min(page, maxPage));
+
+  const start = currentPage * pageSize;
+  const end = Math.min(start + pageSize, pool.length);
+  const pageMessages = pool.slice(start, end);
+
+  let viewMessage = `📋 <b>Message Pool</b>\n\n`;
+  viewMessage += `✅ <b>Active:</b> ${activePool.length} | ❌ <b>Disabled:</b> ${inactivePool.length}\n`;
+  viewMessage += `📄 <b>Page:</b> ${currentPage + 1}/${maxPage + 1} (${pool.length} total)\n\n`;
+  
+  // Show messages for current page
+  pageMessages.forEach((msg, idx) => {
+    const statusIcon = msg.is_active ? '✅' : '❌';
+    const globalIndex = start + idx + 1;
+    const preview = msg.text.length > 80 ? msg.text.substring(0, 80) + '...' : msg.text;
+    viewMessage += `${statusIcon} ${globalIndex}. <i>"${escapeHtml(preview)}"</i>\n\n`;
+  });
 
   await safeEditMessage(
     bot,
     chatId,
     callbackQuery.message.message_id,
     viewMessage,
-    { parse_mode: 'HTML', ...createMessagePoolListKeyboard(pool, 0) }
+    { parse_mode: 'HTML', ...createMessagePoolListKeyboard(pool, currentPage, pageSize) }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -2198,21 +3452,63 @@ export async function handlePoolDeleteMessage(bot, callbackQuery, messageId) {
   const result = await messageService.deleteFromMessagePool(accountId, messageId);
   
   if (result.success) {
-    const pool = await messageService.getMessagePool(accountId);
+    const pool = await messageService.getMessagePool(accountId, true);
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: 'Message deleted from pool!',
       show_alert: true,
     });
     
-    // Refresh the view
+    // Refresh the view - calculate page based on message position
     if (pool.length === 0) {
       await handleMessagePoolButton(bot, callbackQuery);
     } else {
-      await handlePoolViewMessages(bot, callbackQuery);
+      // Find which page the deleted message was on (if still exists, find similar position)
+      const pageSize = 3;
+      const messageIndex = pool.findIndex(msg => msg.id === messageId);
+      const page = messageIndex >= 0 ? Math.floor(messageIndex / pageSize) : 0;
+      await handlePoolViewMessages(bot, callbackQuery, page);
     }
   } else {
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: `Failed to delete: ${result.error}`,
+      show_alert: true,
+    });
+  }
+}
+
+export async function handlePoolToggleMessage(bot, callbackQuery, messageId) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Toggle Pool Message', chatId);
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const result = await messageService.toggleMessagePoolActive(accountId, messageId);
+  
+  if (result.success) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: result.isActive ? 'Message enabled!' : 'Message disabled!',
+      show_alert: true,
+    });
+    
+    // Refresh the view - find which page the message is on
+    const pool = await messageService.getMessagePool(accountId, true);
+    const pageSize = 3;
+    const messageIndex = pool.findIndex(msg => msg.id === messageId);
+    const page = messageIndex >= 0 ? Math.floor(messageIndex / pageSize) : 0;
+    await handlePoolViewMessages(bot, callbackQuery, page);
+  } else {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: `Failed to toggle: ${result.error}`,
       show_alert: true,
     });
   }
@@ -3059,11 +4355,19 @@ export async function handleDeleteAccount(bot, callbackQuery, accountId) {
         console.log(`[DELETE ACCOUNT] Stopped broadcast for account ${accountId} before deletion`);
       }
 
+      // Get account phone before deletion
+      const accountPhone = accountToDelete?.phone || 'N/A';
+      
       // Delete the account
       await accountLinker.deleteLinkedAccount(accountId);
       
       console.log(`[DELETE ACCOUNT] User ${userId} deleted account ${accountId} (${accountDisplayName})`);
       logger.logChange('ACCOUNT_DELETED', userId, `Successfully deleted account ${accountId} (${accountDisplayName})`);
+      
+      // Log to logger bot
+      loggerBotService.logAccountDeleted(userId, accountId, accountPhone).catch(() => {
+        // Silently fail - logger bot may not be started or user may have blocked it
+      });
       
       // Notify admins
       adminNotifier.notifyUserAction('ACCOUNT_DELETED', userId, {
@@ -3601,3 +4905,319 @@ export async function handleCheckPaymentStatus(bot, callbackQuery) {
     logger.logError('PREMIUM', userId, error, 'Error checking payment status');
   }
 }
+
+/**
+ * Handle show Saved Messages instructions button
+ */
+export async function handleShowSavedInstructions(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Show Saved Messages Instructions', chatId);
+
+  const instructions = `📱 <b>How to Open Saved Messages</b>\n\n` +
+    `To open Saved Messages in Telegram:\n\n` +
+    `📱 <b>Mobile (Android/iOS):</b>\n` +
+    `1. Open Telegram app\n` +
+    `2. Tap the menu (☰) in the top left\n` +
+    `3. Tap "Saved Messages" at the top\n\n` +
+    `💻 <b>Desktop/Web:</b>\n` +
+    `1. Open Telegram\n` +
+    `2. Click the menu (☰) in the top left\n` +
+    `3. Click "Saved Messages"\n\n` +
+    `💡 <b>Tip:</b> You can also search for "Saved Messages" in the search bar.\n\n` +
+    `Once you're in Saved Messages, send your message there, then come back and try again!`;
+
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🔙 Back to Messages', callback_data: 'btn_messages_menu' }]
+      ]
+    }
+  };
+
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    instructions,
+    { parse_mode: 'HTML', ...keyboard }
+  );
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+}
+
+/**
+ * Handle forward to Saved Messages button click
+ */
+export async function handleForwardToSavedButton(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Forward to Saved Messages', chatId);
+
+  if (!accountLinker.isLinked(userId)) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'Please link an account first!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const instructions = `📤 <b>Use Saved Messages for Premium Emojis</b>\n\n` +
+    `To use premium emojis in your broadcasts:\n\n` +
+    `1️⃣ Open your account's Telegram app\n` +
+    `2️⃣ Go to <b>Saved Messages</b>\n` +
+    `3️⃣ Send your message with premium emojis there\n` +
+    `4️⃣ Come back and click "✅ Check Saved Messages" below\n\n` +
+    `The bot will automatically use the last message from Saved Messages for broadcasts.`;
+
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Check Saved Messages', callback_data: 'btn_check_saved_messages' }],
+        [{ text: '🔙 Back', callback_data: 'btn_messages_menu' }]
+      ]
+    }
+  };
+
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    instructions,
+    { parse_mode: 'HTML', ...keyboard }
+  );
+
+  await safeAnswerCallback(bot, callbackQuery.id);
+}
+
+/**
+ * Handle check Saved Messages button - gets last message from Saved Messages
+ * Can be used for setting message or just checking
+ */
+export async function handleCheckSavedMessages(bot, callbackQuery, saveAsMessage = false) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, saveAsMessage ? 'Check Saved Messages (Set)' : 'Check Saved Messages', chatId);
+
+  if (!accountLinker.isLinked(userId)) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'Please link an account first!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const accountId = accountLinker.getActiveAccountId(userId);
+  if (!accountId) {
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'No active account found!',
+      show_alert: true,
+    });
+    return;
+  }
+
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: 'Checking Saved Messages...',
+    show_alert: false,
+  });
+
+  try {
+    const accountLinker = (await import('../services/accountLinker.js')).default;
+    const client = await accountLinker.ensureConnected(accountId);
+    
+    if (!client) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ Account client not available. Please try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    // Get Saved Messages entity
+    const me = await client.getMe();
+    let savedMessagesEntity;
+    try {
+      savedMessagesEntity = await client.getEntity(me);
+    } catch (error) {
+      const dialogs = await client.getDialogs();
+      const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+      if (savedDialog) {
+        savedMessagesEntity = savedDialog.entity;
+      } else {
+        throw new Error('Saved Messages not found');
+      }
+    }
+
+    // Get the last message from Saved Messages
+    const messages = await client.getMessages(savedMessagesEntity, { limit: 1 });
+    if (!messages || messages.length === 0) {
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        '❌ <b>No Message Found</b>\n\nPlease send your message to Saved Messages first, then try again.',
+        { parse_mode: 'HTML', ...createBackButton() }
+      );
+      return;
+    }
+
+    const savedMessage = messages[0];
+    const savedMessageId = savedMessage.id;
+
+    // Extract message text and entities
+    const messageText = savedMessage.text || '';
+    let messageEntities = null;
+
+    // Extract entities from the saved message
+    if (savedMessage.entities && savedMessage.entities.length > 0) {
+      messageEntities = savedMessage.entities.map(e => {
+        let entityType = 'unknown';
+        
+        // Determine entity type from GramJS entity class
+        if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+          entityType = 'custom_emoji';
+        } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+          entityType = 'bold';
+        } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+          entityType = 'italic';
+        } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+          entityType = 'code';
+        } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+          entityType = 'pre';
+        }
+
+        const entity = {
+          type: entityType,
+          offset: e.offset,
+          length: e.length,
+        };
+
+        // Preserve custom_emoji_id for premium emojis
+        if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+          entity.custom_emoji_id = String(e.documentId);
+        }
+
+        // Add language for pre entities
+        if (entityType === 'pre' && e.language !== undefined) {
+          entity.language = e.language;
+        }
+
+        return entity;
+      });
+    }
+
+    // If saveAsMessage is true, save as the active message
+    if (saveAsMessage) {
+      // Deactivate existing messages
+      await db.query(
+        `UPDATE messages SET is_active = FALSE WHERE account_id = $1`,
+        [accountId]
+      );
+
+      // Save new active message
+      const result = await messageService.saveMessage(accountId, messageText, 'A', messageEntities);
+      
+      if (result.success) {
+        // Update with saved_message_id
+        await db.query(
+          `UPDATE messages 
+           SET saved_message_id = $1
+           WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
+           ORDER BY updated_at DESC LIMIT 1`,
+          [savedMessageId, accountId]
+        );
+
+        const premiumEmojiCount = messageEntities ? messageEntities.filter(e => e.type === 'custom_emoji').length : 0;
+        const previewText = messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText;
+
+        let successMessage = `✅ <b>Broadcast Message Set!</b>\n\n`;
+        successMessage += `Your message from Saved Messages has been set as the broadcast message.\n\n`;
+        successMessage += `📝 <b>Preview:</b> ${escapeHtml(previewText)}\n`;
+        if (premiumEmojiCount > 0) {
+          successMessage += `🎨 <b>Premium Emojis:</b> ${premiumEmojiCount} found\n\n`;
+        }
+        successMessage += `✅ The bot will use the <b>last message</b> from Saved Messages when broadcasting.`;
+
+        console.log(`[SET_MESSAGE] ✅ Message set from Saved Messages (ID: ${savedMessageId}, ${premiumEmojiCount} premium emojis)`);
+
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          successMessage,
+          { parse_mode: 'HTML', ...await createMainMenu(userId) }
+        );
+
+        logger.logChange('MESSAGE_SET', userId, `Message set from Saved Messages (ID: ${savedMessageId})`);
+      } else {
+        throw new Error(result.error || 'Failed to save message');
+      }
+    } else {
+      // Just update existing message with saved_message_id (for forward mode)
+      await db.query(
+        `UPDATE messages 
+         SET saved_message_id = $1, message_text = $2, message_entities = $3
+         WHERE account_id = $4 AND is_active = TRUE 
+         ORDER BY updated_at DESC LIMIT 1`,
+        [
+          savedMessageId,
+          messageText,
+          messageEntities ? JSON.stringify(messageEntities) : null,
+          accountId
+        ]
+      );
+
+      const premiumEmojiCount = messageEntities ? messageEntities.filter(e => e.type === 'custom_emoji').length : 0;
+      const previewText = messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText;
+
+      let successMessage = `✅ <b>Message Updated!</b>\n\n`;
+      successMessage += `Your message from Saved Messages has been linked.\n\n`;
+      successMessage += `📝 <b>Preview:</b> ${escapeHtml(previewText)}\n`;
+      successMessage += `🆔 <b>Message ID:</b> <code>${savedMessageId}</code>\n`;
+      if (premiumEmojiCount > 0) {
+        successMessage += `🎨 <b>Premium Emojis:</b> ${premiumEmojiCount} found\n\n`;
+      }
+      successMessage += `✅ Premium emojis will be preserved during broadcasts!`;
+
+      console.log(`[CHECK_SAVED] ✅ Updated message with Saved Messages ID: ${savedMessageId} (${premiumEmojiCount} premium emojis)`);
+
+      await safeEditMessage(
+        bot,
+        chatId,
+        callbackQuery.message.message_id,
+        successMessage,
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+
+      logger.logChange('CHECK_SAVED', userId, `Message from Saved Messages linked (ID: ${savedMessageId})`);
+    }
+  } catch (error) {
+    console.log(`[CHECK_SAVED] Error: ${error.message}`);
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      `❌ <b>Error</b>\n\nFailed to check Saved Messages: ${error.message}`,
+      { parse_mode: 'HTML', ...createBackButton() }
+    );
+  }
+}
+

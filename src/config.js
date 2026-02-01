@@ -26,6 +26,10 @@ export const config = {
     return this.updatesChannel.split(',').map(ch => ch.trim()).filter(ch => ch);
   },
   
+  // Admin Broadcast Channel
+  // Messages posted in this channel will be automatically forwarded to all users
+  adminBroadcastChannel: process.env.ADMIN_BROADCAST || null,
+  
   // Logger Bots
   loggerBotToken: process.env.LOGGER_BOT_TOKEN,
   userLoggerBotToken: process.env.USER_LOGGER_BOT_TOKEN,

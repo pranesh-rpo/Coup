@@ -5,6 +5,7 @@ import { initializeSchema } from './database/schema.js';
 import accountLinker from './services/accountLinker.js';
 import messageManager from './services/messageManager.js';
 import adminNotifier from './services/adminNotifier.js';
+import { getAdminBot } from './handlers/adminBotHandlers.js';
 import userService from './services/userService.js';
 import automationService from './services/automationService.js';
 // Note: automationService is already imported above, using it for blockedUsers tracking
@@ -236,6 +237,7 @@ import {
   handlePoolMessageInput,
   handlePoolViewMessages,
   handlePoolDeleteMessage,
+  handlePoolToggleMessage,
   handlePoolModeChange,
   handlePoolToggle,
   handlePoolClear,
@@ -248,6 +250,10 @@ import {
   handleLoginTypePhone,
   handleLoginCancel,
   handleCheckPaymentStatus,
+  handleForwardToSavedButton,
+  handleCheckSavedMessages,
+  handleShowSavedInstructions,
+  handleLoggerBotButton,
 } from './handlers/commandHandler.js';
 import {
   handleConfigButton,
@@ -531,7 +537,7 @@ const bot = new TelegramBot(config.botToken, {
     autoStart: false, // We'll start after deleting webhook if needed
     params: {
       timeout: 10, // Long polling timeout in seconds
-      allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member']
+      allowed_updates: ['message', 'channel_post', 'callback_query', 'chat_member', 'my_chat_member']
     }
   }
 });
@@ -594,6 +600,18 @@ console.log('✅ Channel verification service initialized');
 initializeAdminBot(bot);
 console.log('✅ Admin bot initialized');
 
+// Initialize logger bot service
+(async () => {
+  try {
+    console.log('[INIT] Initializing logger bot service...');
+    const loggerBotService = (await import('./services/loggerBotService.js')).default;
+    await loggerBotService.initialize();
+    console.log('✅ Logger bot service initialized');
+  } catch (error) {
+    console.log('[INIT] Logger bot service initialization failed (non-critical):', error.message);
+  }
+})();
+
 // Handle chat_member updates (when users leave/join channels) - for polling mode
 bot.on('chat_member', async (msg) => {
   try {
@@ -650,7 +668,6 @@ const pendingPhoneNumbers = new Set();
 const pendingStartMessages = new Set();
 const pendingPasswords = new Set();
 const pendingQuietHoursInputs = new Map(); // userId -> { accountId, type: 'start' | 'end' }
-const pendingPoolMessages = new Map(); // userId -> { accountId }
 const pendingScheduleInputs = new Map(); // userId -> { accountId, type: 'schedule' }
 const pendingCustomIntervalInputs = new Map(); // userId -> { accountId }
 const pendingGroupDelayInputs = new Map(); // userId -> { accountId }
@@ -1166,13 +1183,252 @@ async function ensureUserStored(msg) {
   }
 }
 
+// Helper function to forward AdminBroadcast channel messages to all users
+async function forwardAdminBroadcastMessage(msg, sourceUserId = null) {
+  if (!config.adminBroadcastChannel) {
+    return false;
+  }
+
+  const chat = msg.chat;
+  const chatId = chat.id;
+  
+  // Check if this is a channel
+  const isChannel = chat.type === 'channel' || chat.type === 'supergroup' || (chat.id && chat.id < 0);
+  
+  if (!isChannel) {
+    return false;
+  }
+  
+  const channelUsername = chat.username ? chat.username.toLowerCase() : null;
+  const channelTitle = chat.title ? chat.title.toLowerCase() : null;
+  const adminBroadcastChannelName = config.adminBroadcastChannel.replace('@', '').toLowerCase();
+  
+  // Debug logging
+  console.log(`[ADMIN_BROADCAST_CHANNEL] Checking message from chat:`, {
+    chatId,
+    chatType: chat.type,
+    channelUsername,
+    channelTitle,
+    adminBroadcastChannelName,
+    messageId: msg.message_id
+  });
+  
+  // Check if message is from AdminBroadcast channel (by username or title)
+  const isAdminBroadcastChannel = (channelUsername && channelUsername === adminBroadcastChannelName) ||
+                                  (channelTitle && channelTitle === adminBroadcastChannelName);
+  
+  if (!isAdminBroadcastChannel) {
+    return false;
+  }
+  
+  console.log(`[ADMIN_BROADCAST_CHANNEL] ✅ Message received from AdminBroadcast channel, forwarding to all users`);
+  
+  // Skip commands in the channel
+  if (msg.text?.startsWith('/')) {
+    console.log(`[ADMIN_BROADCAST_CHANNEL] Skipping command message`);
+    return true;
+  }
+  
+  // Forward message to all users
+  try {
+    // Get all users who have interacted with the bot
+    const allUsersQuery = `
+      SELECT DISTINCT user_id FROM users
+      ORDER BY user_id
+    `;
+    
+    const users = await db.query(allUsersQuery);
+    const userIds = users.rows.map(row => {
+      const uid = row.user_id;
+      if (typeof uid === 'bigint') {
+        return Number(uid);
+      } else if (typeof uid === 'string') {
+        return parseInt(uid, 10);
+      }
+      return uid;
+    }).filter(uid => uid && !isNaN(uid));
+    
+    if (userIds.length === 0) {
+      console.log('[ADMIN_BROADCAST_CHANNEL] No users found in database');
+      return true;
+    }
+    
+    console.log(`[ADMIN_BROADCAST_CHANNEL] Forwarding message to ${userIds.length} users`);
+    let successCount = 0;
+    let failedCount = 0;
+    const blockedUsers = []; // Track users who blocked the bot during this broadcast
+    
+    // Rate limiting for admin broadcasts
+    const MIN_DELAY_BETWEEN_MESSAGES = 6000; // 6 seconds between messages
+    const MAX_MESSAGES_PER_MINUTE = 10;
+    const messageTimestamps = [];
+    
+    // Forward message to each user
+    for (const targetUserId of userIds) {
+      try {
+        // Check rate limit (update current time each iteration)
+        const currentTime = Date.now();
+        const oneMinuteAgo = currentTime - 60000;
+        const recentMessages = messageTimestamps.filter(ts => ts > oneMinuteAgo);
+        if (recentMessages.length >= MAX_MESSAGES_PER_MINUTE) {
+          const oldestMessage = Math.min(...recentMessages);
+          const waitTime = 60000 - (currentTime - oldestMessage) + 1000;
+          console.log(`[ADMIN_BROADCAST_CHANNEL] Rate limit reached. Waiting ${(waitTime / 1000).toFixed(1)}s...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          // Update timestamps after waiting
+          const newNow = Date.now();
+          const newOneMinuteAgo = newNow - 60000;
+          messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
+        }
+        
+        // Check if user has blocked the bot
+        if (automationService.blockedUsers.has(targetUserId)) {
+          const blockedInfo = automationService.blockedUsers.get(targetUserId);
+          if (blockedInfo && blockedInfo.lastChecked && (Date.now() - blockedInfo.lastChecked) < (24 * 60 * 60 * 1000)) {
+            console.log(`[ADMIN_BROADCAST_CHANNEL] Skipping user ${targetUserId} - previously blocked`);
+            blockedUsers.push(targetUserId); // Track for stats
+            failedCount++;
+            continue;
+          }
+        }
+        
+        // Forward the message
+        const forwardResult = await safeBotApiCall(
+          () => bot.forwardMessage(targetUserId, chatId, msg.message_id),
+          { maxRetries: 3, bufferSeconds: 2, throwOnFailure: false }
+        );
+        
+        if (forwardResult) {
+          successCount++;
+          messageTimestamps.push(Date.now());
+          logger.logChange('ADMIN_BROADCAST_CHANNEL', sourceUserId || 'system', `Forwarded message from AdminBroadcast channel to user ${targetUserId}`);
+          
+          // Remove from blocked list if forward succeeded
+          if (automationService.blockedUsers.has(targetUserId)) {
+            automationService.blockedUsers.delete(targetUserId);
+          }
+        } else {
+          failedCount++;
+          console.log(`[ADMIN_BROADCAST_CHANNEL] Failed to forward to user ${targetUserId} after retries`);
+          logger.logError('ADMIN_BROADCAST_CHANNEL', targetUserId, new Error('Failed after retries'), `Failed to forward message to user ${targetUserId}`);
+        }
+      } catch (error) {
+        failedCount++;
+        
+        // Check if user blocked the bot
+        const errorMessage = error.message || error.toString() || '';
+        const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
+        const isBotBlocked = errorMessage.includes('bot was blocked') ||
+                            errorMessage.includes('bot blocked') ||
+                            errorMessage.includes('BLOCKED') ||
+                            errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden')) ||
+                            errorMessage.includes('chat not found');
+        
+        if (isBotBlocked) {
+          automationService.blockedUsers.set(targetUserId, {
+            blocked: true,
+            lastChecked: Date.now()
+          });
+          blockedUsers.push(targetUserId); // Track for stats
+          console.log(`[ADMIN_BROADCAST_CHANNEL] User ${targetUserId} has blocked the bot - added to blocked list`);
+        }
+        
+        console.log(`[ADMIN_BROADCAST_CHANNEL] Failed to forward to user ${targetUserId}: ${error.message}`);
+        logger.logError('ADMIN_BROADCAST_CHANNEL', targetUserId, error, `Failed to forward message to user ${targetUserId}`);
+      }
+      
+      // Wait between messages to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, MIN_DELAY_BETWEEN_MESSAGES));
+    }
+    
+    console.log(`[ADMIN_BROADCAST_CHANNEL] Forward completed. Success: ${successCount}, Failed: ${failedCount}`);
+    logger.logChange('ADMIN_BROADCAST_CHANNEL', sourceUserId || 'system', `AdminBroadcast channel message forwarded. Success: ${successCount}, Failed: ${failedCount}`);
+    
+    // Send stats to admin bot
+    try {
+      const adminBot = getAdminBot();
+      if (adminBot && config.adminChatIds && config.adminChatIds.length > 0) {
+        const blockedCount = blockedUsers.length;
+        const blockedUsersText = blockedCount > 0 
+          ? `\n\n🚫 <b>Blocked Users (${blockedCount}):</b>\n<code>${blockedUsers.slice(0, 20).join(', ')}${blockedUsers.length > 20 ? `\n... and ${blockedUsers.length - 20} more` : ''}</code>`
+          : '';
+        
+        // Helper function to escape HTML
+        const escapeHtml = (text) => {
+          if (typeof text !== 'string') text = String(text);
+          return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        };
+        
+        const channelName = escapeHtml(chat.title || chat.username || 'Unknown');
+        const statsMessage = `📊 <b>Admin Broadcast Stats</b>\n\n` +
+          `📢 <b>Channel:</b> ${channelName}\n` +
+          `📝 <b>Message ID:</b> <code>${msg.message_id}</code>\n` +
+          `⏰ <b>Time:</b> <code>${new Date().toISOString()}</code>\n\n` +
+          `📈 <b>Statistics:</b>\n` +
+          `• Total Users: <b>${userIds.length}</b>\n` +
+          `• ✅ Success: <b>${successCount}</b>\n` +
+          `• ❌ Failed: <b>${failedCount}</b>\n` +
+          `• Success Rate: <b>${userIds.length > 0 ? ((successCount / userIds.length) * 100).toFixed(1) : 0}%</b>${blockedUsersText}`;
+        
+        // Send to all admin chats
+        for (const adminChatId of config.adminChatIds) {
+          try {
+            await safeBotApiCall(
+              () => adminBot.sendMessage(adminChatId, statsMessage, { parse_mode: 'HTML' }),
+              { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
+            );
+          } catch (error) {
+            console.error(`[ADMIN_BROADCAST_CHANNEL] Failed to send stats to admin chat ${adminChatId}:`, error.message);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[ADMIN_BROADCAST_CHANNEL] Error sending stats to admin bot:', error);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('[ADMIN_BROADCAST_CHANNEL] Error:', error);
+    logger.logError('ADMIN_BROADCAST_CHANNEL', sourceUserId || 'system', error, 'AdminBroadcast channel forwarding error');
+    return true; // Return true to indicate we handled it (even if with error)
+  }
+}
+
+// Handle channel posts (messages from channels)
+bot.on('channel_post', async (msg) => {
+  console.log(`[CHANNEL_POST] Received channel post:`, {
+    chatId: msg.chat?.id,
+    chatType: msg.chat?.type,
+    chatUsername: msg.chat?.username,
+    chatTitle: msg.chat?.title,
+    messageId: msg.message_id,
+    hasText: !!msg.text
+  });
+  
+  // Handle AdminBroadcast channel messages
+  const handled = await forwardAdminBroadcastMessage(msg, null);
+  if (handled) {
+    return; // Message was handled, don't process further
+  }
+});
+
 // Handle text input (phone numbers, messages)
 bot.on('message', async (msg) => {
-  const userId = msg.from.id;
+  const userId = msg.from?.id;
   const chatId = msg.chat.id;
   
   // Ensure user is stored in database (for any interaction)
-  await ensureUserStored(msg);
+  // Skip for channel messages where msg.from might be null
+  if (msg.from) {
+    await ensureUserStored(msg);
+  }
+  
+  // Handle AdminBroadcast channel messages (for messages that might come through message event)
+  // Note: Most channel posts come through 'channel_post' event, but we check here too for safety
+  const handled = await forwardAdminBroadcastMessage(msg, userId);
+  if (handled) {
+    return; // Message was handled, don't process further
+  }
   
   // Skip commands
   if (msg.text?.startsWith('/')) {
@@ -1181,7 +1437,7 @@ bot.on('message', async (msg) => {
   
   // Log all incoming messages for debugging
   console.log(`[MESSAGE HANDLER] User ${userId} sent message: "${msg.text?.substring(0, 50) || 'non-text'}"`);
-  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneNumbers.has(userId)}, StartMsg: ${pendingStartMessages.has(userId)}, Password: ${pendingPasswords.has(userId)}, Pool: ${pendingPoolMessages.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}, CustomInterval: ${pendingCustomIntervalInputs.has(userId)}`);
+  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneNumbers.has(userId)}, Password: ${pendingPasswords.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}, CustomInterval: ${pendingCustomIntervalInputs.has(userId)}, BlacklistSearch: ${pendingBlacklistSearchInputs.has(userId)}`);
   
   // Handle contact sharing (phone number via button)
   if (msg.contact && msg.contact.phone_number) {
@@ -1241,27 +1497,6 @@ bot.on('message', async (msg) => {
         { parse_mode: 'HTML', ...createMainMenu() }
       );
     }
-  } else if (pendingStartMessages.has(userId)) {
-    // Don't delete from pendingStartMessages yet - let handleSetStartMessage handle it
-    // This way, if it returns early (e.g., empty message), the state persists for retry
-    const result = await handleSetStartMessage(bot, msg);
-    // Only remove from pending if message was successfully processed
-    if (result === true) {
-      pendingStartMessages.delete(userId);
-      logger.logChange('MESSAGE_STATE', userId, 'Start message input completed');
-    } else {
-      logger.logChange('MESSAGE_STATE', userId, 'Start message input still pending (retry needed)');
-    }
-  } else if (pendingPoolMessages.has(userId)) {
-    const pendingData = pendingPoolMessages.get(userId);
-    if (!pendingData) {
-      pendingPoolMessages.delete(userId);
-      console.log(`[MESSAGE HANDLER] Invalid pending pool message state for user ${userId}, cleared`);
-      return;
-    }
-    const { accountId } = pendingData;
-    pendingPoolMessages.delete(userId);
-    await handlePoolMessageInput(bot, msg, accountId);
   } else if (pendingPasswords.has(userId) || accountLinker.isPasswordRequired(userId)) {
     // Only remove from pendingPasswords if password is successfully verified
     // Keep it if verification fails so user can retry
@@ -1516,10 +1751,6 @@ bot.on('callback_query', async (callbackQuery) => {
         pendingPasswords.delete(userId);
         console.log(`[CALLBACK] Cleared pending password state for user ${userId}`);
       }
-      if (pendingPoolMessages.has(userId)) {
-        pendingPoolMessages.delete(userId);
-        console.log(`[CALLBACK] Cleared pending pool message state for user ${userId}`);
-      }
       if (pendingQuietHoursInputs.has(userId)) {
         pendingQuietHoursInputs.delete(userId);
         console.log(`[CALLBACK] Cleared pending quiet hours state for user ${userId}`);
@@ -1535,6 +1766,8 @@ bot.on('callback_query', async (callbackQuery) => {
       await handleMainMenu(bot, callbackQuery);
     } else if (data === 'btn_account') {
       await handleAccountButton(bot, callbackQuery);
+    } else if (data === 'btn_logger_bot') {
+      await handleLoggerBotButton(bot, callbackQuery);
     } else if (data === 'btn_link') {
       const result = await handleLinkButton(bot, callbackQuery);
       if (result) {
@@ -1555,9 +1788,6 @@ bot.on('callback_query', async (callbackQuery) => {
       await handleMessagesMenu(bot, callbackQuery);
     } else if (data === 'btn_set_start_msg') {
       await handleSetStartMessageButton(bot, callbackQuery);
-      addPendingStateWithTimeout(pendingStartMessages, userId);
-      console.log(`[CALLBACK] User ${userId} clicked "Set Message" - added to pendingStartMessages`);
-      logger.logChange('MESSAGE_INPUT', userId, 'Waiting for message input');
     } else if (data === 'btn_start_broadcast') {
       // Note: handleStartBroadcastButton will check and redirect to link account if needed
       // The pending state will be set in that handler
@@ -1652,21 +1882,29 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
       }
       await handleConfigMentionCount(bot, callbackQuery, count);
+    } else if (data === 'btn_forward_to_saved') {
+      await handleForwardToSavedButton(bot, callbackQuery);
+    } else if (data === 'btn_check_saved_messages') {
+      await handleCheckSavedMessages(bot, callbackQuery);
+    } else if (data === 'btn_show_saved_instructions') {
+      await handleShowSavedInstructions(bot, callbackQuery);
     } else if (data === 'btn_message_pool') {
       await handleMessagePoolButton(bot, callbackQuery);
     } else if (data === 'pool_menu') {
       await handleMessagePoolButton(bot, callbackQuery);
     } else if (data === 'pool_add_message') {
-      const result = await handlePoolAddMessage(bot, callbackQuery);
-      if (result) {
-        addPendingStateWithTimeout(pendingPoolMessages, userId, result);
-      }
+      await handlePoolAddMessage(bot, callbackQuery);
     } else if (data === 'pool_view_messages') {
       await handlePoolViewMessages(bot, callbackQuery);
     } else if (data.startsWith('pool_delete_')) {
       const messageId = parseInt(data.replace('pool_delete_', ''));
       if (!isNaN(messageId)) {
         await handlePoolDeleteMessage(bot, callbackQuery, messageId);
+      }
+    } else if (data.startsWith('pool_toggle_')) {
+      const messageId = parseInt(data.replace('pool_toggle_', ''));
+      if (!isNaN(messageId)) {
+        await handlePoolToggleMessage(bot, callbackQuery, messageId);
       }
     } else if (data === 'pool_mode_random') {
       await handlePoolModeChange(bot, callbackQuery, 'random');
@@ -1679,11 +1917,22 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'pool_clear_confirm') {
       await handlePoolClear(bot, callbackQuery);
     } else if (data.startsWith('pool_page_')) {
-      // Handle pagination - refresh view
-      await handlePoolViewMessages(bot, callbackQuery);
+      // Handle pagination - extract page number
+      const page = parseInt(data.replace('pool_page_', ''));
+      if (!isNaN(page) && page >= 0) {
+        await handlePoolViewMessages(bot, callbackQuery, page);
+      } else {
+        await handlePoolViewMessages(bot, callbackQuery, 0);
+      }
     } else if (data.startsWith('pool_view_')) {
-      // View single message - just refresh list for now
-      await handlePoolViewMessages(bot, callbackQuery);
+      // View single message - now handled by toggle, but keep for backward compatibility
+      const messageId = parseInt(data.replace('pool_view_', ''));
+      if (!isNaN(messageId)) {
+        await handlePoolToggleMessage(bot, callbackQuery, messageId);
+      }
+    } else if (data === 'pool_page_info') {
+      // Page info button - just answer callback, no action needed
+      await safeAnswerCallback(bot, callbackQuery.id);
     } else if (data === 'btn_config_group_delay') {
       const result = await handleConfigGroupDelay(bot, callbackQuery);
       if (result && result.accountId) {

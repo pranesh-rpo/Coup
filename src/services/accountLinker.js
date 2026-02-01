@@ -215,7 +215,7 @@ class AccountLinker {
     }
   }
 
-  // Ensure client is connected (connect on-demand)
+  // Ensure client is connected (reconnect if disconnected)
   async ensureConnected(accountId) {
     const accountIdStr = accountId.toString();
     const account = this.linkedAccounts.get(accountIdStr);
@@ -447,32 +447,28 @@ class AccountLinker {
         }
       }
       
-      // Restore clients from saved sessions
-      // Add delays between verifications to avoid rate limits and session conflicts
-      const skipVerification = process.env.SKIP_STARTUP_VERIFICATION === 'true';
-      if (skipVerification) {
-        console.log('[ACCOUNT] SKIP_STARTUP_VERIFICATION=true - Skipping all account verifications on startup');
-      }
+      // Load accounts into memory and create clients immediately (pure connection)
+      console.log('[ACCOUNT] Loading accounts into memory and connecting clients...');
       
-      for (let index = 0; index < result.rows.length; index++) {
-        const row = result.rows[index];
+      let connectedCount = 0;
+      let skippedCount = 0;
+      
+      for (const row of result.rows) {
         try {
           // Skip if session string is null (revoked session)
           if (!row.session_string) {
             console.log(`[ACCOUNT] Skipping account ${row.account_id} - session revoked (needs re-authentication)`);
+            skippedCount++;
             continue;
           }
+          
+          const accountId = row.account_id.toString();
+          const userIdStr = row.user_id.toString();
+          const isActive = userActiveAccounts.get(userIdStr) === row.account_id;
           
           // CRITICAL: Skip main account entirely - it should not be verified or used
           if (config.mainAccountPhone && row.phone === config.mainAccountPhone.trim()) {
             console.log(`[ACCOUNT PROTECTION] ⚠️  Skipping main account ${row.account_id} (${row.phone}) - should not be verified or used for broadcasting`);
-            // Still add to memory but mark as protected
-            const accountId = row.account_id.toString();
-            const userIdStr = row.user_id.toString();
-            const isActive = userActiveAccounts.get(userIdStr) === row.account_id;
-            
-            // Create a dummy client that won't be used
-            const dummyClient = null;
             
             this.linkedAccounts.set(accountId, {
               accountId: row.account_id,
@@ -480,7 +476,7 @@ class AccountLinker {
               phone: row.phone,
               firstName: row.first_name || null,
               sessionString: row.session_string,
-              client: dummyClient,
+              client: null, // No client for main account
               isActive: isActive,
               isMainAccount: true, // Mark as main account
             });
@@ -492,113 +488,50 @@ class AccountLinker {
             this.userAccounts.get(userIdStr).add(accountId);
             
             console.log(`[ACCOUNT] Loaded main account ${accountId} (PROTECTED - not verified)`);
+            skippedCount++;
             continue; // Skip verification entirely
           }
           
-          // Add delay between account verifications to prevent rate limiting
-          // INCREASED to 5 seconds for safety
-          if (index > 0) {
-            await new Promise(resolve => setTimeout(resolve, 5000)); // Increased from 2000 to 5000
-          }
-          
+          // Create client immediately (pure connection - no lazy loading)
           const stringSession = new StringSession(row.session_string);
-          const client = new TelegramClient(stringSession, config.apiId, config.apiHash, {
-            connectionRetries: 3, // Reduced retries
+          const accountClient = new TelegramClient(stringSession, config.apiId, config.apiHash, {
+            connectionRetries: 3,
             timeout: 10000,
-            retryDelay: 3000,
-            autoReconnect: false, // Disable autoReconnect on startup - reconnect on-demand only
+            retryDelay: 5000,
+            autoReconnect: false, // CRITICAL: Disable autoReconnect to prevent excessive reconnections
             useWSS: false,
           });
           
           // Setup error handlers to prevent crashes from MTProto errors
-          setupClientErrorHandlers(client, row.account_id);
+          setupClientErrorHandlers(accountClient, row.account_id);
           
-          // Skip verification if SKIP_STARTUP_VERIFICATION is set
-          if (!skipVerification) {
-            // Connect client to verify session is valid, then disconnect
-            // Use try-catch to handle verification errors gracefully
-            try {
-              await client.connect();
-              
-              // Quick verification - just check if we can get our own info
-              try {
-                await client.getMe();
-              } catch (verifyError) {
-                // If verification fails, it might be a temporary issue
-                // Don't delete the account, just log and skip
-                const errorMsg = verifyError.errorMessage || verifyError.message || '';
-                
-                if (errorMsg.includes('SESSION_REVOKED') || errorMsg.includes('AUTH_KEY')) {
-                  console.log(`[ACCOUNT] Account ${row.account_id} session appears revoked during verification - marking for re-auth`);
-                  // Mark session as revoked in database instead of deleting account
-                  // Use empty string instead of NULL to avoid NOT NULL constraint violation
-                  await db.query(
-                    'UPDATE accounts SET session_string = ?, is_active = 0 WHERE account_id = $1',
-                    ['', row.account_id]
-                  );
-                  await client.disconnect().catch(() => {});
-                  continue; // Skip this account
-                }
-                throw verifyError; // Re-throw other errors
-              }
-              
-              // Disconnect after verifying session - clients will connect on-demand when needed
-              await client.disconnect();
-              console.log(`[ACCOUNT] Verified and disconnected account ${row.account_id} (will connect on-demand)`);
-            } catch (connectError) {
-              // Handle connection/verification errors
-              const errorMsg = connectError.errorMessage || connectError.message || '';
-              
-              if (errorMsg.includes('SESSION_REVOKED') || errorMsg.includes('AUTH_KEY')) {
-                console.log(`[ACCOUNT] Account ${row.account_id} session revoked during verification - marking for re-auth`);
-                // Mark session as revoked instead of deleting account
-                // Use empty string instead of NULL to avoid NOT NULL constraint violation
-                await db.query(
-                  'UPDATE accounts SET session_string = ?, is_active = 0 WHERE account_id = $1',
-                  ['', row.account_id]
-                );
-                await client.disconnect().catch(() => {});
-                continue; // Skip this account
-              }
-              // For other errors, log but continue
-              logError(`[ACCOUNT ERROR] Error verifying account ${row.account_id}:`, connectError);
-              await client.disconnect().catch(() => {});
-              continue; // Skip this account if verification fails
-            }
-          } else {
-            console.log(`[ACCOUNT] Skipping verification for account ${row.account_id} (SKIP_STARTUP_VERIFICATION=true)`);
+          // Connect client immediately
+          try {
+            await accountClient.connect();
+            console.log(`[ACCOUNT] Connected account ${accountId} (${row.phone})`);
+            connectedCount++;
+            
+            // Setup auto-reply handler when client connects
+            await autoReplyHandler.setupAutoReply(accountClient, row.account_id);
+          } catch (connectError) {
+            console.log(`[ACCOUNT] Failed to connect account ${accountId} (${row.phone}): ${connectError.message}`);
+            // Still store the client, but mark it as not connected
+            // It will be retried when ensureConnected() is called
+            logError(`[ACCOUNT] Connection failed for account ${accountId}:`, connectError);
           }
           
-          // Wrap client methods to catch SESSION_REVOKED errors
-          const originalInvoke = client.invoke.bind(client);
-          const accountIdForRevoke = row.account_id; // Capture account ID for closure
-          const self = this; // Capture 'this' for use in closure
-          client.invoke = async function(...args) {
-            try {
-              return await originalInvoke(...args);
-            } catch (error) {
-              if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
-                logError(`[ACCOUNT ERROR] Session revoked detected for account ${accountIdForRevoke} during API call`);
-                await self.handleSessionRevoked(accountIdForRevoke);
-                throw error;
-              }
-              throw error;
-            }
-          };
-          
-          const accountId = row.account_id.toString();
-          const userIdStr = row.user_id.toString();
-          // Use the corrected active status from userActiveAccounts
-          const isActive = userActiveAccounts.get(userIdStr) === row.account_id;
-          
+          // Store account info with client (pure connection)
           this.linkedAccounts.set(accountId, {
             accountId: row.account_id,
             userId: row.user_id,
             phone: row.phone,
             firstName: row.first_name || null,
             sessionString: row.session_string,
-            client,
+            client: accountClient, // Client created and connected immediately
             isActive: isActive,
+            isMainAccount: false,
+            createdAt: Date.now(),
+            lastUsed: Date.now(),
           });
           
           // Track accounts per user
@@ -607,17 +540,15 @@ class AccountLinker {
           }
           this.userAccounts.get(userIdStr).add(accountId);
           
-          console.log(`[ACCOUNT] Loaded account ${accountId} for user ${userIdStr}, phone: ${row.phone}, first_name: ${row.first_name || 'N/A'}, active: ${isActive}`);
         } catch (error) {
-          // Check if it's a SESSION_REVOKED error
-          if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
-            logError(`[ACCOUNT ERROR] Session revoked for account ${row.account_id} during load`);
-            await this.handleSessionRevoked(row.account_id);
-          } else {
-            logError(`[ACCOUNT ERROR] Error restoring client for account ${row.account_id}:`, error);
-          }
+          console.log(`[ACCOUNT] Error loading account ${row.account_id}: ${error.message}`);
+          logError(`[ACCOUNT] Error loading account ${row.account_id}:`, error);
+          skippedCount++;
+          continue;
         }
       }
+      
+      console.log(`[ACCOUNT] ✅ Loaded ${this.linkedAccounts.size} accounts (${connectedCount} connected, ${skippedCount} skipped)`);
     } catch (error) {
       logError('[ACCOUNT ERROR] Error loading accounts from database:', error);
     }
@@ -846,6 +777,12 @@ class AccountLinker {
           phone,
           details: `Account ${accountId} linked for user ${userIdNum} (${phone})`,
         }).catch(() => {}); // Silently fail to avoid blocking
+        
+        // Log to logger bot
+        const loggerBotService = (await import('./loggerBotService.js')).default;
+        loggerBotService.logAccountLinked(userIdNum, normalizedPhone, accountId).catch(() => {
+          // Silently fail - logger bot may not be started or user may have blocked it
+        });
       }
       
       // If this is a new account and it's being set as active, deactivate other accounts in memory
@@ -1040,14 +977,30 @@ class AccountLinker {
         return { success: false, error: 'Phone number is required' };
       }
       
-      // Normalize phone number
-      const normalizedPhone = phone.trim().replace(/\s+/g, '');
+      // Normalize phone number - remove all non-digit characters except +
+      // This handles cases like "+1 (234) 567-8900" or "+1-234-567-8900"
+      let normalizedPhone = phone.trim();
       
-      // Validate phone format (E.164: + followed by 1-15 digits)
+      // Remove all characters except + and digits
+      normalizedPhone = normalizedPhone.replace(/[^\d+]/g, '');
+      
+      // Ensure it starts with +
+      if (!normalizedPhone.startsWith('+')) {
+        // If it doesn't start with +, add it
+        normalizedPhone = '+' + normalizedPhone;
+      }
+      
+      // Remove any duplicate + signs (should only be at the start)
+      normalizedPhone = normalizedPhone.replace(/^\+{2,}/, '+');
+      
+      // Validate phone format (E.164: + followed by 1-15 digits, first digit after + should be 1-9)
       const phoneRegex = /^\+[1-9]\d{1,14}$/;
       if (!phoneRegex.test(normalizedPhone)) {
+        console.log(`[LINK] Invalid phone format: "${phone}" -> normalized: "${normalizedPhone}"`);
         return { success: false, error: 'Invalid phone number format. Please use international format (e.g., +1234567890)' };
       }
+      
+      console.log(`[LINK] Phone number normalized: "${phone}" -> "${normalizedPhone}"`);
       
       // Check if user is in password attempt cooldown period
       const attemptData = this.passwordAttempts.get(userId);
@@ -1090,6 +1043,9 @@ class AccountLinker {
       setupClientErrorHandlers(client);
 
       await client.connect();
+      
+      // Log the exact phone number being sent to Telegram API for debugging
+      console.log(`[LINK] Sending code to phone: "${normalizedPhone}" (length: ${normalizedPhone.length})`);
       
       const result = await client.sendCode(
         {

@@ -134,21 +134,16 @@ export async function createMainMenu(userId = null) {
 }
 
 export function createGroupsMenu(groupDelayMin = null, groupDelayMax = null, blacklistCount = 0) {
-  const groupDelayText = groupDelayMin !== null && groupDelayMax !== null
-    ? `${groupDelayMin}-${groupDelayMax}s`
-    : 'Default (5-10s)';
-  
   return {
     reply_markup: {
       inline_keyboard: [
-        // Group Management Actions - 2 per row
+        // Group Management Actions - 2 columns
         [
           { text: '🔄 Refresh Groups', callback_data: 'btn_refresh_groups' },
           { text: '📋 List Groups', callback_data: 'btn_list_groups' }
         ],
-        // Group Settings - 2 per row
+        // Group Settings - Full width
         [
-          { text: '⏳ Group Delay', callback_data: 'btn_config_group_delay' },
           { text: '🚫 Blacklist', callback_data: 'btn_config_blacklist' }
         ],
         // Back - Full Width
@@ -228,21 +223,23 @@ export function createStopButton() {
   };
 }
 
-export function createConfigMenu(currentInterval = 11, quietHours = null, forwardMode = false) {
+export function createConfigMenu(currentInterval = 11, quietHours = null) {
   return {
     reply_markup: {
       inline_keyboard: [
-        // Core Broadcast Settings - 2 per row
+        // Core Broadcast Settings - 2 columns
         [
           { text: '⏱️ Interval', callback_data: 'btn_config_interval_menu' },
           { text: '🌙 Quiet Hours', callback_data: 'btn_config_quiet_hours' }
         ],
+        // Schedule - Full Width
         [
-          { text: '📅 Schedule', callback_data: 'btn_config_schedule' },
-          { text: '📤 Forward Mode', callback_data: 'btn_config_forward_mode' }
+          { text: '📅 Schedule', callback_data: 'btn_config_schedule' }
         ],
+        // Logger Bot - Full Width
+        [{ text: '📝 Logger Bot', callback_data: 'btn_logger_bot' }],
         // Back - Full Width
-        [{ text: '🔙 Back', callback_data: 'btn_main_menu' }],
+        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
       ],
     },
   };
@@ -254,11 +251,14 @@ export function createQuietHoursKeyboard() {
   return {
     reply_markup: {
       inline_keyboard: [
+        // Actions - 2 columns
         [
-          { text: '➕ Set Quiet Hours', callback_data: 'config_quiet_set' },
+          { text: '➕ Set', callback_data: 'config_quiet_set' },
           { text: '👁️ View', callback_data: 'config_quiet_view' }
         ],
-        [{ text: '🗑️ Clear', callback_data: 'config_quiet_clear' }],
+        // Clear - Full width
+        [{ text: '🗑️ Clear Quiet Hours', callback_data: 'config_quiet_clear' }],
+        // Back - Full width
         [{ text: '🔙 Back to Settings', callback_data: 'btn_config' }],
       ],
     },
@@ -270,11 +270,14 @@ export function createScheduleKeyboard() {
   return {
     reply_markup: {
       inline_keyboard: [
+        // Actions - 2 columns
         [
-          { text: '➕ Set Schedule', callback_data: 'config_schedule_normal' },
+          { text: '➕ Set', callback_data: 'config_schedule_normal' },
           { text: '👁️ View', callback_data: 'config_schedule_view' }
         ],
-        [{ text: '🗑️ Clear', callback_data: 'config_schedule_clear' }],
+        // Clear - Full width
+        [{ text: '🗑️ Clear Schedule', callback_data: 'config_schedule_clear' }],
+        // Back - Full width
         [{ text: '🔙 Back to Settings', callback_data: 'btn_config' }],
       ],
     },
@@ -285,33 +288,25 @@ export function createScheduleKeyboard() {
 export function createMessagePoolKeyboard(poolSize, poolMode = 'random', usePool = false) {
   const buttons = [];
   
-  // Main actions
+  // Main actions - 2 columns
   buttons.push([
-    { text: '➕ Add Message', callback_data: 'pool_add_message' },
-    { text: '👁️ View Pool', callback_data: 'pool_view_messages' }
+    { text: '👁️ View Pool', callback_data: 'pool_view_messages' },
+    { text: '🔄 Refresh', callback_data: 'pool_add_message' }
   ]);
   
-  // Enable/Disable toggle
+  // Status toggle - Full width with modern design
   buttons.push([
-    { text: usePool ? '✅ Enabled' : '❌ Disabled', callback_data: 'pool_toggle' }
+    { text: usePool ? '✅ Pool Enabled' : '❌ Pool Disabled', callback_data: 'pool_toggle' }
   ]);
   
-  // Mode selection - 3 modes
+  // Mode selection - 3 columns for better layout
   buttons.push([
     { text: poolMode === 'random' ? '🟢 🎲 Random' : '⚪ 🎲 Random', callback_data: 'pool_mode_random' },
-    { text: poolMode === 'rotate' ? '🟢 🔄 Rotate' : '⚪ 🔄 Rotate', callback_data: 'pool_mode_rotate' }
-  ]);
-  buttons.push([
+    { text: poolMode === 'rotate' ? '🟢 🔄 Rotate' : '⚪ 🔄 Rotate', callback_data: 'pool_mode_rotate' },
     { text: poolMode === 'sequential' ? '🟢 ➡️ Sequential' : '⚪ ➡️ Sequential', callback_data: 'pool_mode_sequential' }
   ]);
   
-  if (poolSize > 0) {
-    buttons.push([
-      { text: `🗑️ Clear Pool (${poolSize})`, callback_data: 'pool_clear_confirm' },
-      { text: '📋 Export', callback_data: 'pool_export' }
-    ]);
-  }
-  
+  // Back button - Full width
   buttons.push([{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]);
   
   return {
@@ -321,38 +316,53 @@ export function createMessagePoolKeyboard(poolSize, poolMode = 'random', usePool
   };
 }
 
-export function createMessagePoolListKeyboard(messages, page = 0, pageSize = 5) {
+export function createMessagePoolListKeyboard(messages, page = 0, pageSize = 3) {
   const buttons = [];
   const start = page * pageSize;
   const end = Math.min(start + pageSize, messages.length);
   const pageMessages = messages.slice(start, end);
   
-  // Message buttons
+  // Message buttons with enable/disable
   pageMessages.forEach((msg, idx) => {
-    const displayText = msg.text.length > 30 ? msg.text.substring(0, 30) + '...' : msg.text;
+    // Extend title text to take maximum space (longer text = wider button)
+    const displayText = msg.text.length > 60 ? msg.text.substring(0, 60) + '...' : msg.text;
+    const statusIcon = msg.is_active ? '✅' : '❌';
+    const globalIndex = start + idx + 1;
+    
+    // Message title (extended) and small bin button (just emoji)
     buttons.push([
-      { text: `📝 ${start + idx + 1}. ${displayText}`, callback_data: `pool_view_${msg.id}` }
-    ]);
-    buttons.push([
-      { text: '🗑️ Delete', callback_data: `pool_delete_${msg.id}` }
+      { text: `${statusIcon} ${globalIndex}. ${displayText}`, callback_data: `pool_toggle_${msg.id}` },
+      { text: '🗑️', callback_data: `pool_delete_${msg.id}` }
     ]);
   });
   
-  // Pagination
+  // Pagination controls - Modern centered layout
   if (messages.length > pageSize) {
+    const maxPage = Math.ceil(messages.length / pageSize) - 1;
     const navButtons = [];
+    
+    // Left navigation
     if (page > 0) {
-      navButtons.push({ text: '◀️ Prev', callback_data: `pool_page_${page - 1}` });
+      navButtons.push({ text: '◀️', callback_data: `pool_page_${page - 1}` });
+    } else {
+      navButtons.push({ text: '⚪', callback_data: 'pool_page_info' }); // Placeholder for alignment
     }
-    if (end < messages.length) {
-      navButtons.push({ text: 'Next ▶️', callback_data: `pool_page_${page + 1}` });
+    
+    // Page indicator - centered
+    navButtons.push({ text: `📄 ${page + 1}/${maxPage + 1}`, callback_data: 'pool_page_info' });
+    
+    // Right navigation
+    if (page < maxPage) {
+      navButtons.push({ text: '▶️', callback_data: `pool_page_${page + 1}` });
+    } else {
+      navButtons.push({ text: '⚪', callback_data: 'pool_page_info' }); // Placeholder for alignment
     }
-    if (navButtons.length > 0) {
-      buttons.push(navButtons);
-    }
+    
+    buttons.push(navButtons);
   }
   
-  buttons.push([{ text: '🔙 Back to Pool', callback_data: 'pool_menu' }]);
+  // Back button - Full width
+  buttons.push([{ text: '🔙 Back to Pool', callback_data: 'btn_message_pool' }]);
   
   return {
     reply_markup: {
@@ -392,12 +402,12 @@ export function createAutoReplyMenu() {
   return {
     reply_markup: {
       inline_keyboard: [
-        // Auto Reply Options - 2 per row
+        // Auto Reply Options - 2 columns
         [
-          { text: '💬 Auto Reply DM', callback_data: 'btn_config_auto_reply_dm' },
-          { text: '💬 Auto Reply Groups', callback_data: 'btn_config_auto_reply_groups' }
+          { text: '💬 DM Replies', callback_data: 'btn_config_auto_reply_dm' },
+          { text: '👥 Group Replies', callback_data: 'btn_config_auto_reply_groups' }
         ],
-        // Back - Full Width
+        // Back - Full width
         [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
       ],
     },
@@ -408,10 +418,10 @@ export function createIntervalMenu() {
   return {
     reply_markup: {
       inline_keyboard: [
-        // Interval Options - 2 per row
+        // Interval Options - 2 columns
         [
           { text: '📡 Broadcast Interval', callback_data: 'btn_config_custom_interval' },
-          { text: '💬 Auto Reply Interval', callback_data: 'auto_reply_set_interval' }
+          { text: '⏳ Group Delay', callback_data: 'btn_config_group_delay' }
         ],
         // Back - Full Width
         [{ text: '🔙 Back to Settings', callback_data: 'btn_config' }],
@@ -420,7 +430,9 @@ export function createIntervalMenu() {
   };
 }
 
-export function createMessagesMenu() {
+export function createMessagesMenu(forwardMode = false, savedMessagesUrl = 'tg://search?query=Saved Messages') {
+  const forwardModeText = forwardMode ? '🟢 Forward Mode' : '⚪ Forward Mode';
+  
   return {
     reply_markup: {
       inline_keyboard: [
@@ -429,6 +441,10 @@ export function createMessagesMenu() {
           { text: '✍️ Set Message', callback_data: 'btn_set_start_msg' },
           { text: '🎲 Message Pool', callback_data: 'btn_message_pool' }
         ],
+        // Forward Mode - Full Width
+        [{ text: forwardModeText, callback_data: 'btn_config_forward_mode' }],
+        // Go to Saved Messages - Full Width (uses account username if available, otherwise search)
+        [{ text: '📱 Go to Saved Messages', url: savedMessagesUrl }],
         // Back - Full Width
         [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
       ],

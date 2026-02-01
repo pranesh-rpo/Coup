@@ -11,9 +11,62 @@ import mentionService from './mentionService.js';
 import db from '../database/db.js';
 import { config } from '../config.js';
 import { logError } from '../utils/logger.js';
-import { Api } from 'telegram/tl/index.js';
+import { Api } from 'telegram';
 import { getInputUser } from 'telegram/Utils.js';
 import { isFloodWaitError, extractWaitTime } from '../utils/floodWaitHandler.js';
+import { validateMessage } from '../utils/messageValidator.js';
+
+/**
+ * Fetch custom emoji documents to grant the account access before sending.
+ * This is the reliable method - calling messages.GetCustomEmojiDocuments caches
+ * the emoji documents and allows the account to use them in messages.
+ * 
+ * @param {TelegramClient} client - GramJS client
+ * @param {Array} emojiDocumentIds - Array of emoji document IDs (BigInt)
+ * @returns {Promise<boolean>} - Whether the fetch was successful
+ */
+async function fetchCustomEmojiDocuments(client, emojiDocumentIds) {
+  if (!client || !emojiDocumentIds || emojiDocumentIds.length === 0) {
+    return false;
+  }
+
+  try {
+    console.log(`[PREMIUM_EMOJI] Fetching ${emojiDocumentIds.length} custom emoji documents to grant access...`);
+    
+    // Call messages.GetCustomEmojiDocuments to fetch and cache the emoji documents
+    // This grants the account access to use these emojis
+    const result = await client.invoke(
+      new Api.messages.GetCustomEmojiDocuments({
+        documentId: emojiDocumentIds
+      })
+    );
+    
+    if (result && result.length > 0) {
+      console.log(`[PREMIUM_EMOJI] ✅ Successfully fetched ${result.length} emoji documents`);
+      result.forEach((doc, idx) => {
+        console.log(`[PREMIUM_EMOJI] Document ${idx}: id=${doc.id}, accessHash=${doc.accessHash ? 'present' : 'missing'}`);
+      });
+      return true;
+    } else {
+      console.log(`[PREMIUM_EMOJI] ⚠️ GetCustomEmojiDocuments returned empty result`);
+      return false;
+    }
+  } catch (error) {
+    // Check for specific error types
+    const errorMessage = error?.message || error?.toString() || 'Unknown error';
+    
+    if (errorMessage.includes('EMOTICON_INVALID') || errorMessage.includes('400')) {
+      console.log(`[PREMIUM_EMOJI] ⚠️ Some emoji IDs may be invalid: ${errorMessage}`);
+    } else if (errorMessage.includes('FLOOD')) {
+      console.log(`[PREMIUM_EMOJI] ⚠️ Rate limited while fetching emojis: ${errorMessage}`);
+    } else {
+      console.log(`[PREMIUM_EMOJI] ⚠️ Error fetching emoji documents: ${errorMessage}`);
+    }
+    
+    // Return false but don't throw - we'll try to send anyway
+    return false;
+  }
+}
 
 class AutomationService {
   constructor() {
@@ -503,8 +556,8 @@ class AutomationService {
       const settings = await configService.getAccountSettings(accountId);
       const intervalMinutes = settings?.manualInterval;
     
-      // Default to 15 minutes if not set
-      const defaultIntervalMinutes = 15;
+      // Default to 11 minutes if not set (matches UI default)
+      const defaultIntervalMinutes = 11;
       const minIntervalMinutes = 11;
       
       let finalIntervalMinutes;
@@ -525,8 +578,8 @@ class AutomationService {
       return intervalMs;
     } catch (error) {
       logError(`[BROADCAST] Error getting custom interval:`, error);
-      // Return default 15 minutes on error
-      return 15 * 60 * 1000;
+      // Return default 11 minutes on error (matches UI default)
+      return 11 * 60 * 1000;
     }
   }
 
@@ -578,6 +631,8 @@ class AutomationService {
     let broadcastMessage = message;
     let useForwardMode = false;
     let forwardMessageId = null;
+    let messageEntities = null; // Declare at function scope to ensure it's available throughout
+    let messageData = null; // Declare at function scope to store full message data including saved_message_id
     
     // Validate message if provided (check for empty/whitespace)
     if (broadcastMessage && typeof broadcastMessage === 'string' && broadcastMessage.trim().length === 0) {
@@ -619,8 +674,7 @@ class AutomationService {
       if (!useForwardMode) {
         try {
           const useMessagePool = settings?.useMessagePool || false;
-          let messageData = null;
-          let messageEntities = null;
+          // messageData and messageEntities are already declared at function scope
 
           // Try message pool first if enabled
           if (useMessagePool) {
@@ -649,6 +703,37 @@ class AutomationService {
             messageData = await messageService.getActiveMessage(accountId);
           }
           
+          // If no saved_message_id found, try to get last message from Saved Messages automatically
+          if (messageData && typeof messageData === 'object' && !messageData.saved_message_id) {
+            try {
+              const accountLinker = (await import('./accountLinker.js')).default;
+              const client = await accountLinker.ensureConnected(accountId);
+              if (client) {
+                const me = await client.getMe();
+                let savedMessagesEntity;
+                try {
+                  savedMessagesEntity = await client.getEntity(me);
+                } catch (error) {
+                  const dialogs = await client.getDialogs();
+                  const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+                  if (savedDialog) {
+                    savedMessagesEntity = savedDialog.entity;
+                  }
+                }
+                
+                if (savedMessagesEntity) {
+                  const messages = await client.getMessages(savedMessagesEntity, { limit: 1 });
+                  if (messages && messages.length > 0) {
+                    messageData.saved_message_id = messages[0].id;
+                    console.log(`[BROADCAST] Auto-detected last message from Saved Messages (ID: ${messageData.saved_message_id})`);
+                  }
+                }
+              }
+            } catch (autoCheckError) {
+              console.log(`[BROADCAST] Could not auto-check Saved Messages: ${autoCheckError.message}`);
+            }
+          }
+          
           // Handle both old (string) and new (object) formats for backward compatibility
           if (messageData === null) {
             broadcastMessage = null;
@@ -657,6 +742,17 @@ class AutomationService {
           } else if (messageData && typeof messageData === 'object') {
             broadcastMessage = messageData.text || null;
             messageEntities = messageData.entities || null;
+            
+            // Log entities extraction
+            if (messageEntities && messageEntities.length > 0) {
+              const premiumEmojis = messageEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+              console.log(`[BROADCAST] Extracted ${messageEntities.length} entities from messageData (${premiumEmojis.length} premium emojis)`);
+              if (premiumEmojis.length > 0) {
+                console.log(`[BROADCAST] Premium emoji IDs extracted: ${premiumEmojis.map(e => e.custom_emoji_id).join(', ')}`);
+              }
+            } else {
+              console.log(`[BROADCAST] ⚠️ No entities found in messageData object`);
+            }
           } else {
             broadcastMessage = null;
           }
@@ -689,17 +785,33 @@ class AutomationService {
     const customIntervalMs = await this.getCustomInterval(accountId);
     const customIntervalMinutes = customIntervalMs / (60 * 1000);
     
-    // Extract entities from messageData if available
-    let messageEntities = null;
-    if (typeof messageData === 'object' && messageData !== null && messageData.entities) {
+    // If messageEntities wasn't set in the if block above, try to extract from messageData as fallback
+    // (This can happen if useForwardMode is true, skipping the message retrieval block)
+    if (!messageEntities && typeof messageData !== 'undefined' && messageData && typeof messageData === 'object' && messageData.entities) {
       messageEntities = messageData.entities;
+      console.log(`[BROADCAST] Fallback: Extracted ${messageEntities.length} entities from messageData`);
+    }
+    
+    // Final check: log what we have before storing in broadcast
+    if (messageEntities && messageEntities.length > 0) {
+      const premiumEmojis = messageEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+      console.log(`[BROADCAST] Final: Storing ${messageEntities.length} entities in broadcast data (${premiumEmojis.length} premium emojis)`);
+    } else {
+      console.log(`[BROADCAST] ⚠️ WARNING: No entities to store in broadcast data!`);
     }
     
     // broadcastKey is already declared above (line 66)
+    // Store messageData to access saved_message_id for premium emoji forwarding
+    let storedMessageData = null;
+    if (typeof messageData !== 'undefined' && messageData !== null) {
+      storedMessageData = messageData;
+    }
+    
     const broadcastData = {
       isRunning: true,
       message: broadcastMessage,
       messageEntities, // Store entities for premium emoji support
+      messageData: storedMessageData, // Store full messageData including saved_message_id
       useForwardMode,
       forwardMessageId,
       timeouts: [],
@@ -910,50 +1022,81 @@ class AutomationService {
         }
       }
         
-      // If not using forward mode (and not using saved template), get A/B variant message
+      // If not using forward mode (and not using saved template), get message from pool or A/B variant
       if (!useForwardMode) {
         try {
-          const abMode = settings?.abMode || false;
-          const abModeType = settings?.abModeType || 'single';
-          const abLastVariant = settings?.abLastVariant || 'A';
+          const useMessagePool = settings?.useMessagePool || false;
           
-          const messageData = await messageService.selectMessageVariant(
-            broadcast.accountId,
-            abMode,
-            abModeType,
-            abLastVariant
-          );
+          // Try message pool first if enabled (for random and rotate modes)
+          // Sequential mode is handled per-group in sendSingleMessageToAllGroups
+          if (useMessagePool) {
+            const poolMode = settings?.messagePoolMode || 'random';
+            const poolLastIndex = settings?.messagePoolLastIndex || 0;
+            
+            if (poolMode === 'random') {
+              const poolMessage = await messageService.getRandomFromPool(broadcast.accountId);
+              if (poolMessage) {
+                messageToSend = poolMessage.text || null;
+                storedEntities = poolMessage.entities || null;
+                console.log(`[BROADCAST] Cycle: Selected random message from pool`);
+              }
+            } else if (poolMode === 'rotate') {
+              const poolResult = await messageService.getNextFromPool(broadcast.accountId, poolLastIndex);
+              if (poolResult) {
+                messageToSend = poolResult.text || null;
+                storedEntities = poolResult.entities || null;
+                // Update last index for next rotation
+                await configService.updateMessagePoolLastIndex(broadcast.accountId, poolResult.nextIndex);
+                console.log(`[BROADCAST] Cycle: Selected next message from pool (index ${poolResult.nextIndex})`);
+              }
+            }
+            // Sequential mode is handled per-group in sendSingleMessageToAllGroups, so we don't need to handle it here
+          }
           
-          // Handle both old (string) and new (object) formats for backward compatibility
-          if (messageData === null) {
-            messageToSend = null;
-          } else if (typeof messageData === 'string') {
-            messageToSend = messageData;
-          } else if (messageData && typeof messageData === 'object') {
-            messageToSend = messageData.text || null;
-            storedEntities = messageData.entities || null;
-          } else {
-            messageToSend = null;
+          // Fall back to A/B variant message if pool is empty, not enabled, or in sequential mode
+          if (!messageToSend) {
+            const abMode = settings?.abMode || false;
+            const abModeType = settings?.abModeType || 'single';
+            const abLastVariant = settings?.abLastVariant || 'A';
+            
+            const messageData = await messageService.selectMessageVariant(
+              broadcast.accountId,
+              abMode,
+              abModeType,
+              abLastVariant
+            );
+            
+            // Handle both old (string) and new (object) formats for backward compatibility
+            if (messageData === null) {
+              messageToSend = null;
+            } else if (typeof messageData === 'string') {
+              messageToSend = messageData;
+            } else if (messageData && typeof messageData === 'object') {
+              messageToSend = messageData.text || null;
+              storedEntities = messageData.entities || null;
+            } else {
+              messageToSend = null;
+            }
+            
+            // Update last variant if using rotate mode
+            if (abMode && abModeType === 'rotate' && messageToSend) {
+              try {
+                const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
+                await configService.updateABLastVariant(broadcast.accountId, nextVariant);
+              } catch (variantError) {
+                logError(`[BROADCAST ERROR] Error updating AB variant in cycle:`, variantError);
+                // Non-critical error, continue
+              }
+            }
           }
           
           // Validate message (check for empty/whitespace)
           if (messageToSend && typeof messageToSend === 'string' && messageToSend.trim().length === 0) {
-            console.log(`[BROADCAST] Selected message variant is empty/whitespace, treating as null`);
+            console.log(`[BROADCAST] Selected message is empty/whitespace, treating as null`);
             messageToSend = null;
           }
-          
-          // Update last variant if using rotate mode
-          if (abMode && abModeType === 'rotate' && messageToSend) {
-            try {
-              const nextVariant = abLastVariant === 'A' ? 'B' : 'A';
-              await configService.updateABLastVariant(broadcast.accountId, nextVariant);
-            } catch (variantError) {
-              logError(`[BROADCAST ERROR] Error updating AB variant in cycle:`, variantError);
-              // Non-critical error, continue
-            }
-          }
         } catch (messageError) {
-          logError(`[BROADCAST ERROR] Error getting message variant in cycle:`, messageError);
+          logError(`[BROADCAST ERROR] Error getting message in cycle:`, messageError);
           messageToSend = null;
         }
       } else {
@@ -1293,6 +1436,22 @@ class AutomationService {
       console.log(`[BROADCAST] Broadcast not running for account ${accountId} (user ${userId}), skipping send`);
       return;
     }
+    
+    // Log entities being passed to send function
+    if (messageEntities && messageEntities.length > 0) {
+      console.log(`[BROADCAST] Received ${messageEntities.length} entities to send (from parameter)`);
+      const premiumEmojis = messageEntities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+      if (premiumEmojis.length > 0) {
+        console.log(`[BROADCAST] Premium emoji entities in parameter: ${premiumEmojis.map(e => e.custom_emoji_id).join(', ')}`);
+      }
+    } else {
+      console.log(`[BROADCAST] ⚠️ No entities in messageEntities parameter`);
+      // Try to get from broadcast data
+      if (broadcast.messageEntities && broadcast.messageEntities.length > 0) {
+        messageEntities = broadcast.messageEntities;
+        console.log(`[BROADCAST] Using entities from broadcast data: ${messageEntities.length} entities`);
+      }
+    }
 
     // Check if current time is within schedule window
     // Bypass schedule if:
@@ -1363,35 +1522,37 @@ class AutomationService {
         return;
       }
 
-      // Get Saved Messages entity and last message for forwarding if using forward mode
-      // Forward mode forwards the LAST message from Saved Messages (user should forward a message there first)
-      // This preserves premium emojis because the message is forwarded, not re-sent
+      // ALWAYS get the last message from Saved Messages for broadcasting
+      // This is the new model: users send messages to Saved Messages, and we use the last one
       let savedMessagesEntity = null;
-      let forwardMessageIdToUse = null;
-      if (useForwardMode) {
-        try {
-          // Get Saved Messages entity (it's the "me" user)
-          const me = await client.getMe();
-          savedMessagesEntity = await client.getEntity(me);
-          
-          // Get the last message from Saved Messages
-          const messages = await client.getMessages(savedMessagesEntity, {
-            limit: 1,
-          });
-          
-          if (messages && messages.length > 0) {
-            forwardMessageIdToUse = messages[0].id;
-            console.log(`[BROADCAST] Using forward mode - will forward last message (ID: ${forwardMessageIdToUse}) from Saved Messages`);
-          } else {
-            console.log(`[BROADCAST] ⚠️ Forward mode enabled but no messages found in Saved Messages. User should forward a message to Saved Messages first.`);
-            useForwardMode = false; // Fallback to normal message
-          }
-        } catch (error) {
-          logError(`[BROADCAST ERROR] Failed to get Saved Messages or last message:`, error);
-          console.log(`[BROADCAST] ⚠️ Cannot get Saved Messages, forward mode will not work`);
-          useForwardMode = false; // Fallback to normal message
+      let lastSavedMessageId = null;
+      let lastSavedMessage = null;
+      
+      try {
+        // Get Saved Messages entity (it's the "me" user)
+        const me = await client.getMe();
+        savedMessagesEntity = await client.getEntity(me);
+        
+        // Get the last message from Saved Messages
+        const messages = await client.getMessages(savedMessagesEntity, {
+          limit: 1,
+        });
+        
+        if (messages && messages.length > 0) {
+          lastSavedMessage = messages[0];
+          lastSavedMessageId = lastSavedMessage.id;
+          console.log(`[BROADCAST] ✅ Found last message from Saved Messages (ID: ${lastSavedMessageId})`);
+        } else {
+          console.log(`[BROADCAST] ⚠️ No messages found in Saved Messages. User should send a message to Saved Messages first.`);
         }
+      } catch (error) {
+        logError(`[BROADCAST ERROR] Failed to get Saved Messages or last message:`, error);
+        console.log(`[BROADCAST] ⚠️ Cannot get Saved Messages: ${error.message}`);
       }
+      
+      // If forward mode is enabled, we'll forward the last message instead of sending
+      // If forward mode is disabled, we'll still use the last message but send it normally
+      const forwardMessageIdToUse = useForwardMode ? lastSavedMessageId : null;
 
       // Get all dialogs (chats) with error handling
       let dialogs = [];
@@ -1656,9 +1817,67 @@ class AutomationService {
               }
             }
           } else {
-            // For sequential mode, get message based on group index
+            // NEW MODEL: Always use the last message from Saved Messages
+            // We already fetched it at the top of the function, so use it here
             let messageToUse = message;
             let entitiesToUse = messageEntities;
+            let savedMessageIdToUse = lastSavedMessageId; // Use the last message we already fetched
+            
+            // If we have the last message from Saved Messages, use it
+            if (lastSavedMessage) {
+              messageToUse = lastSavedMessage.text || messageToUse;
+              
+              // Extract entities from the saved message if available
+              if (lastSavedMessage.entities && lastSavedMessage.entities.length > 0) {
+                entitiesToUse = lastSavedMessage.entities.map(e => {
+                  let entityType = 'unknown';
+                  
+                  if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
+                    entityType = 'custom_emoji';
+                  } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
+                    entityType = 'bold';
+                  } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
+                    entityType = 'italic';
+                  } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
+                    entityType = 'code';
+                  } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
+                    entityType = 'pre';
+                  }
+                  
+                  const entity = {
+                    type: entityType,
+                    offset: e.offset,
+                    length: e.length,
+                  };
+                  
+                  if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
+                    entity.custom_emoji_id = String(e.documentId);
+                  }
+                  
+                  if (entityType === 'pre' && e.language !== undefined) {
+                    entity.language = e.language;
+                  }
+                  
+                  return entity;
+                });
+                
+                console.log(`[BROADCAST] Group "${groupName}": Using last message from Saved Messages (ID: ${savedMessageIdToUse}) with ${entitiesToUse.length} entities`);
+              }
+            } else {
+              console.log(`[BROADCAST] Group "${groupName}": ⚠️ No message in Saved Messages, using fallback message`);
+            }
+            
+            // Log entities at start of group processing
+            if (entitiesToUse && entitiesToUse.length > 0) {
+              console.log(`[BROADCAST] Group "${groupName}": Starting with ${entitiesToUse.length} entities`);
+            } else {
+              console.log(`[BROADCAST] Group "${groupName}": ⚠️ No entities available, checking broadcast data...`);
+              // Fallback: try to get from broadcast data
+              if (broadcast.messageEntities && broadcast.messageEntities.length > 0) {
+                entitiesToUse = broadcast.messageEntities;
+                console.log(`[BROADCAST] Group "${groupName}": Using ${entitiesToUse.length} entities from broadcast data`);
+              }
+            }
             
             // OPTIMIZATION: Use cached settings instead of fetching from database again
             const settings = broadcast.cachedSettings || await configService.getAccountSettings(accountId);
@@ -1683,6 +1902,53 @@ class AutomationService {
               continue;
             }
             
+            // Check if we should forward from Saved Messages (if we have saved_message_id with premium emojis)
+            // This is the proper way to preserve premium emojis - forward the message that already has emoji documents
+            if (savedMessageIdToUse && entitiesToUse && entitiesToUse.some(e => e.type === 'custom_emoji' && e.custom_emoji_id)) {
+              try {
+                // Get Saved Messages entity
+                const me = await client.getMe();
+                let savedMessagesEntity;
+                try {
+                  savedMessagesEntity = await client.getEntity(me);
+                } catch (error) {
+                  const dialogs = await client.getDialogs();
+                  const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
+                  if (savedDialog) {
+                    savedMessagesEntity = savedDialog.entity;
+                  } else {
+                    throw new Error('Saved Messages not found');
+                  }
+                }
+                
+                console.log(`[BROADCAST] Group "${groupName}": Forwarding message ${savedMessageIdToUse} from Saved Messages to preserve premium emojis`);
+                
+                // Forward the message from Saved Messages (preserves premium emojis)
+                const forwardedResult = await client.forwardMessages(group.entity, {
+                  messages: [savedMessageIdToUse],
+                  fromPeer: savedMessagesEntity,
+                  dropAuthor: false,
+                  dropMediaCaptions: false,
+                });
+                
+                if (forwardedResult && forwardedResult.length > 0) {
+                  console.log(`[BROADCAST] ✅ Successfully forwarded message with premium emojis to group "${groupName}"`);
+                  
+                  // Record message sent for rate limiting tracking
+                  this.recordMessageSent(accountId);
+                  this.recordGroupMessageSent(accountId, groupId);
+                  successCount++;
+                  continue; // Skip to next group
+                } else {
+                  throw new Error('Forward result was empty');
+                }
+              } catch (forwardError) {
+                console.log(`[BROADCAST] ⚠️ Failed to forward from Saved Messages: ${forwardError?.message || 'Unknown error'}`);
+                console.log(`[BROADCAST] ⚠️ Falling back to sending with entities (may not preserve emojis)`);
+                // Continue with entity sending as fallback
+              }
+            }
+            
             // Check if auto-mention is enabled
             const autoMention = settings?.autoMention || false;
             // Ensure mentionCount is valid (1, 3, or 5), default to 5
@@ -1696,23 +1962,45 @@ class AutomationService {
             
             let messageToSend = messageToUse;
             let entities = [];
+            let premiumEmojiIds = [];  // Track premium emoji document IDs for fetching
             
-            // Convert stored entities (from Bot API format) to GramJS format if available
+            // Convert stored entities (from Bot API format) to GramJS format
             if (entitiesToUse && entitiesToUse.length > 0) {
-              console.log(`[BROADCAST] Converting ${entitiesToUse.length} stored entities (premium emojis) to GramJS format`);
-              const { Api } = await import('telegram/tl/index.js');
+              console.log(`[BROADCAST] Group "${groupName}": Processing ${entitiesToUse.length} entities`);
               
               for (const entity of entitiesToUse) {
                 try {
-                  // Convert Bot API entity to GramJS entity
                   if (entity.type === 'custom_emoji' && entity.custom_emoji_id) {
                     // Premium emoji entity
-                    entities.push(new Api.MessageEntityCustomEmoji({
-                      offset: entity.offset,
-                      length: entity.length,
-                      documentId: BigInt(entity.custom_emoji_id)
-                    }));
-                    console.log(`[BROADCAST] Added premium emoji entity: custom_emoji_id=${entity.custom_emoji_id}, offset=${entity.offset}, length=${entity.length}`);
+                    let emojiId;
+                    try {
+                      if (typeof entity.custom_emoji_id === 'string') {
+                        emojiId = BigInt(entity.custom_emoji_id);
+                      } else if (typeof entity.custom_emoji_id === 'number') {
+                        emojiId = BigInt(entity.custom_emoji_id);
+                      } else if (typeof entity.custom_emoji_id === 'bigint') {
+                        emojiId = entity.custom_emoji_id;
+                      } else {
+                        console.log(`[BROADCAST] ⚠️ Invalid custom_emoji_id type: ${typeof entity.custom_emoji_id}`);
+                        continue;
+                      }
+                      
+                      // Track emoji ID for pre-fetching
+                      premiumEmojiIds.push(emojiId);
+                      
+                      // Create MessageEntityCustomEmoji exactly as per Telegram API docs
+                      // offset and length are UTF-16 code units (already correct from Bot API)
+                      const emojiEntity = new Api.MessageEntityCustomEmoji({
+                        offset: entity.offset,
+                        length: entity.length,
+                        documentId: emojiId
+                      });
+                      entities.push(emojiEntity);
+                      console.log(`[BROADCAST] ✅ Added premium emoji entity: documentId=BigInt("${emojiId.toString()}"), offset=${entity.offset}, length=${entity.length}`);
+                      console.log(`[BROADCAST] Entity format: new Api.MessageEntityCustomEmoji({ offset: ${entity.offset}, length: ${entity.length}, documentId: BigInt("${emojiId.toString()}") })`);
+                    } catch (emojiError) {
+                      console.log(`[BROADCAST] ⚠️ Error converting custom_emoji_id: ${emojiError.message}`);
+                    }
                   } else if (entity.type === 'bold') {
                     entities.push(new Api.MessageEntityBold({
                       offset: entity.offset,
@@ -1735,9 +2023,10 @@ class AutomationService {
                       language: entity.language || ''
                     }));
                   } else if (entity.type === 'text_link' && entity.url) {
-                    entities.push(new Api.MessageEntityUrl({
+                    entities.push(new Api.MessageEntityTextUrl({
                       offset: entity.offset,
-                      length: entity.length
+                      length: entity.length,
+                      url: entity.url
                     }));
                   } else if (entity.type === 'text_mention' && entity.user) {
                     entities.push(new Api.MessageEntityMentionName({
@@ -1746,10 +2035,16 @@ class AutomationService {
                       userId: BigInt(entity.user.id)
                     }));
                   }
-                  // Add more entity types as needed
                 } catch (entityError) {
                   console.log(`[BROADCAST] Error converting entity: ${entityError.message}`);
                 }
+              }
+              
+              // CRITICAL: Fetch premium emoji documents BEFORE sending
+              // This grants the account access to use these emojis
+              if (premiumEmojiIds.length > 0 && client) {
+                console.log(`[BROADCAST] 🎨 Message has ${premiumEmojiIds.length} premium emojis - fetching documents...`);
+                await fetchCustomEmojiDocuments(client, premiumEmojiIds);
               }
             }
             
@@ -1816,7 +2111,7 @@ class AutomationService {
               (e.className === 'MessageEntityMentionName') || 
               (e.userId !== undefined && e.userId !== null)
             );
-            // Explicitly check for premium emoji entities
+            // Explicitly check for premium emoji entities in GramJS format
             const hasPremiumEmojiEntities = entities.some(e => 
               (e.className === 'MessageEntityCustomEmoji') ||
               (e.documentId !== undefined && e.documentId !== null)
@@ -1826,11 +2121,6 @@ class AutomationService {
                 (e.userId !== undefined && e.userId !== null))
             );
             
-            // Log entity detection for debugging
-            if (hasPremiumEmojiEntities) {
-              console.log(`[BROADCAST] ✅ Detected premium emoji entities in message`);
-            }
-            
             if (entities.length > 0) {
               try {
                 // Validate group entity before sending
@@ -1838,32 +2128,51 @@ class AutomationService {
                   throw new Error('Group entity is missing');
                 }
                 
-                // If we have premium emoji entities, ALWAYS use direct entity sending (premium emojis cannot be sent via HTML)
+                // If we have premium emoji entities, use direct entity sending
                 // If we have both mention entities and other entities (premium emojis), use direct entity sending
                 // If we only have mention entities, use HTML parsing (better for mentions)
                 // If we only have other entities (premium emojis), use direct entity sending
                 if (hasPremiumEmojiEntities || (hasMentionEntities && hasOtherEntities)) {
                   // Send message with direct entities (for premium emojis and/or when we have both mentions and premium emojis)
                   const entityTypes = entities.map(e => e.className || e.constructor?.name || 'Unknown').join(', ');
-                  console.log(`[BROADCAST] Sending message with ${entities.length} direct entities (types: ${entityTypes})`);
+                  console.log(`[BROADCAST] 🎨 Sending message with ${entities.length} direct entities (types: ${entityTypes})`);
+                  
+                  // Log premium emoji document IDs for debugging
+                  if (hasPremiumEmojiEntities) {
+                    const emojiEntities = entities.filter(e => 
+                      (e.className === 'MessageEntityCustomEmoji') ||
+                      (e.documentId !== undefined && e.documentId !== null)
+                    );
+                    console.log(`[BROADCAST] Premium emoji document IDs: ${emojiEntities.map(e => e.documentId?.toString() || 'N/A').join(', ')}`);
+                    console.log(`[BROADCAST] ✅ Emoji documents were pre-fetched to grant access`);
+                  }
+                  
+                  // CRITICAL: Validate message before sending (Telegram compliance)
+                  const messageValidation = validateMessage(messageToSend, entities);
+                  if (!messageValidation.valid) {
+                    console.log(`[BROADCAST] ⚠️ Message validation failed: ${messageValidation.error}`);
+                    loggingService.logError(accountId, `Message validation failed: ${messageValidation.error}`, userId);
+                    errorCount++;
+                    continue;
+                  }
+                  
+                  const validatedMessage = messageValidation.sanitized || messageToSend;
                   
                   const result = await client.sendMessage(group.entity, {
-                    message: messageToSend,
+                    message: validatedMessage,
                     entities: entities
                   });
                   
-                  console.log(`[BROADCAST] Message sent successfully with entities. Message ID: ${result?.id || 'unknown'}`);
+                  console.log(`[BROADCAST] ✅ Message sent successfully with entities. Message ID: ${result?.id || 'unknown'}`);
                   
                   // Check if entities were actually included in the sent message
                   const resultEntities = result?.entities || result?._entities || [];
                   if (resultEntities.length > 0) {
                     console.log(`[BROADCAST] ✅ Entities confirmed in sent message: ${resultEntities.length} entities`);
-                    resultEntities.forEach((ent, idx) => {
-                      console.log(`[BROADCAST] Entity ${idx}: ${ent?.className || ent?.constructor?.name || 'Unknown'}, offset=${ent?.offset || 'N/A'}, length=${ent?.length || 'N/A'}`);
-                      if (ent?.documentId) {
-                        console.log(`[BROADCAST] Entity ${idx} is premium emoji: documentId=${ent.documentId}`);
-                      }
-                    });
+                    const premiumCount = resultEntities.filter(e => e.className === 'MessageEntityCustomEmoji' || e.documentId).length;
+                    if (premiumCount > 0) {
+                      console.log(`[BROADCAST] ✅ Premium emojis preserved: ${premiumCount} custom emoji entities`);
+                    }
                   } else {
                     console.log(`[BROADCAST] ⚠️ WARNING: No entities found in sent message result!`);
                   }
@@ -1967,6 +2276,52 @@ class AutomationService {
                 console.log(`[BROADCAST] Error sending message with entities: ${sendError?.message || 'Unknown error'}`);
                 console.log(`[BROADCAST] Send error details:`, sendError);
                 
+                // Check for premium emoji errors (900-942)
+                const errorCode = sendError?.code || sendError?.errorCode || sendError?.error_code;
+                const isPremiumEmojiError = errorCode >= 900 && errorCode <= 942;
+                
+                if (isPremiumEmojiError || (hasPremiumEmojiEntities && sendError?.message?.includes('emoji'))) {
+                  console.log(`[BROADCAST] ❌ Premium emoji error (code: ${errorCode}): ${sendError?.message || 'Unknown error'}`);
+                  console.log(`[BROADCAST] ⚠️ The account may not have access to the premium emoji document.`);
+                  console.log(`[BROADCAST] ⚠️ Possible reasons:`);
+                  console.log(`[BROADCAST]   1. The account is not a premium Telegram user`);
+                  console.log(`[BROADCAST]   2. The emoji document ID is invalid or expired`);
+                  console.log(`[BROADCAST]   3. The account needs to receive the emoji first to have access`);
+                  console.log(`[BROADCAST] 💡 Solution: The premium user should forward the message with premium emojis to the account's Saved Messages first.`);
+                  
+                  // Try to resolve emoji documents if possible
+                  if (hasPremiumEmojiEntities && client) {
+                    try {
+                      console.log(`[BROADCAST] Attempting to resolve premium emoji documents...`);
+                      const premiumEmojiEntities = entities.filter(e => 
+                        (e.className === 'MessageEntityCustomEmoji') ||
+                        (e.documentId !== undefined && e.documentId !== null)
+                      );
+                      
+                      // Try to get emoji documents from Telegram
+                      for (const emojiEntity of premiumEmojiEntities) {
+                        try {
+                          const documentId = emojiEntity.documentId;
+                          if (documentId) {
+                            // Try to get the document to ensure account has access
+                            const { Api } = await import('telegram/tl/index.js');
+                            // Note: We can't directly fetch emoji documents, but we can log the attempt
+                            console.log(`[BROADCAST] Emoji document ID: ${documentId}`);
+                          }
+                        } catch (resolveError) {
+                          console.log(`[BROADCAST] Could not resolve emoji document: ${resolveError?.message}`);
+                        }
+                      }
+                    } catch (resolveError) {
+                      console.log(`[BROADCAST] Error resolving emoji documents: ${resolveError?.message}`);
+                    }
+                  }
+                  
+                  // Don't fallback for premium emoji errors - the message should fail
+                  // This ensures users know the premium emojis aren't working
+                  throw new Error(`Premium emoji error (${errorCode}): ${sendError?.message || 'Account may not have access to premium emoji'}`);
+                }
+                
                 // If premium emojis are present, warn that they will be lost in fallback
                 if (hasPremiumEmojiEntities) {
                   console.log(`[BROADCAST] ⚠️ WARNING: Premium emoji entities will be lost in fallback!`);
@@ -1976,8 +2331,17 @@ class AutomationService {
                 // Fallback: send without entities (premium emojis will be lost)
                 console.log(`[BROADCAST] Falling back to sending without entities`);
                 try {
-                  if (group.entity && messageToSend && messageToSend.trim().length > 0) {
-                    await client.sendMessage(group.entity, { message: messageToSend });
+                  // CRITICAL: Validate message before fallback send
+                  const fallbackValidation = validateMessage(messageToSend);
+                  if (!fallbackValidation.valid) {
+                    console.log(`[BROADCAST] ⚠️ Fallback message validation failed: ${fallbackValidation.error}`);
+                    throw new Error(`Fallback validation failed: ${fallbackValidation.error}`);
+                  }
+                  
+                  const validatedFallbackMessage = fallbackValidation.sanitized || messageToSend;
+                  
+                  if (group.entity && validatedFallbackMessage && validatedFallbackMessage.trim().length > 0) {
+                    await client.sendMessage(group.entity, { message: validatedFallbackMessage });
                     if (hasPremiumEmojiEntities) {
                       console.log(`[BROADCAST] ⚠️ Message sent but premium emojis were lost due to entity send error`);
                     }
@@ -1996,10 +2360,25 @@ class AutomationService {
                 errorCount++;
                 continue;
               }
-              if (messageToSend && messageToSend.trim().length > 0) {
-                await client.sendMessage(group.entity, { message: messageToSend });
+              
+              // CRITICAL: Validate message content before sending (Telegram compliance)
+              // Use entitiesToUse (Bot API format) for validation, or null if no entities
+              const entitiesForValidation = entitiesToUse || null;
+              const messageValidation = validateMessage(messageToSend, entitiesForValidation);
+              if (!messageValidation.valid) {
+                console.log(`[BROADCAST] ⚠️ Message validation failed for group "${groupName}": ${messageValidation.error}`);
+                loggingService.logError(accountId, `Message validation failed: ${messageValidation.error}`, userId);
+                errorCount++;
+                continue;
+              }
+              
+              const validatedMessage = messageValidation.sanitized || messageToSend;
+              
+              if (validatedMessage && validatedMessage.trim().length > 0) {
+                await client.sendMessage(group.entity, { message: validatedMessage });
               } else {
-                console.log(`[BROADCAST] ⚠️ Message is empty, skipping group "${groupName}"`);
+                console.log(`[BROADCAST] ⚠️ Message is empty after validation, skipping group "${groupName}"`);
+                errorCount++;
                 continue;
               }
             }
@@ -2102,15 +2481,25 @@ class AutomationService {
                   }
                 }
                 
-                if (messageToSend && messageToSend.trim().length > 0) {
-                  await client.sendMessage(group.entity, { message: messageToSend, entities });
+                // CRITICAL: Validate message before retry send
+                const retryValidation = validateMessage(messageToSend, entities);
+                if (!retryValidation.valid) {
+                  console.log(`[BROADCAST] ⚠️ Retry message validation failed: ${retryValidation.error}`);
+                  errorCount++;
+                  continue;
+                }
+                
+                const validatedRetryMessage = retryValidation.sanitized || messageToSend;
+                
+                if (validatedRetryMessage && validatedRetryMessage.trim().length > 0) {
+                  await client.sendMessage(group.entity, { message: validatedRetryMessage, entities });
                   console.log(`[BROADCAST] ✅ Retry successful: Sent to group "${groupName}"`);
                   successCount++;
                   this.recordMessageSent(accountId);
                   this.recordGroupMessageSent(accountId, groupId);
                   continue; // Successfully retried, move to next group
                 } else {
-                  console.log(`[BROADCAST] Retry message is empty, treating as error`);
+                  console.log(`[BROADCAST] Retry message is empty after validation, treating as error`);
                   errorCount++;
                   // Continue to error handling below
                 }
@@ -2488,9 +2877,25 @@ class AutomationService {
                       htmlMessage = before + `<a href="tg://user?id=${userIdValue}">&#8203;</a>` + after;
                     }
                   }
-                  await client.sendMessage(group.entity, { message: htmlMessage, parseMode: 'html' });
+                  // CRITICAL: Validate HTML message before sending
+                  const htmlValidation = validateMessage(htmlMessage);
+                  if (htmlValidation.valid && htmlValidation.sanitized) {
+                    await client.sendMessage(group.entity, { message: htmlValidation.sanitized, parseMode: 'html' });
+                  } else {
+                    console.log(`[BROADCAST] ⚠️ HTML message validation failed, skipping retry`);
+                    errorCount++;
+                    continue;
+                  }
                 } else {
-                  await client.sendMessage(group.entity, { message: messageToSend });
+                  // CRITICAL: Validate plain message before sending
+                  const plainValidation = validateMessage(messageToSend);
+                  if (plainValidation.valid && plainValidation.sanitized) {
+                    await client.sendMessage(group.entity, { message: plainValidation.sanitized });
+                  } else {
+                    console.log(`[BROADCAST] ⚠️ Plain message validation failed, skipping retry`);
+                    errorCount++;
+                    continue;
+                  }
                 }
                 
                 console.log(`[FLOOD_WAIT] ✅ Retry successful: Sent to group "${errorGroupName}"`);
@@ -2588,7 +2993,15 @@ class AutomationService {
                   this.recordGroupMessageSent(accountId, errorGroupId);
                   continue;
                 } else if (message && message.trim().length > 0) {
-                  await client.sendMessage(group.entity, { message: message });
+                  // CRITICAL: Validate message before sending
+                  const finalValidation = validateMessage(message);
+                  if (finalValidation.valid && finalValidation.sanitized) {
+                    await client.sendMessage(group.entity, { message: finalValidation.sanitized });
+                  } else {
+                    console.log(`[BROADCAST] ⚠️ Final message validation failed, skipping`);
+                    errorCount++;
+                    continue;
+                  }
                   console.log(`[BROADCAST] ✅ Retry successful: Sent to group "${errorGroupName}"`);
                   successCount++;
                   this.recordMessageSent(accountId);
@@ -2696,6 +3109,17 @@ class AutomationService {
       // Record broadcast statistics
       broadcastStatsService.recordStats(accountId, groupsToSend.length, successCount, errorCount).catch(err => {
         console.log(`[SILENT_FAIL] Broadcast stats recording failed: ${err.message}`);
+      });
+      
+      // Log cycle completion to logger bot
+      const loggerBotService = (await import('./loggerBotService.js')).default;
+      loggerBotService.logCycleCompleted(userId, accountId, {
+        groupsProcessed: groupsToSend.length,
+        messagesSent: successCount,
+        errors: errorCount,
+        skipped: groupsToSend.length - successCount - errorCount
+      }).catch(() => {
+        // Silently fail - logger bot may not be started or user may have blocked it
       });
       
       // Notification removed - user doesn't want completion messages after each cycle

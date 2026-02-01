@@ -249,6 +249,17 @@ class AutoReplyIntervalService {
           // Skip if message is not text
           if (!lastMessage.text || lastMessage.text.trim().length === 0) continue;
 
+          // CRITICAL: Skip Saved Messages (user's own chat with themselves)
+          if (isDM) {
+            const chatIdNum = typeof chat.id === 'bigint' ? Number(chat.id) : Number(chat.id);
+            const meIdNum = typeof me.id === 'bigint' ? Number(me.id) : Number(me.id);
+            
+            if (chatIdNum === meIdNum || chat.firstName === 'Saved Messages' || chat.username === 'savedmessages') {
+              console.log(`[AUTO_REPLY_INTERVAL] Skipping Saved Messages for account ${accountId}`);
+              continue;
+            }
+          }
+
           // Get chat ID and message ID for tracking
           let chatId = null;
           if (chat.id !== null && chat.id !== undefined) {

@@ -69,7 +69,8 @@ export async function initializeSchema() {
         first_name TEXT,
         joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         is_verified INTEGER DEFAULT 0,
-        is_active INTEGER DEFAULT 1
+        is_active INTEGER DEFAULT 1,
+        logger_bot_started INTEGER DEFAULT 0
       )
     `);
 
@@ -124,6 +125,8 @@ export async function initializeSchema() {
 
     // Add message_entities column if it doesn't exist (for existing databases)
     await addColumnIfNotExists('messages', 'message_entities', 'TEXT');
+    // Add saved_message_id column to track messages sent to Saved Messages
+    await addColumnIfNotExists('messages', 'saved_message_id', 'INTEGER');
 
     // Create saved_templates table (for Saved Messages sync)
     await db.query(`
@@ -558,6 +561,9 @@ export async function initializeSchema() {
     await addColumnIfNotExists('accounts', 'use_message_pool', 'INTEGER DEFAULT 0');
     await addColumnIfNotExists('accounts', 'message_pool_mode', 'TEXT DEFAULT \'random\'');
     await addColumnIfNotExists('accounts', 'message_pool_last_index', 'INTEGER DEFAULT 0');
+    
+    // Add logger_bot_started column to users table
+    await addColumnIfNotExists('users', 'logger_bot_started', 'INTEGER DEFAULT 0');
     
     // Update existing accounts with NULL or 0 to default to 30 seconds
     try {

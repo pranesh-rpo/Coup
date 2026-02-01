@@ -361,14 +361,26 @@ class AutoReplyHandler {
         return;
       }
 
-      // Get auto-reply settings
-      const settings = await configService.getAccountSettings(accountId);
-      if (!settings) return;
-
       // Determine chat type
       const chatType = chat.className || '';
       const isDM = chatType === 'User';
       const isGroup = chatType === 'Chat' || chat.megagroup || chat.gigagroup;
+      
+      // CRITICAL: Skip Saved Messages (user's own chat with themselves)
+      if (isDM) {
+        // Check if this is Saved Messages by comparing chat ID with account's own ID
+        const chatIdNum = typeof chat.id === 'bigint' ? Number(chat.id) : Number(chat.id);
+        const meIdNum = typeof me.id === 'bigint' ? Number(me.id) : Number(me.id);
+        
+        if (chatIdNum === meIdNum || chat.firstName === 'Saved Messages' || chat.username === 'savedmessages') {
+          console.log(`[AUTO_REPLY] Skipping Saved Messages for account ${accountId}`);
+          return;
+        }
+      }
+
+      // Get auto-reply settings
+      const settings = await configService.getAccountSettings(accountId);
+      if (!settings) return;
 
       // Handle DM auto-reply
       if (isDM && settings.autoReplyDmEnabled && settings.autoReplyDmMessage) {
@@ -392,6 +404,27 @@ class AutoReplyHandler {
           // TODO: Re-enable chat marking for 30-minute cooldown (DISABLED FOR TESTING)
           // this.markChatAsReplied(accountId, chatId);
           console.log(`[AUTO_REPLY] ✅ DM auto-reply sent for account ${accountId}`);
+          
+          // Log to logger bot
+          try {
+            const loggerBotService = (await import('./loggerBotService.js')).default;
+            const db = (await import('../database/db.js')).default;
+            const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
+            
+            if (accountResult.rows && accountResult.rows.length > 0) {
+              const userId = accountResult.rows[0].user_id;
+              const chatName = chat.firstName || chat.username || chat.id || 'Unknown';
+              loggerBotService.logAutoReply(userId, accountId, message, settings.autoReplyDmMessage, {
+                name: chatName,
+                type: 'DM',
+                id: chatId
+              }).catch(() => {
+                // Silently fail - logger bot may not be started or user may have blocked it
+              });
+            }
+          } catch (logError) {
+            // Silently fail - don't block auto-reply if logging fails
+          }
         } catch (sendError) {
           console.error(`[AUTO_REPLY] Error sending DM auto-reply:`, sendError.message);
           logError(`[AUTO_REPLY] Error sending DM auto-reply:`, sendError);
@@ -452,6 +485,27 @@ class AutoReplyHandler {
                              isMentioned ? 'mention (tagged/pinged)' : 
                              'reply to account message';
           console.log(`[AUTO_REPLY] ✅ Group auto-reply sent for account ${accountId} (triggered by: ${triggerType}, replied to message ${message.id})`);
+          
+          // Log to logger bot
+          try {
+            const loggerBotService = (await import('./loggerBotService.js')).default;
+            const db = (await import('../database/db.js')).default;
+            const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
+            
+            if (accountResult.rows && accountResult.rows.length > 0) {
+              const userId = accountResult.rows[0].user_id;
+              const chatName = chat.title || chat.username || chat.id || 'Unknown';
+              loggerBotService.logAutoReply(userId, accountId, message, settings.autoReplyGroupsMessage, {
+                name: chatName,
+                type: 'Group',
+                id: chatId
+              }).catch(() => {
+                // Silently fail - logger bot may not be started or user may have blocked it
+              });
+            }
+          } catch (logError) {
+            // Silently fail - don't block auto-reply if logging fails
+          }
         } catch (sendError) {
           console.error(`[AUTO_REPLY] Error sending group auto-reply:`, sendError.message);
           logError(`[AUTO_REPLY] Error sending group auto-reply:`, sendError);

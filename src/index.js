@@ -676,6 +676,63 @@ const pendingAutoReplyDmMessageInputs = new Map(); // userId -> { accountId }
 const pendingAutoReplyGroupsMessageInputs = new Map(); // userId -> { accountId }
 const pendingAutoReplyIntervalInputs = new Map(); // userId -> { accountId }
 
+/**
+ * Clear all conflicting pending states for a user
+ * This prevents multiple input handlers from interfering with each other
+ */
+function clearConflictingPendingStates(userId, excludeState = null) {
+  const cleared = [];
+  
+  if (excludeState !== 'phone' && pendingPhoneNumbers.has(userId)) {
+    pendingPhoneNumbers.delete(userId);
+    cleared.push('phone');
+  }
+  if (excludeState !== 'startMessage' && pendingStartMessages.has(userId)) {
+    pendingStartMessages.delete(userId);
+    cleared.push('startMessage');
+  }
+  if (excludeState !== 'password' && pendingPasswords.has(userId)) {
+    pendingPasswords.delete(userId);
+    cleared.push('password');
+  }
+  if (excludeState !== 'quietHours' && pendingQuietHoursInputs.has(userId)) {
+    pendingQuietHoursInputs.delete(userId);
+    cleared.push('quietHours');
+  }
+  if (excludeState !== 'schedule' && pendingScheduleInputs.has(userId)) {
+    pendingScheduleInputs.delete(userId);
+    cleared.push('schedule');
+  }
+  if (excludeState !== 'customInterval' && pendingCustomIntervalInputs.has(userId)) {
+    pendingCustomIntervalInputs.delete(userId);
+    cleared.push('customInterval');
+  }
+  if (excludeState !== 'groupDelay' && pendingGroupDelayInputs.has(userId)) {
+    pendingGroupDelayInputs.delete(userId);
+    cleared.push('groupDelay');
+  }
+  if (excludeState !== 'blacklistSearch' && pendingBlacklistSearchInputs.has(userId)) {
+    pendingBlacklistSearchInputs.delete(userId);
+    cleared.push('blacklistSearch');
+  }
+  if (excludeState !== 'autoReplyDmMessage' && pendingAutoReplyDmMessageInputs.has(userId)) {
+    pendingAutoReplyDmMessageInputs.delete(userId);
+    cleared.push('autoReplyDmMessage');
+  }
+  if (excludeState !== 'autoReplyGroupsMessage' && pendingAutoReplyGroupsMessageInputs.has(userId)) {
+    pendingAutoReplyGroupsMessageInputs.delete(userId);
+    cleared.push('autoReplyGroupsMessage');
+  }
+  if (excludeState !== 'autoReplyInterval' && pendingAutoReplyIntervalInputs.has(userId)) {
+    pendingAutoReplyIntervalInputs.delete(userId);
+    cleared.push('autoReplyInterval');
+  }
+  
+  if (cleared.length > 0) {
+    console.log(`[CALLBACK] Cleared conflicting pending states for user ${userId}: ${cleared.join(', ')} (entering ${excludeState || 'new'} mode)`);
+  }
+}
+
 // Set the reference in commandHandler so it can set pending state when redirecting to link
 setPendingPhoneNumbersReference(pendingPhoneNumbers);
 
@@ -1555,6 +1612,18 @@ bot.on('message', async (msg) => {
     const { accountId } = pendingData;
     pendingScheduleInputs.delete(userId);
     await handleScheduleInput(bot, msg, accountId);
+  } else if (pendingBlacklistSearchInputs.has(userId)) {
+    // Check blacklist search BEFORE other input handlers to prevent conflicts
+    const pendingData = pendingBlacklistSearchInputs.get(userId);
+    if (!pendingData || !pendingData.accountId) {
+      pendingBlacklistSearchInputs.delete(userId);
+      return;
+    }
+    const accountId = pendingData.accountId;
+    const result = await handleBlacklistSearchInput(bot, msg, accountId);
+    if (result) {
+      pendingBlacklistSearchInputs.delete(userId);
+    }
   } else if (pendingGroupDelayInputs.has(userId)) {
     const pendingData = pendingGroupDelayInputs.get(userId);
     if (!pendingData || !pendingData.accountId) {
@@ -1582,17 +1651,6 @@ bot.on('message', async (msg) => {
       logger.logChange('CUSTOM_INTERVAL', userId, 'Custom interval input completed');
     } else {
       logger.logChange('CUSTOM_INTERVAL', userId, 'Custom interval input still pending (retry needed)');
-    }
-  } else if (pendingBlacklistSearchInputs.has(userId)) {
-    const pendingData = pendingBlacklistSearchInputs.get(userId);
-    if (!pendingData || !pendingData.accountId) {
-      pendingBlacklistSearchInputs.delete(userId);
-      return;
-    }
-    const accountId = pendingData.accountId;
-    const result = await handleBlacklistSearchInput(bot, msg, accountId);
-    if (result) {
-      pendingBlacklistSearchInputs.delete(userId);
     }
   } else if (pendingAutoReplyDmMessageInputs.has(userId)) {
     const pendingData = pendingAutoReplyDmMessageInputs.get(userId);
@@ -1769,6 +1827,7 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_logger_bot') {
       await handleLoggerBotButton(bot, callbackQuery);
     } else if (data === 'btn_link') {
+      clearConflictingPendingStates(userId, 'phone');
       const result = await handleLinkButton(bot, callbackQuery);
       if (result) {
         addPendingStateWithTimeout(pendingPhoneNumbers, userId);
@@ -1777,6 +1836,7 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_login_share_phone') {
       await handleLoginSharePhone(bot, callbackQuery);
     } else if (data === 'btn_login_type_phone') {
+      clearConflictingPendingStates(userId, 'phone');
       const result = await handleLoginTypePhone(bot, callbackQuery);
       if (result) {
         addPendingStateWithTimeout(pendingPhoneNumbers, userId);
@@ -1828,6 +1888,7 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_config_interval_menu') {
       await handleIntervalMenu(bot, callbackQuery);
     } else if (data === 'btn_config_custom_interval') {
+      clearConflictingPendingStates(userId, 'customInterval');
       const result = await handleConfigCustomInterval(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingCustomIntervalInputs, userId, result);
@@ -1842,6 +1903,7 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_config_quiet_hours') {
       await handleConfigQuietHours(bot, callbackQuery);
     } else if (data === 'config_quiet_set') {
+      clearConflictingPendingStates(userId, 'quietHours');
       const result = await handleQuietHoursSet(bot, callbackQuery);
       if (result) {
         addPendingStateWithTimeout(pendingQuietHoursInputs, userId, result);
@@ -1858,6 +1920,7 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_config_schedule') {
       await handleConfigSchedule(bot, callbackQuery);
     } else if (data === 'config_schedule_normal') {
+      clearConflictingPendingStates(userId, 'schedule');
       const result = await handleScheduleSet(bot, callbackQuery);
       if (result) {
         addPendingStateWithTimeout(pendingScheduleInputs, userId, result);
@@ -1934,6 +1997,7 @@ bot.on('callback_query', async (callbackQuery) => {
       // Page info button - just answer callback, no action needed
       await safeAnswerCallback(bot, callbackQuery.id);
     } else if (data === 'btn_config_group_delay') {
+      clearConflictingPendingStates(userId, 'groupDelay');
       const result = await handleConfigGroupDelay(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingGroupDelayInputs, userId, result);
@@ -2014,6 +2078,7 @@ bot.on('callback_query', async (callbackQuery) => {
         // No pending state needed for blacklist menu
       }
     } else if (data === 'btn_blacklist_search') {
+      clearConflictingPendingStates(userId, 'blacklistSearch');
       const result = await handleBlacklistSearch(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingBlacklistSearchInputs, userId, result);
@@ -2035,6 +2100,7 @@ bot.on('callback_query', async (callbackQuery) => {
       const enabled = data.replace('auto_reply_dm_toggle_', '') === 'true';
       await handleAutoReplyDmToggle(bot, callbackQuery, enabled);
     } else if (data === 'auto_reply_dm_set_message') {
+      clearConflictingPendingStates(userId, 'autoReplyDmMessage');
       const result = await handleAutoReplyDmSetMessage(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingAutoReplyDmMessageInputs, userId, result);
@@ -2048,6 +2114,7 @@ bot.on('callback_query', async (callbackQuery) => {
       const enabled = data.replace('auto_reply_groups_toggle_', '') === 'true';
       await handleAutoReplyGroupsToggle(bot, callbackQuery, enabled);
     } else if (data === 'auto_reply_groups_set_message') {
+      clearConflictingPendingStates(userId, 'autoReplyGroupsMessage');
       const result = await handleAutoReplyGroupsSetMessage(bot, callbackQuery);
       if (result && result.accountId) {
         addPendingStateWithTimeout(pendingAutoReplyGroupsMessageInputs, userId, result);

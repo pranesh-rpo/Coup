@@ -1526,6 +1526,71 @@ class AccountLinker {
     return this.pendingPasswordAuth.has(userId);
   }
 
+  /**
+   * Cancel any pending authentication for a user
+   * Cleans up OTP verification, password auth, and web login states
+   * @param {number} userId - User ID
+   */
+  async cancelAuth(userId) {
+    let cleaned = false;
+    
+    // Clean up pending OTP verification
+    const pendingVerification = this.pendingVerifications.get(userId);
+    if (pendingVerification) {
+      if (pendingVerification.client) {
+        try {
+          await pendingVerification.client.disconnect();
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+      }
+      this.pendingVerifications.delete(userId);
+      await this.deletePendingVerification(userId);
+      cleaned = true;
+      console.log(`[AUTH_CANCEL] Cleaned up pending OTP verification for user ${userId}`);
+    }
+    
+    // Clean up pending password auth
+    const pendingPassword = this.pendingPasswordAuth.get(userId);
+    if (pendingPassword) {
+      if (pendingPassword.client) {
+        try {
+          await pendingPassword.client.disconnect();
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+      }
+      this.pendingPasswordAuth.delete(userId);
+      cleaned = true;
+      console.log(`[AUTH_CANCEL] Cleaned up pending password auth for user ${userId}`);
+    }
+    
+    // Clean up pending web login
+    const pendingWebLogin = this.pendingWebLogins.get(userId);
+    if (pendingWebLogin) {
+      pendingWebLogin.cancelled = true;
+      if (pendingWebLogin.client) {
+        try {
+          await pendingWebLogin.client.disconnect();
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+      }
+      this.pendingWebLogins.delete(userId);
+      cleaned = true;
+      console.log(`[AUTH_CANCEL] Cleaned up pending web login for user ${userId}`);
+    }
+    
+    // Reset password attempts
+    this.passwordAttempts.delete(userId);
+    
+    if (cleaned) {
+      console.log(`[AUTH_CANCEL] Auth cancelled for user ${userId}`);
+    }
+    
+    return { success: true, cleaned };
+  }
+
   async initiateWebLogin(userId, chatId = null) {
     try {
       // Enhanced validation

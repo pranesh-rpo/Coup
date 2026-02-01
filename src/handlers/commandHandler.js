@@ -972,6 +972,39 @@ export async function handleOTPCallback(bot, callbackQuery) {
       show_alert: true,
     });
     return false;
+  } else if (result.action === 'cancel') {
+    // User cancelled linking process
+    logger.logChange('OTP_CANCEL', userId, 'User cancelled account linking');
+    
+    // Cancel any pending auth process in accountLinker
+    try {
+      await accountLinker.cancelAuth(userId);
+    } catch (e) {
+      // Ignore errors - just cleanup what we can
+    }
+    
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'Account linking cancelled',
+      show_alert: false,
+    });
+    
+    // Show account menu with link option
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      `❌ <b>Linking Cancelled</b>\n\nAccount linking has been cancelled. You can try again anytime.`,
+      { 
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔗 Link Account', callback_data: 'btn_link' }],
+            [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+          ]
+        }
+      }
+    );
+    return false;
   } else {
     // 'update' or 'complete' action - update the display
     const currentCode = otpHandler.getCurrentCode(userId);

@@ -62,6 +62,10 @@ export function createOTPKeypad(currentCode = '') {
             callback_data: isComplete ? 'otp_submit' : 'otp_info' 
           }
         ],
+        // Cancel row
+        [
+          { text: '❌ Cancel Linking', callback_data: 'otp_cancel' }
+        ],
       ],
     },
   };
@@ -94,6 +98,9 @@ export function createSimpleOTPKeypad() {
           { text: '⌫', callback_data: 'otp_backspace' },
           { text: '0', callback_data: 'otp_0' },
           { text: '✓', callback_data: 'otp_submit' },
+        ],
+        [
+          { text: '❌ Cancel', callback_data: 'otp_cancel' }
         ],
       ],
     },
@@ -140,6 +147,10 @@ export class OTPHandler {
     } else if (digit === 'display' || digit === 'info') {
       // Ignore clicks on display area
       return { action: 'ignore', code: currentCode };
+    } else if (digit === 'cancel') {
+      // Cancel linking process
+      this.otpCodes.delete(userId);
+      return { action: 'cancel', code: '' };
     } else {
       // Add digit if not at max length
       if (currentCode.length < this.OTP_LENGTH) {

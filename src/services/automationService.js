@@ -825,6 +825,15 @@ class AutomationService {
     // Set broadcast data BEFORE sending initial message (so sendSingleMessageToAllGroups can find it)
     this.activeBroadcasts.set(broadcastKey, broadcastData);
 
+    // CRITICAL: Update database flag to prevent account linking during broadcast
+    try {
+      await db.query('UPDATE accounts SET is_broadcasting = 1 WHERE account_id = ?', [accountId]);
+      console.log(`[BROADCAST] Updated is_broadcasting flag to true for account ${accountId}`);
+    } catch (dbError) {
+      logError(`[BROADCAST ERROR] Failed to update is_broadcasting flag:`, dbError);
+      // Non-critical error, continue with broadcast
+    }
+
       // Send initial 1 message to all groups AFTER broadcast data is set
       // Initial message is sent regardless of schedule (user explicitly started broadcast)
       // Schedule next cycle IMMEDIATELY (before sending) to maintain consistent timing
@@ -1214,6 +1223,15 @@ class AutomationService {
       broadcast.isRunning = false;
       this.activeBroadcasts.delete(broadcastKey);
 
+      // CRITICAL: Update database flag to allow account linking again
+      try {
+        await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+        console.log(`[BROADCAST] Updated is_broadcasting flag to false for account ${accountId}`);
+      } catch (dbError) {
+        logError(`[BROADCAST ERROR] Failed to update is_broadcasting flag:`, dbError);
+        // Non-critical error, continue
+      }
+
       console.log(`[BROADCAST] Broadcast stopped for account ${accountId} (user ${userId})`);
       return { success: true };
     } catch (error) {
@@ -1233,6 +1251,14 @@ class AutomationService {
             }
             broadcast.isRunning = false;
             this.activeBroadcasts.delete(broadcastKey);
+          }
+        }
+        // Try to update database flag even on error
+        if (accountId) {
+          try {
+            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+          } catch (dbError) {
+            // Ignore - already in error state
           }
         }
       } catch (cleanupError) {

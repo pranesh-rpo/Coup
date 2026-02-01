@@ -411,37 +411,32 @@ export async function handleStart(bot, msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const username = msg.from.username || 'Unknown';
-  const firstName = msg.from.first_name || '';
 
   logger.logInfo('START', `User ${userId} (@${username}) started the bot`, userId);
 
-  // Add/update user in database
-  try {
-    await userService.addUser(userId, username, firstName);
-    logger.logChange('USER_ADDED', userId, `Username: ${username}, FirstName: ${firstName}`);
-  } catch (error) {
-    logger.logError('START', userId, error, 'Failed to add user to database');
-    // Notify admins of start errors
-    adminNotifier.notifyUserError('USER_START_ERROR', userId, error, {
-      username,
-      firstName,
-      details: 'Failed to add user to database',
-    }).catch(() => {}); // Silently fail to avoid blocking
-  }
+  // NOTE: User is already added to DB by ensureUserStored() in index.js - no duplicate call needed
 
   // Check channel verification requirement (mandatory if updates channel is configured)
   const updatesChannels = config.getUpdatesChannels();
   if (updatesChannels.length > 0) {
-    const verification = await checkUserVerification(bot, userId);
+    // FAST: Only check DB verification status for /start - skip expensive real-time API calls
+    // Real-time verification is done by background channelVerificationService periodically
+    const isVerifiedInDb = await userService.isUserVerified(userId);
     
-    if (!verification.verified) {
-      // Show verification requirement message with all channels
-      await showVerificationRequired(bot, chatId, verification.channelUsernames || updatesChannels.map(ch => ch.replace('@', '')));
+    if (!isVerifiedInDb) {
+      // User not verified - show verification requirement
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
-  const statusText = await generateStatusText(userId);
+  // Run status and menu generation in PARALLEL for faster response
+  const [statusText, mainMenu] = await Promise.all([
+    generateStatusText(userId),
+    createMainMenu(userId)
+  ]);
+
   const welcomeMessage = `
 ✨ <b>Welcome to Coup Bot</b> ✨
 
@@ -451,7 +446,7 @@ Select an option from the menu below:
   `;
 
   try {
-    await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
+    await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML', ...mainMenu });
     logger.logInfo('START', `Welcome message sent to user ${userId}`, userId);
   } catch (error) {
     logger.logError('START', userId, error, 'Failed to send welcome message');
@@ -462,28 +457,27 @@ Select an option from the menu below:
 export async function handleMainMenu(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Back to Menu', chatId);
-
-  // Check verification requirement
+  // Check verification (fast - uses cache)
   const updatesChannels = config.getUpdatesChannels();
   if (updatesChannels.length > 0) {
     const verification = await checkUserVerification(bot, userId);
-    
     if (!verification.verified) {
       await showVerificationRequired(bot, chatId, verification.channelUsernames || updatesChannels.map(ch => ch.replace('@', '')));
       return;
     }
   }
 
-  const statusText = await generateStatusText(userId);
-  const welcomeMessage = `
-👋 <b>Coup Bot</b>${statusText}
-  `;
+  // Run status and menu generation in PARALLEL
+  const [statusText, mainMenu] = await Promise.all([
+    generateStatusText(userId),
+    createMainMenu(userId)
+  ]);
 
-  await safeEditMessage(bot, chatId, callbackQuery.message.message_id, welcomeMessage, { parse_mode: 'HTML', ...await createMainMenu(userId) });
-  logger.logInfo('BUTTON_CLICK', `Main menu displayed to user ${userId}`, userId);
+  const welcomeMessage = `👋 <b>Coup Bot</b>${statusText}`;
+
+  await safeEditMessage(bot, chatId, callbackQuery.message.message_id, welcomeMessage, { parse_mode: 'HTML', ...mainMenu });
+  await safeAnswerCallback(bot, callbackQuery.id);
 }
 
 export async function handleLink(bot, msg) {
@@ -1302,15 +1296,16 @@ export async function handleMessagesMenu(bot, callbackQuery) {
   logger.logButtonClick(userId, username, 'Messages Menu', chatId);
 
   // Check verification requirement
-  if (config.updatesChannel) {
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
+        text: 'Please verify by joining our updates channel(s) first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
@@ -1332,90 +1327,77 @@ export async function handleMessagesMenu(bot, callbackQuery) {
     return;
   }
 
-  const currentMessage = await messageService.getActiveMessage(accountId);
-  const pool = await messageService.getMessagePool(accountId);
-  const settings = await configService.getAccountSettings(accountId);
-  const usePool = settings?.useMessagePool || false;
-  const forwardMode = settings?.forwardMode || false;
-
-  // Handle both object format {text, entities} and string format for backward compatibility
-  const messageText = currentMessage ? (typeof currentMessage === 'string' ? currentMessage : currentMessage.text) : null;
-
-  // Get account username for Saved Messages button
-  let accountUsername = null;
-  let savedMessagesUrl = 'tg://search?query=Saved Messages';
   try {
-    const client = await accountLinker.ensureConnected(accountId);
-    if (client) {
-      const me = await client.getMe();
-      if (me && me.username) {
-        accountUsername = me.username;
-        savedMessagesUrl = `tg://resolve?domain=${accountUsername}`;
-      }
-    }
+    // Run all database queries in PARALLEL for speed
+    const [currentMessage, pool, settings] = await Promise.all([
+      messageService.getActiveMessage(accountId).catch(() => null),
+      messageService.getMessagePool(accountId, true).catch(() => []),
+      configService.getAccountSettings(accountId).catch(() => null)
+    ]);
+
+    const usePool = settings?.useMessagePool || false;
+    const forwardMode = settings?.forwardMode || false;
+
+    // Handle both object format {text, entities} and string format for backward compatibility
+    const messageText = currentMessage ? (typeof currentMessage === 'string' ? currentMessage : currentMessage.text) : null;
+
+    // Use simple fallback URL - don't try to connect to account (slow when session is invalid)
+    const savedMessagesUrl = 'tg://search?query=Saved Messages';
+
+    let menuMessage = `💬 <b>Messages</b>\n\n`;
+    menuMessage += `Manage your broadcast messages and message pool.\n\n`;
+    menuMessage += `✍️ <b>Current Message:</b> ${messageText ? `"${escapeHtml(messageText.substring(0, 50))}${messageText.length > 50 ? '...' : ''}"` : 'Not set'}\n`;
+    menuMessage += `🎲 <b>Message Pool:</b> ${(pool || []).length} messages ${usePool ? '(Enabled)' : '(Disabled)'}\n`;
+    menuMessage += `📤 <b>Forward Mode:</b> ${forwardMode ? '🟢 Enabled' : '⚪ Disabled'}\n\n`;
+    menuMessage += `Select an option below:`;
+
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      menuMessage,
+      { parse_mode: 'HTML', ...createMessagesMenu(forwardMode, savedMessagesUrl) }
+    );
+    
+    await safeAnswerCallback(bot, callbackQuery.id);
   } catch (error) {
-    // If we can't get username, use search as fallback
-    console.log(`[MESSAGES_MENU] Could not get account username: ${error.message}`);
+    console.error(`[MESSAGES_MENU] Error:`, error.message);
+    await safeAnswerCallback(bot, callbackQuery.id, {
+      text: 'An error occurred. Please try again.',
+      show_alert: true,
+    });
   }
-
-  let menuMessage = `💬 <b>Messages</b>\n\n`;
-  menuMessage += `Manage your broadcast messages and message pool.\n\n`;
-  menuMessage += `✍️ <b>Current Message:</b> ${messageText ? `"${escapeHtml(messageText.substring(0, 50))}${messageText.length > 50 ? '...' : ''}"` : 'Not set'}\n`;
-  menuMessage += `🎲 <b>Message Pool:</b> ${pool.length} messages ${usePool ? '(Enabled)' : '(Disabled)'}\n`;
-  menuMessage += `📤 <b>Forward Mode:</b> ${forwardMode ? '🟢 Enabled' : '⚪ Disabled'}\n\n`;
-  menuMessage += `Select an option below:`;
-
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    menuMessage,
-    { parse_mode: 'HTML', ...createMessagesMenu(forwardMode, savedMessagesUrl) }
-  );
-  
-  await safeAnswerCallback(bot, callbackQuery.id);
 }
 
 export async function handleSetStartMessageButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
 
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
-      await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
-        show_alert: true,
-      });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+      await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please verify first!', show_alert: true });
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
   if (!accountLinker.isLinked(userId)) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'Please link an account first!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please link an account first!', show_alert: true });
     return;
   }
 
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'No active account found!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'No active account found!', show_alert: true });
     return;
   }
 
-  // Automatically detect and set the last message from Saved Messages
-  await safeAnswerCallback(bot, callbackQuery.id, {
-    text: 'Checking Saved Messages...',
-    show_alert: false,
-  });
+  // Answer callback immediately - the rest is slow (needs Telegram connection)
+  await safeAnswerCallback(bot, callbackQuery.id, { text: 'Checking Saved Messages...', show_alert: false });
 
   try {
     const accountLinker = (await import('../services/accountLinker.js')).default;
@@ -1994,80 +1976,50 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
 
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
-      await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel first!',
-        show_alert: true,
-      });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+      await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please verify first!', show_alert: true });
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
   if (!accountLinker.isLinked(userId)) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'Please link your account first!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please link your account first!', show_alert: true });
     const linkResult = await handleLinkButton(bot, callbackQuery);
-    // Set pending state for phone number input
     if (linkResult) {
       addPendingPhoneNumber(userId);
-      logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input (redirected from start broadcast)');
     }
     return;
   }
 
-  // Get current active account
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'No active account found!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'No active account found!', show_alert: true });
     return;
   }
 
-  // Check if logger bot is started (only on first time - check if user has ever started broadcast before)
+  // Check logger bot only if NOT broadcasting (and check in PARALLEL)
   if (!automationService.isBroadcasting(userId, accountId)) {
-    const hasLoggerBotStarted = await loggerBotService.hasLoggerBotStarted(userId);
-    if (!hasLoggerBotStarted) {
-      // Check if this is the first time starting broadcast (no previous broadcast history)
-      const hasPreviousBroadcast = await db.query(
-        'SELECT 1 FROM accounts WHERE user_id = ? AND broadcast_start_time IS NOT NULL LIMIT 1',
-        [userId]
+    const [hasLoggerBotStarted, hasPreviousBroadcast] = await Promise.all([
+      loggerBotService.hasLoggerBotStarted(userId).catch(() => true), // Default to true to skip check on error
+      db.query('SELECT 1 FROM accounts WHERE user_id = ? AND broadcast_start_time IS NOT NULL LIMIT 1', [userId]).catch(() => ({ rows: [1] }))
+    ]);
+
+    if (!hasLoggerBotStarted && (!hasPreviousBroadcast.rows || hasPreviousBroadcast.rows.length === 0)) {
+      await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please start the logger bot first!', show_alert: true });
+      await safeEditMessage(bot, chatId, callbackQuery.message.message_id,
+        `❌ <b>Logger Bot Required</b>\n\nPlease start the logger bot before starting broadcast.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '📝 Start Logger Bot', callback_data: 'btn_logger_bot' }],
+          [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
+        ]}}
       );
-      
-      // Only show warning on first time
-      if (!hasPreviousBroadcast.rows || hasPreviousBroadcast.rows.length === 0) {
-        await safeAnswerCallback(bot, callbackQuery.id, {
-          text: 'Please start the logger bot first!',
-          show_alert: true,
-        });
-        await safeEditMessage(
-          bot,
-          chatId,
-          callbackQuery.message.message_id,
-          `❌ <b>Logger Bot Required</b>\n\n` +
-          `Please start the logger bot before starting broadcast.\n\n` +
-          `The logger bot sends you important logs about your account activity.\n\n` +
-          `Click the button below to start the logger bot:`,
-          {
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '📝 Start Logger Bot', callback_data: 'btn_logger_bot' }],
-                [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]
-              ]
-            }
-          }
-        );
-        return;
-      }
+      return;
     }
   }
 
@@ -2488,52 +2440,43 @@ export async function handleStatusButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
 
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
         text: 'Please verify by joining our updates channel first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
-  const isLinked = accountLinker.isLinked(userId);
-  const accounts = await accountLinker.getAccounts(userId);
-  const activeAccountId = accountLinker.getActiveAccountId(userId);
+  // Get data in PARALLEL
+  const [accounts, mainMenu] = await Promise.all([
+    accountLinker.getAccounts(userId),
+    createMainMenu(userId)
+  ]);
   
-  // Check if broadcast is running for the current active account
+  const isLinked = accountLinker.isLinked(userId);
+  const activeAccountId = accountLinker.getActiveAccountId(userId);
   const isBroadcasting = activeAccountId ? automationService.isBroadcasting(userId, activeAccountId) : false;
-  const broadcastingAccountId = automationService.getBroadcastingAccountId(userId);
 
-  // Minimal account status - just account info
   let statusMessage = '<b>Account</b>\n\n';
   
   if (isLinked && accounts.length > 0) {
     const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
     const displayName = activeAccount ? (activeAccount.firstName || activeAccount.phone) : 'None';
     statusMessage += `Active: ${escapeHtml(displayName)}\n`;
-    
-    if (isBroadcasting) {
-      statusMessage += `Broadcast: Active\n`;
-    } else {
-      statusMessage += `Broadcast: Inactive\n`;
-    }
+    statusMessage += `Broadcast: ${isBroadcasting ? 'Active' : 'Inactive'}\n`;
   } else {
     statusMessage += `Not linked\n`;
   }
   
-  await safeEditMessage(
-    bot, 
-    chatId, 
-    callbackQuery.message.message_id, 
-    statusMessage, 
-    { parse_mode: 'HTML', ...await createMainMenu(userId) }
-  );
+  await safeEditMessage(bot, chatId, callbackQuery.message.message_id, statusMessage, { parse_mode: 'HTML', ...mainMenu });
   await safeAnswerCallback(bot, callbackQuery.id);
 }
 
@@ -2642,24 +2585,23 @@ export async function handleLoggerBotButton(bot, callbackQuery) {
 export async function handleAccountButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Account', chatId);
-
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast - uses cache)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
-    await safeAnswerCallback(bot, callbackQuery.id, {
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
+      await safeAnswerCallback(bot, callbackQuery.id, {
         text: 'Please verify by joining our updates channel first!',
-      show_alert: true,
-    });
-      await showVerificationRequired(bot, chatId, channelUsername);
-    return;
-  }
+        show_alert: true,
+      });
+      await showVerificationRequired(bot, chatId, channelUsernames);
+      return;
+    }
   }
 
+  // Get accounts (fast - from memory)
   const accounts = await accountLinker.getAccounts(userId);
   const activeAccountId = accountLinker.getActiveAccountId(userId);
 
@@ -2727,146 +2669,48 @@ export async function handleSwitchAccountButton(bot, callbackQuery) {
 export async function handleMessagePoolButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Message Pool', chatId);
-
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
         text: 'Please verify by joining our updates channel first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
   if (!accountLinker.isLinked(userId)) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'Please link an account first!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please link an account first!', show_alert: true });
     return;
   }
 
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'No active account found!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'No active account found!', show_alert: true });
     return;
   }
 
-  // Automatically sync messages from Saved Messages
-  await safeAnswerCallback(bot, callbackQuery.id, {
-    text: 'Syncing messages from Saved Messages...',
-    show_alert: false,
-  });
+  // Get pool and settings in PARALLEL - NO SYNC on click (too slow)
+  const [pool, settings] = await Promise.all([
+    messageService.getMessagePool(accountId, true).catch(() => []),
+    configService.getAccountSettings(accountId).catch(() => null)
+  ]);
 
-  try {
-    const client = await accountLinker.ensureConnected(accountId);
-    if (client) {
-      const me = await client.getMe();
-      let savedMessagesEntity;
-      try {
-        savedMessagesEntity = await client.getEntity(me);
-      } catch (error) {
-        const dialogs = await client.getDialogs();
-        const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
-        if (savedDialog) {
-          savedMessagesEntity = savedDialog.entity;
-        }
-      }
-
-      if (savedMessagesEntity) {
-        // Get the last 7 messages from Saved Messages
-        const messages = await client.getMessages(savedMessagesEntity, { limit: 7 });
-        if (messages && messages.length > 0) {
-          let addedCount = 0;
-          let duplicateCount = 0;
-          let skippedCount = 0;
-
-          for (const savedMessage of messages) {
-            const messageText = savedMessage.text || '';
-            
-            if (!messageText || messageText.trim().length === 0 || messageText.length > 4096) {
-              skippedCount++;
-              continue;
-            }
-            
-            let messageEntities = null;
-            if (savedMessage.entities && savedMessage.entities.length > 0) {
-              messageEntities = savedMessage.entities.map(e => {
-                let entityType = 'unknown';
-                if (e.className === 'MessageEntityCustomEmoji' || e.constructor?.name === 'MessageEntityCustomEmoji') {
-                  entityType = 'custom_emoji';
-                } else if (e.className === 'MessageEntityBold' || e.constructor?.name === 'MessageEntityBold') {
-                  entityType = 'bold';
-                } else if (e.className === 'MessageEntityItalic' || e.constructor?.name === 'MessageEntityItalic') {
-                  entityType = 'italic';
-                } else if (e.className === 'MessageEntityCode' || e.constructor?.name === 'MessageEntityCode') {
-                  entityType = 'code';
-                } else if (e.className === 'MessageEntityPre' || e.constructor?.name === 'MessageEntityPre') {
-                  entityType = 'pre';
-                }
-
-                const entity = {
-                  type: entityType,
-                  offset: e.offset,
-                  length: e.length,
-                };
-
-                if (entityType === 'custom_emoji' && e.documentId !== undefined && e.documentId !== null) {
-                  entity.custom_emoji_id = String(e.documentId);
-                }
-
-                if (entityType === 'pre' && e.language !== undefined) {
-                  entity.language = e.language;
-                }
-
-                return entity;
-              });
-            }
-
-            const result = await messageService.addToMessagePool(accountId, messageText, messageEntities);
-            if (result.success) {
-              addedCount++;
-            } else if (result.isDuplicate) {
-              duplicateCount++;
-            } else {
-              skippedCount++;
-            }
-          }
-
-          if (addedCount > 0) {
-            logger.logChange('MESSAGE_POOL', userId, `Auto-synced ${addedCount} message(s) from Saved Messages`);
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.log(`[POOL_SYNC] Error syncing messages: ${error.message}`);
-    // Continue anyway - show pool even if sync fails
-  }
-
-  const pool = await messageService.getMessagePool(accountId, true); // Get all messages including inactive
-  const settings = await configService.getAccountSettings(accountId);
   const usePool = settings?.useMessagePool || false;
   const poolMode = settings?.messagePoolMode || 'random';
-  const activePool = pool.filter(msg => msg.is_active);
+  const activePool = (pool || []).filter(msg => msg.is_active);
 
   const poolMessage = `🎲 <b>Message Pool</b>\n\n` +
-    `📊 <b>Total Messages:</b> ${pool.length} (${activePool.length} active, ${pool.length - activePool.length} disabled)\n` +
-    `⚙️ <b>Mode:</b> ${usePool ? `✅ ${poolMode === 'random' ? '🎲 Random' : poolMode === 'rotate' ? '🔄 Rotate' : poolMode === 'sequential' ? '➡️ Sequential' : '🎲 Random'}` : '❌ Disabled'}\n\n` +
-    `${pool.length === 0 ? '⚠️ No messages in pool. Send messages to Saved Messages and they will be auto-synced.\n\n' : ''}` +
-    `The message pool automatically syncs the <b>last 7 messages</b> from your Saved Messages. Each broadcast will ${poolMode === 'random' ? 'randomly select' : poolMode === 'rotate' ? 'rotate through in order' : poolMode === 'sequential' ? 'send sequentially (one per group)' : 'randomly select'} one from the active pool.\n\n` +
-    `${usePool ? '✅ Pool is <b>enabled</b> and will be used for broadcasts.\n\n' : '⚠️ Pool is <b>disabled</b>. Enable it to use pool messages.\n\n'}` +
-    `Use buttons below to manage your message pool.`;
+    `📊 <b>Total:</b> ${(pool || []).length} (${activePool.length} active)\n` +
+    `⚙️ <b>Mode:</b> ${usePool ? `✅ ${poolMode === 'random' ? '🎲 Random' : poolMode === 'rotate' ? '🔄 Rotate' : '➡️ Sequential'}` : '❌ Disabled'}\n\n` +
+    `${(pool || []).length === 0 ? '⚠️ No messages. Click 🔄 Refresh to sync from Saved Messages.\n\n' : ''}` +
+    `Click <b>🔄 Refresh</b> to sync messages from Saved Messages.`;
 
   await safeEditMessage(
     bot,
@@ -2875,6 +2719,8 @@ export async function handleMessagePoolButton(bot, callbackQuery) {
     poolMessage,
     { parse_mode: 'HTML', ...createMessagePoolKeyboard(activePool.length, poolMode, usePool) }
   );
+  
+  await safeAnswerCallback(bot, callbackQuery.id);
 }
 
 export async function handlePoolAddMessage(bot, callbackQuery) {
@@ -4018,20 +3864,18 @@ Use the buttons below to navigate:
 export async function handleGroupsButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Groups', chatId);
-
-  // Check verification requirement
-  if (config.updatesChannel) {
+  // Check verification (fast)
+  const updatesChannels = config.getUpdatesChannels();
+  if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
-      const channelUsername = config.updatesChannel.replace('@', '');
+      const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
       await safeAnswerCallback(bot, callbackQuery.id, {
         text: 'Please verify by joining our updates channel first!',
         show_alert: true,
       });
-      await showVerificationRequired(bot, chatId, channelUsername);
+      await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
@@ -4045,17 +3889,20 @@ export async function handleGroupsButton(bot, callbackQuery) {
   }
 
   const accountId = accountLinker.getActiveAccountId(userId);
-  const groupsCount = await groupService.getActiveGroupsCount(accountId);
+
+  // Run ALL queries in PARALLEL
+  const [groupsCount, settings, blacklistResult] = await Promise.all([
+    groupService.getActiveGroupsCount(accountId),
+    configService.getAccountSettings(accountId).catch(() => null),
+    groupBlacklistService.getBlacklistedGroups(accountId).catch(() => ({ groups: [] }))
+  ]);
   
-  // Get group-related settings
-  const settings = await configService.getAccountSettings(accountId);
   const groupDelayMin = settings?.groupDelayMin;
   const groupDelayMax = settings?.groupDelayMax;
   const groupDelayText = groupDelayMin !== null && groupDelayMax !== null
     ? `${groupDelayMin}-${groupDelayMax}s`
     : 'Default (5-10s)';
   
-  const blacklistResult = await groupBlacklistService.getBlacklistedGroups(accountId);
   const blacklistCount = blacklistResult.groups?.length || 0;
 
   const groupsMessage = `👥 <b>Group Management</b>\n\n` +

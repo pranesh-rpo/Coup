@@ -146,18 +146,17 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
   const days = period === 'today' ? 1 : period === 'week' ? 7 : period === 'month' ? 30 : null;
 
   if (period === 'today') {
-    const todayData = await broadcastStatsService.getTodayStats(accountId);
-    currentStats = todayData.stats;
     periodLabel = 'Today';
-    
-    // Compare with yesterday
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayData = await broadcastStatsService.getStats(
-      accountId,
-      yesterday.toISOString().split('T')[0],
-      yesterday.toISOString().split('T')[0]
-    );
+    
+    // Run BOTH queries in PARALLEL
+    const [todayData, yesterdayData] = await Promise.all([
+      broadcastStatsService.getTodayStats(accountId).catch(() => ({ stats: null })),
+      broadcastStatsService.getStats(accountId, yesterday.toISOString().split('T')[0], yesterday.toISOString().split('T')[0]).catch(() => ({ stats: [] }))
+    ]);
+    
+    currentStats = todayData.stats;
     const yesterdayStats = yesterdayData.stats?.[0];
     
     if (currentStats) {
@@ -225,13 +224,15 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
       statsMessage += `No statistics available yet.\n\n`;
     }
   } else {
-    // Week or Month
-    const periodData = await broadcastStatsService.getPeriodStats(accountId, days);
-    currentStats = periodData.stats;
+    // Week or Month - run BOTH queries in PARALLEL
     periodLabel = period === 'week' ? 'Last 7 Days' : 'Last 30 Days';
     
-    // Get comparison
-    const compData = await broadcastStatsService.getPeriodComparison(accountId, days);
+    const [periodData, compData] = await Promise.all([
+      broadcastStatsService.getPeriodStats(accountId, days).catch(() => ({ stats: null })),
+      broadcastStatsService.getPeriodComparison(accountId, days).catch(() => null)
+    ]);
+    
+    currentStats = periodData.stats;
     comparison = compData;
     
     if (currentStats) {

@@ -248,10 +248,26 @@ class AccountLinker {
           lastError = error;
           retries--;
           
-          // Check if session is revoked
-          if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
-            await this.handleSessionRevoked(accountId);
-            throw error; // Don't retry on revoked session
+          const errorCode = error.code || error.errorCode;
+          const errorMessage = error.message || error.toString() || '';
+          
+          // Check for session errors (AUTH_KEY_DUPLICATED, SESSION_REVOKED, etc.)
+          const isSessionError = 
+            errorCode === 406 || // AUTH_KEY_DUPLICATED
+            errorCode === 401 || // SESSION_REVOKED
+            errorMessage.includes('AUTH_KEY_DUPLICATED') ||
+            errorMessage.includes('SESSION_REVOKED') ||
+            errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+            error.errorMessage === 'AUTH_KEY_DUPLICATED' ||
+            error.errorMessage === 'SESSION_REVOKED' ||
+            error.errorMessage === 'AUTH_KEY_UNREGISTERED';
+          
+          if (isSessionError) {
+            console.log(`[CONNECTION] Session error (${errorCode}) for account ${accountId} - handling revocation`);
+            await this.handleSessionRevoked(accountId).catch(err => {
+              console.log(`[CONNECTION] Error handling session revocation: ${err.message}`);
+            });
+            throw error; // Don't retry on session errors
           }
           
           // For other errors, wait before retry (exponential backoff with longer delays)
@@ -514,8 +530,39 @@ class AccountLinker {
             // Setup auto-reply handler when client connects
             await autoReplyHandler.setupAutoReply(accountClient, row.account_id);
           } catch (connectError) {
+            const errorCode = connectError.code || connectError.errorCode;
+            const errorMessage = connectError.message || connectError.toString() || '';
+            
+            // Check for session errors (AUTH_KEY_DUPLICATED, SESSION_REVOKED, etc.)
+            const isSessionError = 
+              errorCode === 406 || // AUTH_KEY_DUPLICATED
+              errorCode === 401 || // SESSION_REVOKED
+              errorMessage.includes('AUTH_KEY_DUPLICATED') ||
+              errorMessage.includes('SESSION_REVOKED') ||
+              errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+              connectError.errorMessage === 'AUTH_KEY_DUPLICATED' ||
+              connectError.errorMessage === 'SESSION_REVOKED';
+            
+            if (isSessionError) {
+              console.log(`[ACCOUNT] Session error (${errorCode}) for account ${accountId} - marking for re-authentication`);
+              // CRITICAL: Dispose of client before skipping to prevent memory leaks
+              try {
+                if (accountClient && typeof accountClient.disconnect === 'function') {
+                  await accountClient.disconnect().catch(() => {});
+                }
+              } catch (disposeError) {
+                // Ignore disposal errors
+              }
+              // Handle session revocation/duplication - mark account for re-auth
+              await this.handleSessionRevoked(row.account_id).catch(err => {
+                console.log(`[ACCOUNT] Error handling session revocation: ${err.message}`);
+              });
+              skippedCount++;
+              continue; // Skip storing this account
+            }
+            
             console.log(`[ACCOUNT] Failed to connect account ${accountId} (${row.phone}): ${connectError.message}`);
-            // Still store the client, but mark it as not connected
+            // Still store the client for other errors, but mark it as not connected
             // It will be retried when ensureConnected() is called
             logError(`[ACCOUNT] Connection failed for account ${accountId}:`, connectError);
           }

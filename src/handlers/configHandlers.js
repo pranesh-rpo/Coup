@@ -59,73 +59,60 @@ After joining, click the "✅ Verify" button below.
 export async function handleConfigButton(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
 
-  logger.logButtonClick(userId, username, 'Config', chatId);
-
-  // Check verification requirement
+  // Check verification (fast)
   const updatesChannels = config.getUpdatesChannels();
   if (updatesChannels.length > 0) {
     const isVerified = await userService.isUserVerified(userId);
     if (!isVerified) {
       const channelUsernames = updatesChannels.map(ch => ch.replace('@', ''));
-      await safeAnswerCallback(bot, callbackQuery.id, {
-        text: 'Please verify by joining our updates channel(s) first!',
-        show_alert: true,
-      });
+      await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please verify first!', show_alert: true });
       await showVerificationRequired(bot, chatId, channelUsernames);
       return;
     }
   }
 
   if (!accountLinker.isLinked(userId)) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'Please link an account first!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'Please link an account first!', show_alert: true });
     return;
   }
 
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: 'No active account found!',
-      show_alert: true,
-    });
+    await safeAnswerCallback(bot, callbackQuery.id, { text: 'No active account found!', show_alert: true });
     return;
   }
 
-  const settings = await configService.getAccountSettings(accountId);
-  const currentInterval = settings?.manualInterval || 11; // Default 11 minutes
+  // Get settings and accounts in PARALLEL
+  const [settings, accounts] = await Promise.all([
+    configService.getAccountSettings(accountId).catch(() => null),
+    accountLinker.getAccounts(userId)
+  ]);
+
+  const currentInterval = settings?.manualInterval || 11;
   const quietHours = settings?.quietStart && settings?.quietEnd 
     ? { start: settings.quietStart, end: settings.quietEnd }
     : null;
   
-  const poolModeText = settings?.useMessagePool ? `${settings.messagePoolMode === 'random' ? '🎲 Random' : settings.messagePoolMode === 'rotate' ? '🔄 Rotate' : settings.messagePoolMode === 'sequential' ? '➡️ Sequential' : 'Random'}` : '⚪ Disabled';
+  const poolModeText = settings?.useMessagePool 
+    ? `${settings.messagePoolMode === 'random' ? '🎲 Random' : settings.messagePoolMode === 'rotate' ? '🔄 Rotate' : '➡️ Sequential'}` 
+    : '⚪ Disabled';
 
   const autoReplyDmText = settings?.autoReplyDmEnabled ? '🟢 Enabled' : '⚪ Disabled';
   const autoReplyGroupsText = settings?.autoReplyGroupsEnabled ? '🟢 Enabled' : '⚪ Disabled';
 
-  const accountPhone = (await accountLinker.getAccounts(userId)).find(a => a.accountId === accountId)?.phone || 'Unknown';
+  const accountPhone = accounts.find(a => a.accountId === accountId)?.phone || 'Unknown';
   const configMessage = `⚙️ <b>Settings</b>\n\n` +
     `📱 <b>Account:</b> ${accountPhone}\n\n` +
     `⏱️ <b>Broadcast Interval:</b> ${currentInterval} min\n` +
     `🎲 <b>Message Pool:</b> ${poolModeText}\n` +
     `🌙 <b>Quiet Hours:</b> ${quietHours ? `${quietHours.start} - ${quietHours.end}` : 'Not set'}\n` +
     `💬 <b>Auto Reply DM:</b> ${autoReplyDmText}\n` +
-    `💬 <b>Auto Reply Groups:</b> ${autoReplyGroupsText}\n\n` +
-    `👥 <b>Group Settings:</b> Manage in Groups menu`;
+    `💬 <b>Auto Reply Groups:</b> ${autoReplyGroupsText}`;
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    configMessage,
-    { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours) }
-  );
-  
+  await safeEditMessage(bot, chatId, callbackQuery.message.message_id, configMessage, { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours) });
   await safeAnswerCallback(bot, callbackQuery.id);
-  return { accountId }; // Return accountId for state management
+  return { accountId };
 }
 
 /**

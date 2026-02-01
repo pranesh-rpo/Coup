@@ -420,6 +420,18 @@ function checkProcessLock() {
     await accountLinker.initialize();
     console.log('✅ Account linker initialized');
     
+    // CRITICAL: Reset all is_broadcasting flags on startup (in case bot crashed)
+    // Since we just started, no broadcasts are running in memory
+    try {
+      const result = await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE is_broadcasting = 1');
+      if (result.rowCount > 0) {
+        console.log(`[INIT] Reset ${result.rowCount} stuck is_broadcasting flag(s) from previous session`);
+      }
+    } catch (dbError) {
+      console.log(`[INIT] Warning: Failed to reset is_broadcasting flags: ${dbError.message}`);
+      // Non-critical, continue startup
+    }
+    
     // Auto-reply interval service disabled - using real-time mode only
     console.log('[INIT] Auto-reply using real-time mode (interval service disabled)');
     
@@ -1220,11 +1232,23 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
 });
 
 // Helper function to ensure user is stored in database
-async function ensureUserStored(msg) {
-  if (msg.from) {
-    const userId = msg.from.id;
-    const username = msg.from.username || null;
-    const firstName = msg.from.first_name || null;
+// Accepts both msg and callbackQuery objects (both have .from property)
+async function ensureUserStored(msgOrCallbackQuery) {
+  // Handle null/undefined
+  if (!msgOrCallbackQuery) {
+    return;
+  }
+  
+  // Both msg and callbackQuery have .from property
+  if (msgOrCallbackQuery.from) {
+    const userId = msgOrCallbackQuery.from.id;
+    const username = msgOrCallbackQuery.from.username || null;
+    const firstName = msgOrCallbackQuery.from.first_name || null;
+    
+    // Validate userId exists
+    if (!userId) {
+      return;
+    }
     
     try {
       // Try to get user, if not exists, add them

@@ -11,28 +11,46 @@ import { logError } from '../utils/logger.js';
 
 class AutoReplyPollingService {
   constructor() {
-    this.pollingIntervals = new Map(); // accountId -> intervalId
+    this.pollingIntervals = new Map(); // accountId -> timeoutId
     this.lastCheckTimes = new Map(); // accountId -> { dm: timestamp, groups: timestamp }
     this.processingAccounts = new Set(); // accountId -> true (to prevent concurrent processing)
+    this.consecutiveErrors = new Map(); // accountId -> error count
+    this.MAX_CONSECUTIVE_ERRORS = 5; // Stop polling after 5 consecutive errors
+    this.ERROR_RESET_TIME = 300000; // Reset error count after 5 minutes
   }
 
   /**
    * Start polling for an account (connects, checks messages, disconnects)
+   * Uses randomized intervals to avoid detection patterns
    */
   async startPolling(accountId) {
     // Stop existing polling if any
     this.stopPolling(accountId);
 
-    const pollInterval = 2000; // 2 seconds - near real-time
-    const intervalId = setInterval(async () => {
+    // Use randomized polling interval (3-5 seconds) to avoid predictable patterns
+    const getRandomPollInterval = () => {
+      return Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000; // 3-5 seconds
+    };
+
+    const scheduleNext = () => {
+      const nextInterval = getRandomPollInterval();
+      const timeoutId = setTimeout(async () => {
+        await this.checkAndReply(accountId);
+        // Schedule next check with random interval
+        scheduleNext();
+      }, nextInterval);
+      
+      this.pollingIntervals.set(accountId.toString(), timeoutId);
+    };
+
+    // Start the polling loop
+    scheduleNext();
+    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (randomized interval: 3-5s)`);
+
+    // Check immediately on start (with a small delay to avoid instant connection)
+    setTimeout(async () => {
       await this.checkAndReply(accountId);
-    }, pollInterval);
-
-    this.pollingIntervals.set(accountId.toString(), intervalId);
-    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (interval: ${pollInterval}ms)`);
-
-    // Check immediately on start
-    await this.checkAndReply(accountId);
+    }, 1000);
   }
 
   /**
@@ -40,11 +58,13 @@ class AutoReplyPollingService {
    */
   stopPolling(accountId) {
     const accountIdStr = accountId.toString();
-    const intervalId = this.pollingIntervals.get(accountIdStr);
-    if (intervalId) {
-      clearInterval(intervalId);
+    const timeoutId = this.pollingIntervals.get(accountIdStr);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
       this.pollingIntervals.delete(accountIdStr);
       this.lastCheckTimes.delete(accountIdStr);
+      this.processingAccounts.delete(accountId);
+      // Don't delete error count - we want to track it for recovery
       console.log(`[AUTO_REPLY_POLL] Stopped polling for account ${accountId}`);
     }
   }
@@ -88,15 +108,41 @@ class AutoReplyPollingService {
       // Connect briefly to check messages
       const client = await accountLinker.getClientAndConnect(userId, accountId);
       if (!client || !client.connected) {
+        console.log(`[AUTO_REPLY_POLL] ⚠️  Account ${accountId} client not connected, will retry on next poll`);
+        // Don't count connection errors as consecutive errors - these are expected
         return; // Will retry on next poll
+      }
+      
+      // Reset error count on successful connection
+      if (this.consecutiveErrors.has(accountId)) {
+        this.consecutiveErrors.delete(accountId);
       }
 
       try {
+        // CRITICAL: Set account to offline status to prevent showing as "online"
+        // Set multiple times to ensure it sticks (some clients may override it)
+        try {
+          const { Api } = await import('telegram/tl/index.js');
+          await client.invoke(new Api.account.UpdateStatus({ offline: true }));
+          // Set again after a brief delay to ensure it persists
+          await new Promise(resolve => setTimeout(resolve, 100));
+          await client.invoke(new Api.account.UpdateStatus({ offline: true }));
+        } catch (statusError) {
+          // Silently ignore - some accounts may not support this
+          // Only log if it's an unexpected error
+          if (!statusError.message?.includes('AUTH_KEY') && !statusError.message?.includes('not connected')) {
+            console.log(`[AUTO_REPLY_POLL] Could not set offline status for account ${accountId}: ${statusError.message}`);
+          }
+        }
+
         const me = await client.getMe();
         const dialogs = await client.getDialogs({ limit: 50 }); // Check recent dialogs
 
-        const lastCheck = this.lastCheckTimes.get(accountId.toString()) || { dm: 0, groups: 0 };
-        const now = Date.now();
+        // Initialize lastCheck with current time if not set (prevents processing old messages on first run)
+        const now = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
+        const lastCheck = this.lastCheckTimes.get(accountId.toString()) || { dm: now, groups: now };
+        
+        console.log(`[AUTO_REPLY_POLL] Checking ${dialogs.length} dialogs for account ${accountId} (lastCheck: DM=${lastCheck.dm}, Groups=${lastCheck.groups})`);
 
         for (const dialog of dialogs) {
           try {
@@ -145,35 +191,88 @@ class AutoReplyPollingService {
             // Check message timestamp
             const messageDate = lastMessage.date ? Math.floor(lastMessage.date.getTime() / 1000) : 0;
             const checkKey = isDM ? 'dm' : 'groups';
-            const lastCheckTime = lastCheck[checkKey] || 0;
+            const lastCheckTime = lastCheck[checkKey] || now;
 
-            // Only process messages newer than last check
-            if (messageDate <= lastCheckTime) continue;
+            // Only process messages newer than last check (< not <=)
+            if (messageDate < lastCheckTime) {
+              continue; // Old message, already processed
+            }
+
+            console.log(`[AUTO_REPLY_POLL] 📨 New message in ${isDM ? 'DM' : 'group'} (chat ${chatId}, msg ${messageId}, date ${messageDate})`);
 
             // Process message using auto-reply handler
-            await autoReplyHandler.processMessage(lastMessage, accountId, client);
+            // Note: Even in polling mode, handler will add human-like delays (2-8 seconds)
+            await autoReplyHandler.processMessage(lastMessage, accountId, client, true); // true = polling mode
 
-            // Update last check time
-            lastCheck[checkKey] = messageDate;
+            // Update last check time to current time (not message time, to avoid missing concurrent messages)
+            lastCheck[checkKey] = now;
           } catch (error) {
-            // Skip errors for individual chats
+            // Log errors for individual chats but continue processing others
+            console.log(`[AUTO_REPLY_POLL] Error processing chat: ${error.message}`);
             continue;
           }
         }
 
         // Update last check times
         this.lastCheckTimes.set(accountId.toString(), lastCheck);
+        console.log(`[AUTO_REPLY_POLL] ✅ Check complete for account ${accountId} (updated lastCheck: DM=${lastCheck.dm}, Groups=${lastCheck.groups})`);
+
+        // Reset error count on successful check
+        if (this.consecutiveErrors.has(accountId)) {
+          this.consecutiveErrors.delete(accountId);
+        }
 
         // Disconnect after checking (to avoid staying online)
         // Note: We don't disconnect if client is being used for broadcasting
         // The accountLinker will manage this
       } catch (error) {
+        console.error(`[AUTO_REPLY_POLL] ❌ Error checking messages for account ${accountId}:`, error.message);
         logError(`[AUTO_REPLY_POLL] Error checking messages for account ${accountId}:`, error);
+        
+        // Track consecutive errors
+        const errorCount = (this.consecutiveErrors.get(accountId) || 0) + 1;
+        this.consecutiveErrors.set(accountId, errorCount);
+        
+        // If too many consecutive errors, stop polling temporarily
+        if (errorCount >= this.MAX_CONSECUTIVE_ERRORS) {
+          console.error(`[AUTO_REPLY_POLL] ⚠️ Account ${accountId} has ${errorCount} consecutive errors, stopping polling temporarily`);
+          this.stopPolling(accountId);
+          
+          // Restart after error reset time
+          setTimeout(async () => {
+            console.log(`[AUTO_REPLY_POLL] 🔄 Restarting polling for account ${accountId} after error recovery...`);
+            this.consecutiveErrors.delete(accountId);
+            await this.startPolling(accountId);
+          }, this.ERROR_RESET_TIME);
+        }
       }
     } catch (error) {
+      console.error(`[AUTO_REPLY_POLL] ❌ Error in checkAndReply for account ${accountId}:`, error.message);
       logError(`[AUTO_REPLY_POLL] Error in checkAndReply for account ${accountId}:`, error);
+      
+      // Track consecutive errors
+      const errorCount = (this.consecutiveErrors.get(accountId) || 0) + 1;
+      this.consecutiveErrors.set(accountId, errorCount);
+      
+      // If too many consecutive errors, stop polling temporarily
+      if (errorCount >= this.MAX_CONSECUTIVE_ERRORS) {
+        console.error(`[AUTO_REPLY_POLL] ⚠️ Account ${accountId} has ${errorCount} consecutive errors, stopping polling temporarily`);
+        this.stopPolling(accountId);
+        
+        // Restart after error recovery time
+        setTimeout(async () => {
+          console.log(`[AUTO_REPLY_POLL] 🔄 Restarting polling for account ${accountId} after error recovery...`);
+          this.consecutiveErrors.delete(accountId);
+          await this.startPolling(accountId);
+        }, this.ERROR_RESET_TIME);
+      }
     } finally {
       this.processingAccounts.delete(accountId);
+      
+      // Reset error count on successful check
+      if (this.consecutiveErrors.has(accountId)) {
+        this.consecutiveErrors.delete(accountId);
+      }
     }
   }
 

@@ -26,6 +26,13 @@ class AutoReplyHandler {
     // Format: accountId -> true
     this.loggedAlreadyRegistered = new Set();
     
+    // Rate limiting: Track last message sent time per account to prevent spam
+    // Format: accountId -> timestamp
+    this.lastMessageSent = new Map();
+    
+    // Minimum delay between messages from same account (anti-detection)
+    this.MIN_MESSAGE_INTERVAL = 3000; // 3 seconds minimum between messages
+    
     // Cleanup old entries periodically
     this.startCleanupInterval();
   }
@@ -58,6 +65,14 @@ class AutoReplyHandler {
     for (const [key, timestamp] of this.repliedChats.entries()) {
       if (timestamp < thirtyMinutesAgo) {
         this.repliedChats.delete(key);
+      }
+    }
+    
+    // Cleanup old rate limiting entries (older than 1 minute)
+    const oneMinuteAgo = now - (60 * 1000);
+    for (const [accountId, timestamp] of this.lastMessageSent.entries()) {
+      if (timestamp < oneMinuteAgo) {
+        this.lastMessageSent.delete(accountId);
       }
     }
     
@@ -318,17 +333,44 @@ class AutoReplyHandler {
 
   /**
    * Get random delay between min and max seconds (in milliseconds)
+   * Adds jitter to avoid predictable patterns
    */
   getRandomDelay(minSeconds = 3, maxSeconds = 10) {
     const minMs = minSeconds * 1000;
     const maxMs = maxSeconds * 1000;
-    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    // Add some jitter for more natural behavior
+    const baseDelay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    const jitter = Math.floor(Math.random() * 500); // 0-500ms jitter
+    return baseDelay + jitter;
+  }
+
+  /**
+   * Check if we can send a message (rate limiting)
+   * Prevents sending messages too quickly from the same account
+   */
+  canSendMessage(accountId) {
+    const lastSent = this.lastMessageSent.get(accountId);
+    if (!lastSent) return true;
+    
+    const timeSinceLastMessage = Date.now() - lastSent;
+    return timeSinceLastMessage >= this.MIN_MESSAGE_INTERVAL;
+  }
+
+  /**
+   * Mark that a message was sent (for rate limiting)
+   */
+  markMessageSent(accountId) {
+    this.lastMessageSent.set(accountId, Date.now());
   }
 
   /**
    * Process incoming message and send auto-reply if needed
+   * @param {Object} message - The message object
+   * @param {number} accountId - The account ID
+   * @param {Object} client - The Telegram client
+   * @param {boolean} immediate - If true, send reply immediately without delay (for polling mode)
    */
-  async processMessage(message, accountId, client) {
+  async processMessage(message, accountId, client, immediate = false) {
     try {
       // Get chat information
       const chat = await message.getChat();
@@ -405,21 +447,76 @@ class AutoReplyHandler {
           return;
         }
 
-        // Send auto-reply with random delay (3-10 seconds)
-        const delay = this.getRandomDelay(3, 10);
-        console.log(`[AUTO_REPLY] Scheduling DM auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s)`);
+        // Check rate limiting before scheduling reply
+        if (!this.canSendMessage(accountId)) {
+          const lastSent = this.lastMessageSent.get(accountId);
+          const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
+          console.log(`[AUTO_REPLY] Rate limit: Waiting ${Math.ceil(waitTime/1000)}s before sending DM reply for account ${accountId}`);
+          // Schedule for later when rate limit allows
+          setTimeout(() => {
+            this.processMessage(message, accountId, client, immediate);
+          }, waitTime);
+          return;
+        }
+
+        // Always add random delay (even in immediate mode) to avoid detection
+        // Human-like behavior: 2-8 seconds for polling, 3-10 seconds for event-driven
+        const delay = immediate ? this.getRandomDelay(2, 8) : this.getRandomDelay(3, 10);
+        if (immediate) {
+          console.log(`[AUTO_REPLY] Scheduling DM auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s) - polling mode with human-like delay`);
+        } else {
+          console.log(`[AUTO_REPLY] Scheduling DM auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s)`);
+        }
         
-        setTimeout(async () => {
+        // Always use setTimeout for human-like delays (even in immediate mode)
+        const sendReply = async () => {
           try {
-            // Check if client is still connected before sending
-            if (!client.connected) {
-              console.error(`[AUTO_REPLY] Client disconnected before sending DM auto-reply for account ${accountId}`);
+            // Double-check rate limiting right before sending
+            if (!this.canSendMessage(accountId)) {
+              const lastSent = this.lastMessageSent.get(accountId);
+              const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
+              console.log(`[AUTO_REPLY] Rate limit hit: Rescheduling DM reply for account ${accountId} in ${Math.ceil(waitTime/1000)}s`);
+              setTimeout(sendReply, waitTime);
+              return;
+            }
+            // Get fresh client connection (in case original disconnected during delay)
+            const accountLinker = (await import('./accountLinker.js')).default;
+            const db = (await import('../database/db.js')).default;
+            const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
+            
+            if (!accountResult.rows || accountResult.rows.length === 0) {
+              console.error(`[AUTO_REPLY] Account ${accountId} not found when sending DM reply`);
+              return;
+            }
+            
+            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0].user_id, accountId);
+            if (!freshClient || !freshClient.connected) {
+              console.error(`[AUTO_REPLY] Could not connect for DM auto-reply (account ${accountId})`);
               return;
             }
 
-            await client.sendMessage(chat, {
+            // Set offline status before sending to ensure we don't appear online
+            try {
+              const { Api } = await import('telegram/tl/index.js');
+              await freshClient.invoke(new Api.account.UpdateStatus({ offline: true }));
+            } catch (statusError) {
+              // Ignore status errors, continue with sending
+            }
+
+            await freshClient.sendMessage(chat, {
               message: settings.autoReplyDmMessage,
             });
+
+            // Mark message as sent for rate limiting
+            this.markMessageSent(accountId);
+
+            // Set offline status again after sending to ensure we stay offline
+            try {
+              const { Api } = await import('telegram/tl/index.js');
+              await freshClient.invoke(new Api.account.UpdateStatus({ offline: true }));
+            } catch (statusError) {
+              // Ignore status errors
+            }
             // TODO: Re-enable chat marking for 30-minute cooldown (DISABLED FOR TESTING)
             // this.markChatAsReplied(accountId, chatId);
             console.log(`[AUTO_REPLY] ✅ DM auto-reply sent for account ${accountId}`);
@@ -448,7 +545,10 @@ class AutoReplyHandler {
             console.error(`[AUTO_REPLY] Error sending DM auto-reply:`, sendError.message);
             logError(`[AUTO_REPLY] Error sending DM auto-reply:`, sendError);
           }
-        }, delay);
+        };
+        
+        // Always use setTimeout for human-like delays (prevents instant bot-like responses)
+        setTimeout(sendReply, delay); // Schedule for later, don't wait
         return;
       }
 
@@ -491,27 +591,88 @@ class AutoReplyHandler {
           return;
         }
 
-        // Send auto-reply with random delay (3-10 seconds)
-        const delay = this.getRandomDelay(3, 10);
+        // Check rate limiting before scheduling reply
+        if (!this.canSendMessage(accountId)) {
+          const lastSent = this.lastMessageSent.get(accountId);
+          const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
+          const triggerType = isMentioned && isReplyToAccount ? 'mention + reply' : 
+                             isMentioned ? 'mention (tagged/pinged)' : 
+                             'reply to account message';
+          console.log(`[AUTO_REPLY] Rate limit: Waiting ${Math.ceil(waitTime/1000)}s before sending group reply for account ${accountId} (${triggerType})`);
+          // Schedule for later when rate limit allows
+          setTimeout(() => {
+            this.processMessage(message, accountId, client, immediate);
+          }, waitTime);
+          return;
+        }
+
+        // Always add random delay (even in immediate mode) to avoid detection
+        // Human-like behavior: 2-8 seconds for polling, 3-10 seconds for event-driven
+        const delay = immediate ? this.getRandomDelay(2, 8) : this.getRandomDelay(3, 10);
         const triggerType = isMentioned && isReplyToAccount ? 'mention + reply' : 
                            isMentioned ? 'mention (tagged/pinged)' : 
                            'reply to account message';
-        console.log(`[AUTO_REPLY] Scheduling group auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s) - triggered by: ${triggerType}`);
         
-        setTimeout(async () => {
+        if (immediate) {
+          console.log(`[AUTO_REPLY] Scheduling group auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s) - polling mode with human-like delay - triggered by: ${triggerType}`);
+        } else {
+          console.log(`[AUTO_REPLY] Scheduling group auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s) - triggered by: ${triggerType}`);
+        }
+        
+        // Always use setTimeout for human-like delays (even in immediate mode)
+        const sendGroupReply = async () => {
           try {
-            // Check if client is still connected before sending
-            if (!client.connected) {
-              console.error(`[AUTO_REPLY] Client disconnected before sending group auto-reply for account ${accountId}`);
+            // Double-check rate limiting right before sending
+            if (!this.canSendMessage(accountId)) {
+              const lastSent = this.lastMessageSent.get(accountId);
+              const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
+              const triggerType = isMentioned && isReplyToAccount ? 'mention + reply' : 
+                                 isMentioned ? 'mention (tagged/pinged)' : 
+                                 'reply to account message';
+              console.log(`[AUTO_REPLY] Rate limit hit: Rescheduling group reply for account ${accountId} in ${Math.ceil(waitTime/1000)}s (${triggerType})`);
+              setTimeout(sendGroupReply, waitTime);
+              return;
+            }
+            // Get fresh client connection (in case original disconnected during delay)
+            const accountLinker = (await import('./accountLinker.js')).default;
+            const db = (await import('../database/db.js')).default;
+            const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
+            
+            if (!accountResult.rows || accountResult.rows.length === 0) {
+              console.error(`[AUTO_REPLY] Account ${accountId} not found when sending group reply`);
+              return;
+            }
+            
+            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0].user_id, accountId);
+            if (!freshClient || !freshClient.connected) {
+              console.error(`[AUTO_REPLY] Could not connect for group auto-reply (account ${accountId})`);
               return;
             }
 
+            // Set offline status before sending to ensure we don't appear online
+            try {
+              const { Api } = await import('telegram/tl/index.js');
+              await freshClient.invoke(new Api.account.UpdateStatus({ offline: true }));
+            } catch (statusError) {
+              // Ignore status errors, continue with sending
+            }
+
             // Reply to the message that triggered the auto-reply
-            // In gramjs, we need to pass the message object or use replyTo parameter
-            await client.sendMessage(chat, {
+            await freshClient.sendMessage(chat, {
               message: settings.autoReplyGroupsMessage,
-              replyTo: message, // Reply to the triggering message (pass message object)
+              replyTo: message, // Reply to the triggering message
             });
+
+            // Mark message as sent for rate limiting
+            this.markMessageSent(accountId);
+
+            // Set offline status again after sending to ensure we stay offline
+            try {
+              const { Api } = await import('telegram/tl/index.js');
+              await freshClient.invoke(new Api.account.UpdateStatus({ offline: true }));
+            } catch (statusError) {
+              // Ignore status errors
+            }
             
             console.log(`[AUTO_REPLY] ✅ Group auto-reply sent for account ${accountId} (triggered by: ${triggerType}, replied to message ${message.id})`);
             
@@ -539,7 +700,10 @@ class AutoReplyHandler {
             console.error(`[AUTO_REPLY] Error sending group auto-reply:`, sendError.message);
             logError(`[AUTO_REPLY] Error sending group auto-reply:`, sendError);
           }
-        }, delay);
+        };
+        
+        // Always use setTimeout for human-like delays (prevents instant bot-like responses)
+        setTimeout(sendGroupReply, delay); // Schedule for later, don't wait
         return;
       }
     } catch (error) {

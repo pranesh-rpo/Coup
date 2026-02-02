@@ -582,6 +582,17 @@ export async function initializeSchema() {
       console.log(`[SCHEMA] Note: Could not fix message pool is_active values: ${error.message}`);
     }
 
+    // Create banned_users table for user moderation
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS banned_users (
+        user_id INTEGER PRIMARY KEY,
+        banned_by INTEGER NOT NULL,
+        banned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        reason TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+      )
+    `);
+
     console.log('✅ Database schema initialized');
   } catch (error) {
     logError('❌ Error initializing database schema:', error);

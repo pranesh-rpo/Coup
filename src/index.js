@@ -440,6 +440,24 @@ function checkProcessLock() {
     await autoReplyRealtimeService.start();
     console.log('✅ Real-time auto-reply service started (2-10s delay)');
     
+    // Periodic refresh of auto-reply connections (every 5 minutes)
+    // This ensures connections stay healthy and handlers remain registered
+    // More frequent than health checks to catch issues faster
+    setInterval(async () => {
+      try {
+        console.log('[AUTO_REPLY] 🔄 Performing periodic refresh...');
+        const success = await autoReplyRealtimeService.refresh();
+        if (success) {
+          console.log('[AUTO_REPLY] ✅ Periodic refresh completed successfully');
+        } else {
+          console.error('[AUTO_REPLY] ⚠️ Periodic refresh completed with errors');
+        }
+      } catch (error) {
+        console.error('[AUTO_REPLY] ❌ Error in periodic refresh:', error.message);
+      }
+    }, 5 * 60 * 1000); // Every 5 minutes (more frequent for better reliability)
+    console.log('✅ Auto-reply periodic refresh scheduler started (every 5 minutes)');
+    
     // Start periodic cleanup for stopped broadcasts (every hour)
     setInterval(() => {
       automationService.cleanupStoppedBroadcasts();

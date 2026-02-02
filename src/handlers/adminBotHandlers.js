@@ -346,6 +346,18 @@ function registerAdminCommands(bot) {
       `/errors - View recent errors\n` +
       `/user &lt;id&gt; - Get user details\n` +
       `/account &lt;id&gt; - Get account details\n\n` +
+      `<b>🤖 Auto-Reply:</b>\n` +
+      `/autoreply - Show auto-reply status\n` +
+      `/autoreply_refresh - Restart auto-reply service\n` +
+      `/autoreply_stats - Auto-reply statistics\n` +
+      `/autoreply_logs - View auto-reply logs\n` +
+      `/test_autoreply &lt;account_id&gt; - Test auto-reply\n\n` +
+      `<b>🔧 Operations:</b>\n` +
+      `/account_reconnect &lt;account_id&gt; - Reconnect account\n` +
+      `/ban_user &lt;user_id&gt; - Ban a user\n` +
+      `/unban_user &lt;user_id&gt; - Unban a user\n` +
+      `/message_user &lt;user_id&gt; &lt;msg&gt; - Send message\n` +
+      `/cleanup - Clean old data\n\n` +
       `<b>🎮 Control:</b>\n` +
       `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
       `/stop_all_broadcasts - Stop all broadcasts\n` +
@@ -354,6 +366,7 @@ function registerAdminCommands(bot) {
       `/abroadcast_last - Resend last broadcast\n\n` +
       `<b>⚙️ System:</b>\n` +
       `/status - Bot health status\n` +
+      `/health_check - Comprehensive health check\n` +
       `/uptime - Bot uptime information\n` +
       `/test - Test admin bot connection\n\n` +
       `<b>❓ Help:</b>\n` +
@@ -1261,6 +1274,18 @@ function registerAdminCommands(bot) {
         `/errors - View recent errors (last 10)\n` +
       `/user &lt;id&gt; - Get user details\n` +
       `/account &lt;id&gt; - Get account details\n\n` +
+      `<b>🤖 Auto-Reply:</b>\n` +
+      `/autoreply - Show auto-reply status for all accounts\n` +
+      `/autoreply_refresh - Restart auto-reply service\n` +
+      `/autoreply_stats - Detailed auto-reply statistics\n` +
+      `/autoreply_logs - View recent auto-reply activity\n` +
+      `/test_autoreply &lt;account_id&gt; - Test auto-reply for account\n\n` +
+      `<b>🔧 Account Operations:</b>\n` +
+      `/account_reconnect &lt;account_id&gt; - Force reconnect stuck account\n` +
+      `/ban_user &lt;user_id&gt; - Ban user from bot\n` +
+      `/unban_user &lt;user_id&gt; - Unban user\n` +
+      `/message_user &lt;user_id&gt; &lt;msg&gt; - Send direct message to user\n` +
+      `/cleanup - Clean old logs and optimize database\n\n` +
       `<b>🎮 Control:</b>\n` +
       `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
       `/stop_all_broadcasts - Stop all active broadcasts\n` +
@@ -1269,6 +1294,7 @@ function registerAdminCommands(bot) {
         `/abroadcast_last - Resend last broadcast\n\n` +
         `<b>⚙️ System:</b>\n` +
         `/status - Bot health status\n` +
+        `/health_check - Comprehensive system health check\n` +
         `/uptime - Bot uptime information\n` +
         `/test - Test admin bot connection\n\n` +
         `<b>❓ Help:</b>\n` +
@@ -1303,6 +1329,700 @@ function registerAdminCommands(bot) {
       await bot.sendMessage(msg.chat.id, `✅ Admin bot is working! Your ID: ${msg.from.id}\nIs Admin: ${isAdmin(msg.from.id)}`);
     } catch (error) {
       console.error('[ADMIN BOT] Error in /test:', error);
+    }
+  });
+
+  // Auto-reply management commands
+  bot.onText(/\/autoreply$/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      // Get all accounts with auto-reply enabled
+      const result = await db.query(
+        `SELECT 
+          a.account_id, 
+          a.phone, 
+          a.user_id,
+          a.auto_reply_dm_enabled,
+          a.auto_reply_dm_message,
+          a.auto_reply_groups_enabled,
+          a.auto_reply_groups_message,
+          u.first_name,
+          u.username
+         FROM accounts a
+         LEFT JOIN users u ON a.user_id = u.user_id
+         WHERE a.auto_reply_dm_enabled = 1 OR a.auto_reply_groups_enabled = 1
+         ORDER BY a.account_id`
+      );
+
+      if (result.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '📭 No accounts have auto-reply enabled', { parse_mode: 'HTML' });
+        return;
+      }
+
+      // Get auto-reply service status
+      const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+      const activePolling = autoReplyRealtimeService.pollingAccounts.size;
+
+      let message = `🤖 <b>Auto-Reply Status</b>\n\n`;
+      message += `📊 <b>Overview:</b>\n`;
+      message += `• Accounts with auto-reply: ${result.rows.length}\n`;
+      message += `• Active polling sessions: ${activePolling}\n\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      for (const account of result.rows) {
+        const isPolling = autoReplyRealtimeService.pollingAccounts.has(account.account_id.toString());
+        const userName = account.first_name || account.username || 'Unknown';
+        
+        message += `📱 <b>Account ${account.account_id}</b>\n`;
+        message += `   Phone: ${account.phone || 'N/A'}\n`;
+        message += `   User: ${userName} (ID: ${account.user_id})\n`;
+        message += `   Status: ${isPolling ? '🟢 Polling' : '🔴 Inactive'}\n`;
+        
+        if (account.auto_reply_dm_enabled) {
+          const dmMsg = account.auto_reply_dm_message || 'Not set';
+          message += `   📬 DM: ✅ Enabled\n`;
+          message += `      Message: "${dmMsg.substring(0, 30)}${dmMsg.length > 30 ? '...' : ''}"\n`;
+        }
+        
+        if (account.auto_reply_groups_enabled) {
+          const groupMsg = account.auto_reply_groups_message || 'Not set';
+          message += `   👥 Groups: ✅ Enabled\n`;
+          message += `      Message: "${groupMsg.substring(0, 30)}${groupMsg.length > 30 ? '...' : ''}"\n`;
+        }
+        
+        message += `\n`;
+      }
+
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      message += `💡 Use /autoreply_refresh to restart polling\n`;
+      message += `📊 Use /autoreply_stats for detailed stats`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /autoreply:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/autoreply_refresh/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      await bot.sendMessage(msg.chat.id, '🔄 Refreshing auto-reply service...', { parse_mode: 'HTML' });
+
+      const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+      
+      // Get status before refresh
+      const beforeCount = autoReplyRealtimeService.pollingAccounts.size;
+      
+      // Refresh the service
+      await autoReplyRealtimeService.refresh();
+      
+      // Wait a bit for service to stabilize
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Get status after refresh
+      const afterCount = autoReplyRealtimeService.pollingAccounts.size;
+
+      const message = `✅ <b>Auto-Reply Service Refreshed</b>\n\n` +
+        `📊 <b>Status:</b>\n` +
+        `• Before: ${beforeCount} polling session(s)\n` +
+        `• After: ${afterCount} polling session(s)\n\n` +
+        `💡 All accounts with auto-reply enabled have been restarted`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, 'Refreshed auto-reply service');
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /autoreply_refresh:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error refreshing: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/autoreply_stats/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+      
+      // Get database stats
+      const totalAccounts = await db.query('SELECT COUNT(*) as count FROM accounts');
+      const dmEnabled = await db.query('SELECT COUNT(*) as count FROM accounts WHERE auto_reply_dm_enabled = 1');
+      const groupsEnabled = await db.query('SELECT COUNT(*) as count FROM accounts WHERE auto_reply_groups_enabled = 1');
+      const bothEnabled = await db.query('SELECT COUNT(*) as count FROM accounts WHERE auto_reply_dm_enabled = 1 AND auto_reply_groups_enabled = 1');
+
+      // Get service stats
+      const activePolling = autoReplyRealtimeService.pollingAccounts.size;
+      const lastSeenCount = autoReplyRealtimeService.lastSeenMessages.size;
+      const pollingStartCount = autoReplyRealtimeService.pollingStartTimes.size;
+      const connectionErrors = autoReplyRealtimeService.connectionErrors.size;
+
+      // Calculate uptime
+      const uptime = process.uptime();
+      const days = Math.floor(uptime / 86400);
+      const hours = Math.floor((uptime % 86400) / 3600);
+      const minutes = Math.floor((uptime % 3600) / 60);
+
+      let message = `📊 <b>Auto-Reply Statistics</b>\n\n`;
+      
+      message += `🔢 <b>Accounts:</b>\n`;
+      message += `• Total accounts: ${totalAccounts.rows[0].count}\n`;
+      message += `• DM auto-reply enabled: ${dmEnabled.rows[0].count}\n`;
+      message += `• Group auto-reply enabled: ${groupsEnabled.rows[0].count}\n`;
+      message += `• Both enabled: ${bothEnabled.rows[0].count}\n\n`;
+      
+      message += `⚙️ <b>Service Status:</b>\n`;
+      message += `• Active polling: ${activePolling} account(s)\n`;
+      message += `• Tracked chats: ${lastSeenCount}\n`;
+      message += `• Initialized accounts: ${pollingStartCount}\n`;
+      message += `• Connection errors tracked: ${connectionErrors}\n\n`;
+      
+      message += `📝 <b>Configuration:</b>\n`;
+      message += `• Poll interval: 3 seconds\n`;
+      message += `• Reply delay: 2-10 seconds (random)\n`;
+      message += `• Max dialogs per poll: 50\n`;
+      message += `• Mode: 🥷 Stealth (not online 24/7)\n\n`;
+      
+      message += `⏰ <b>Uptime:</b>\n`;
+      message += `• Service running: ${days}d ${hours}h ${minutes}m\n\n`;
+      
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      message += `💡 Use /autoreply for account details\n`;
+      message += `🔄 Use /autoreply_refresh to restart`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /autoreply_stats:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/autoreply_logs/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      // Get recent auto-reply logs from database
+      const logs = await db.query(
+        `SELECT * FROM logs 
+         WHERE action LIKE '%AUTO_REPLY%' OR action LIKE '%auto_reply%'
+         ORDER BY created_at DESC 
+         LIMIT 20`
+      );
+
+      if (logs.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, '📭 No auto-reply logs found', { parse_mode: 'HTML' });
+        return;
+      }
+
+      let message = `📋 <b>Recent Auto-Reply Logs</b> (Last ${logs.rows.length})\n\n`;
+
+      for (const log of logs.rows) {
+        const date = new Date(log.created_at);
+        const time = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        const status = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : 'ℹ️';
+        
+        message += `${status} <b>${time}</b> - ${log.action}\n`;
+        if (log.details) {
+          message += `   ${log.details.substring(0, 60)}${log.details.length > 60 ? '...' : ''}\n`;
+        }
+        message += `\n`;
+      }
+
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      message += `💡 Use /logs for all bot logs`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /autoreply_logs:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // Account operations commands
+  bot.onText(/\/account_reconnect (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const accountId = parseInt(match[1]);
+      if (isNaN(accountId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid account ID. Usage: /account_reconnect 123');
+        return;
+      }
+
+      await bot.sendMessage(msg.chat.id, `🔄 Reconnecting account ${accountId}...`);
+
+      // Get account info
+      const accountResult = await db.query('SELECT user_id, phone FROM accounts WHERE account_id = $1', [accountId]);
+      if (!accountResult.rows || accountResult.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, `❌ Account ${accountId} not found`);
+        return;
+      }
+
+      const userId = accountResult.rows[0].user_id;
+      const phone = accountResult.rows[0].phone;
+
+      // Disconnect if connected
+      try {
+        const client = accountLinker.getClient(userId, accountId);
+        if (client && client.connected) {
+          await client.disconnect();
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (e) {
+        // Ignore disconnect errors
+      }
+
+      // Reconnect
+      const client = await accountLinker.getClientAndConnect(userId, accountId);
+      
+      if (client && client.connected) {
+        const me = await client.getMe();
+        const message = `✅ <b>Account Reconnected</b>\n\n` +
+          `📱 Account ID: <code>${accountId}</code>\n` +
+          `📞 Phone: ${phone}\n` +
+          `👤 Name: ${me.firstName || 'N/A'}\n` +
+          `🆔 Telegram ID: <code>${me.id}</code>\n` +
+          `🔌 Status: Connected`;
+        
+        await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+        logger.logChange('ADMIN', adminUserId, `Reconnected account ${accountId}`);
+      } else {
+        await bot.sendMessage(msg.chat.id, `❌ Failed to reconnect account ${accountId}`);
+      }
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /account_reconnect:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error reconnecting: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/test_autoreply (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const accountId = parseInt(match[1]);
+      if (isNaN(accountId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid account ID. Usage: /test_autoreply 123');
+        return;
+      }
+
+      await bot.sendMessage(msg.chat.id, `🧪 Testing auto-reply for account ${accountId}...`);
+
+      // Get account settings
+      const configService = (await import('../services/configService.js')).default;
+      const settings = await configService.getAccountSettings(accountId);
+      
+      if (!settings) {
+        await bot.sendMessage(msg.chat.id, `❌ Account ${accountId} not found`);
+        return;
+      }
+
+      const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+      const isPolling = autoReplyRealtimeService.pollingAccounts.has(accountId.toString());
+
+      let message = `🧪 <b>Auto-Reply Test Results</b>\n\n`;
+      message += `📱 Account ID: <code>${accountId}</code>\n\n`;
+      
+      message += `<b>Configuration:</b>\n`;
+      message += `📬 DM Auto-Reply: ${settings.autoReplyDmEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+      if (settings.autoReplyDmEnabled) {
+        message += `   Message: "${settings.autoReplyDmMessage?.substring(0, 50)}${settings.autoReplyDmMessage?.length > 50 ? '...' : ''}"\n`;
+      }
+      message += `👥 Group Auto-Reply: ${settings.autoReplyGroupsEnabled ? '✅ Enabled' : '❌ Disabled'}\n`;
+      if (settings.autoReplyGroupsEnabled) {
+        message += `   Message: "${settings.autoReplyGroupsMessage?.substring(0, 50)}${settings.autoReplyGroupsMessage?.length > 50 ? '...' : ''}"\n`;
+      }
+      message += `\n`;
+      
+      message += `<b>Service Status:</b>\n`;
+      message += `🔌 Polling: ${isPolling ? '🟢 Active' : '🔴 Inactive'}\n`;
+      
+      if (!isPolling && (settings.autoReplyDmEnabled || settings.autoReplyGroupsEnabled)) {
+        message += `\n⚠️ <b>Warning:</b> Auto-reply is enabled but not polling!\n`;
+        message += `💡 Try: /autoreply_refresh`;
+      } else if (isPolling && !settings.autoReplyDmEnabled && !settings.autoReplyGroupsEnabled) {
+        message += `\n⚠️ <b>Warning:</b> Polling but auto-reply is disabled!\n`;
+      } else if (isPolling) {
+        message += `\n✅ <b>Status:</b> Auto-reply is working correctly\n`;
+        message += `📝 Send a test message to verify responses`;
+      }
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, `Tested auto-reply for account ${accountId}`);
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /test_autoreply:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error testing: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/health_check/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      await bot.sendMessage(msg.chat.id, '🏥 Running comprehensive health check...');
+
+      // Database check
+      let dbStatus = '✅ Healthy';
+      let dbLatency = 0;
+      try {
+        const start = Date.now();
+        await db.query('SELECT 1');
+        dbLatency = Date.now() - start;
+        if (dbLatency > 1000) dbStatus = '⚠️ Slow';
+      } catch (error) {
+        dbStatus = `❌ Error: ${error.message.substring(0, 30)}`;
+      }
+
+      // Auto-reply service check
+      const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+      const pollingCount = autoReplyRealtimeService.pollingAccounts.size;
+      const expectedPolling = await db.query(
+        'SELECT COUNT(*) as count FROM accounts WHERE auto_reply_dm_enabled = 1 OR auto_reply_groups_enabled = 1'
+      );
+      const autoReplyStatus = pollingCount === expectedPolling.rows[0].count ? '✅ Healthy' : '⚠️ Mismatch';
+
+      // Broadcast service check
+      const activeBroadcasts = automationService.activeBroadcasts?.size || 0;
+      const broadcastStatus = '✅ Running';
+
+      // Memory check
+      const memUsage = process.memoryUsage();
+      const heapUsedMB = (memUsage.heapUsed / 1024 / 1024).toFixed(2);
+      const heapTotalMB = (memUsage.heapTotal / 1024 / 1024).toFixed(2);
+      const heapPercent = ((memUsage.heapUsed / memUsage.heapTotal) * 100).toFixed(1);
+      const memoryStatus = heapPercent > 90 ? '⚠️ High' : heapPercent > 70 ? '⚠️ Medium' : '✅ Normal';
+
+      // Uptime
+      const uptime = process.uptime();
+      const days = Math.floor(uptime / 86400);
+      const hours = Math.floor((uptime % 86400) / 3600);
+      const minutes = Math.floor((uptime % 3600) / 60);
+
+      // Account connection check
+      const totalAccounts = await db.query('SELECT COUNT(*) as count FROM accounts');
+      const linkedAccounts = accountLinker.linkedAccounts.size;
+      const accountStatus = linkedAccounts > 0 ? '✅ Connected' : '⚠️ None linked';
+
+      let message = `🏥 <b>Comprehensive Health Check</b>\n\n`;
+      
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+      message += `<b>🗄️ Database</b>\n`;
+      message += `Status: ${dbStatus}\n`;
+      message += `Latency: ${dbLatency}ms\n\n`;
+      
+      message += `<b>🤖 Auto-Reply Service</b>\n`;
+      message += `Status: ${autoReplyStatus}\n`;
+      message += `Active polling: ${pollingCount}/${expectedPolling.rows[0].count}\n\n`;
+      
+      message += `<b>📢 Broadcast Service</b>\n`;
+      message += `Status: ${broadcastStatus}\n`;
+      message += `Active broadcasts: ${activeBroadcasts}\n\n`;
+      
+      message += `<b>🔑 Accounts</b>\n`;
+      message += `Status: ${accountStatus}\n`;
+      message += `Total accounts: ${totalAccounts.rows[0].count}\n`;
+      message += `Linked accounts: ${linkedAccounts}\n\n`;
+      
+      message += `<b>💾 Memory</b>\n`;
+      message += `Status: ${memoryStatus}\n`;
+      message += `Usage: ${heapUsedMB}MB / ${heapTotalMB}MB (${heapPercent}%)\n\n`;
+      
+      message += `<b>⏰ Uptime</b>\n`;
+      message += `Running: ${days}d ${hours}h ${minutes}m\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      // Overall status
+      const hasErrors = dbStatus.includes('❌') || autoReplyStatus.includes('❌');
+      const hasWarnings = dbStatus.includes('⚠️') || autoReplyStatus.includes('⚠️') || 
+                          memoryStatus.includes('⚠️') || accountStatus.includes('⚠️');
+      
+      if (hasErrors) {
+        message += `🔴 <b>Overall:</b> Critical Issues Detected\n`;
+        message += `⚠️ Immediate attention required!`;
+      } else if (hasWarnings) {
+        message += `🟡 <b>Overall:</b> System Operational (Warnings)\n`;
+        message += `💡 Some components need attention`;
+      } else {
+        message += `🟢 <b>Overall:</b> All Systems Healthy\n`;
+        message += `✨ Bot is operating normally`;
+      }
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, 'Performed health check');
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /health_check:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error running health check: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/cleanup/, async (msg) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      await bot.sendMessage(msg.chat.id, '🧹 Starting cleanup...');
+
+      let cleanupSummary = '';
+      let totalCleaned = 0;
+
+      // Clean old logs (older than 30 days)
+      try {
+        const logsResult = await db.query(
+          `DELETE FROM logs WHERE created_at < datetime('now', '-30 days')`
+        );
+        const logsDeleted = logsResult.changes || 0;
+        totalCleaned += logsDeleted;
+        cleanupSummary += `📋 Logs: ${logsDeleted} old entries removed\n`;
+      } catch (e) {
+        cleanupSummary += `⚠️ Logs: Error cleaning\n`;
+      }
+
+      // Clean old broadcasts (completed, older than 7 days)
+      try {
+        const broadcastsResult = await db.query(
+          `DELETE FROM broadcast_messages 
+           WHERE created_at < datetime('now', '-7 days')
+           AND broadcast_id IN (
+             SELECT id FROM broadcasts WHERE status = 'completed'
+           )`
+        );
+        const broadcastsDeleted = broadcastsResult.changes || 0;
+        totalCleaned += broadcastsDeleted;
+        cleanupSummary += `📢 Broadcast messages: ${broadcastsDeleted} old entries removed\n`;
+      } catch (e) {
+        cleanupSummary += `⚠️ Broadcasts: Error cleaning\n`;
+      }
+
+      // Clean orphaned sessions (accounts deleted but sessions remain)
+      try {
+        const sessionsResult = await db.query(
+          `DELETE FROM sessions 
+           WHERE account_id NOT IN (SELECT account_id FROM accounts)`
+        );
+        const sessionsDeleted = sessionsResult.changes || 0;
+        totalCleaned += sessionsDeleted;
+        cleanupSummary += `🔐 Orphaned sessions: ${sessionsDeleted} removed\n`;
+      } catch (e) {
+        cleanupSummary += `⚠️ Sessions: Error cleaning\n`;
+      }
+
+      // Clean old OTP codes (older than 1 day)
+      try {
+        const otpResult = await db.query(
+          `DELETE FROM otp_codes WHERE created_at < datetime('now', '-1 day')`
+        );
+        const otpDeleted = otpResult.changes || 0;
+        totalCleaned += otpDeleted;
+        cleanupSummary += `🔢 Expired OTPs: ${otpDeleted} removed\n`;
+      } catch (e) {
+        cleanupSummary += `⚠️ OTPs: Error cleaning\n`;
+      }
+
+      // Run VACUUM to reclaim space (SQLite)
+      try {
+        await db.query('VACUUM');
+        cleanupSummary += `💾 Database: Optimized and compacted\n`;
+      } catch (e) {
+        cleanupSummary += `⚠️ Database: Could not optimize\n`;
+      }
+
+      const message = `✅ <b>Cleanup Complete</b>\n\n` +
+        cleanupSummary +
+        `\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🗑️ Total items cleaned: <b>${totalCleaned}</b>\n` +
+        `✨ Database optimized`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, `Cleanup completed: ${totalCleaned} items removed`);
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /cleanup:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error during cleanup: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/ban_user (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const userId = parseInt(match[1]);
+      if (isNaN(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID. Usage: /ban_user 123456789');
+        return;
+      }
+
+      // Check if user exists
+      const userResult = await db.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+      if (!userResult.rows || userResult.rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, `❌ User ${userId} not found`);
+        return;
+      }
+
+      const user = userResult.rows[0];
+
+      // Add to banned users (using automation service or create banned_users table)
+      await db.query(
+        `INSERT INTO banned_users (user_id, banned_by, banned_at, reason) 
+         VALUES ($1, $2, datetime('now'), 'Banned by admin')
+         ON CONFLICT(user_id) DO UPDATE SET banned_at = datetime('now'), banned_by = $2`,
+        [userId, adminUserId]
+      );
+
+      // Stop any active broadcasts for this user
+      const stoppedBroadcasts = [];
+      for (const [uid, broadcast] of automationService.activeBroadcasts.entries()) {
+        if (parseInt(uid) === userId) {
+          await automationService.stopBroadcast(uid, broadcast.accountId);
+          stoppedBroadcasts.push(broadcast.accountId);
+        }
+      }
+
+      const message = `🚫 <b>User Banned</b>\n\n` +
+        `👤 User ID: <code>${userId}</code>\n` +
+        `📝 Name: ${user.first_name || 'N/A'}\n` +
+        `📛 Username: @${user.username || 'N/A'}\n` +
+        `📢 Stopped broadcasts: ${stoppedBroadcasts.length}\n\n` +
+        `✅ User is now banned from using the bot`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, `Banned user ${userId}`);
+
+      // Notify user they're banned (via main bot)
+      if (mainBot) {
+        try {
+          await mainBot.sendMessage(userId, '🚫 You have been banned from using this bot. Contact support if you believe this is an error.');
+        } catch (e) {
+          // Ignore if can't notify user
+        }
+      }
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /ban_user:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error banning user: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/unban_user (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const userId = parseInt(match[1]);
+      if (isNaN(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID. Usage: /unban_user 123456789');
+        return;
+      }
+
+      // Remove from banned users
+      const result = await db.query('DELETE FROM banned_users WHERE user_id = $1', [userId]);
+      
+      if (result.changes === 0) {
+        await bot.sendMessage(msg.chat.id, `ℹ️ User ${userId} was not banned`);
+        return;
+      }
+
+      const message = `✅ <b>User Unbanned</b>\n\n` +
+        `👤 User ID: <code>${userId}</code>\n\n` +
+        `User can now use the bot again`;
+
+      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, `Unbanned user ${userId}`);
+
+      // Notify user they're unbanned
+      if (mainBot) {
+        try {
+          await mainBot.sendMessage(userId, '✅ Your ban has been lifted. You can now use the bot again. Welcome back!');
+        } catch (e) {
+          // Ignore if can't notify user
+        }
+      }
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /unban_user:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error unbanning user: ${safeErrorMessage}`);
+    }
+  });
+
+  bot.onText(/\/message_user (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const parts = match[1].split(' ');
+      if (parts.length < 2) {
+        await bot.sendMessage(msg.chat.id, '❌ Usage: /message_user <user_id> <message>');
+        return;
+      }
+
+      const userId = parseInt(parts[0]);
+      const message = parts.slice(1).join(' ');
+
+      if (isNaN(userId)) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID');
+        return;
+      }
+
+      if (!mainBot) {
+        await bot.sendMessage(msg.chat.id, '❌ Main bot not available');
+        return;
+      }
+
+      // Send message to user
+      await mainBot.sendMessage(userId, `📨 <b>Message from Admin:</b>\n\n${message}`, { parse_mode: 'HTML' });
+
+      await bot.sendMessage(msg.chat.id, `✅ Message sent to user ${userId}`, { parse_mode: 'HTML' });
+      logger.logChange('ADMIN', adminUserId, `Sent message to user ${userId}`);
+    } catch (error) {
+      console.error('[ADMIN BOT] Error in /message_user:', error);
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error sending message: ${safeErrorMessage}`);
     }
   });
 

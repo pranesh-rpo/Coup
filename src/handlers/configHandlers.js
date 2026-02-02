@@ -1628,15 +1628,32 @@ export async function handleConfigAutoReplyDm(bot, callbackQuery) {
     ],
   };
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    configMessage,
-    { parse_mode: 'HTML', reply_markup: keyboard }
-  );
+  try {
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      configMessage,
+      { parse_mode: 'HTML', reply_markup: keyboard }
+    );
+  } catch (error) {
+    console.error(`[AUTO_REPLY] Error editing message for DM config:`, error.message);
+    try {
+      await bot.sendMessage(chatId, configMessage, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard
+      });
+    } catch (sendError) {
+      console.error(`[AUTO_REPLY] Error sending message for DM config:`, sendError.message);
+    }
+  }
   
-  await safeAnswerCallback(bot, callbackQuery.id);
+  try {
+    await safeAnswerCallback(bot, callbackQuery.id);
+  } catch (error) {
+    console.log(`[AUTO_REPLY] Callback already answered for DM config`);
+  }
+  
   return { accountId };
 }
 
@@ -1662,19 +1679,54 @@ export async function handleAutoReplyDmToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyDm(accountId, enabled, currentMessage);
   
   if (result.success) {
-    // Update real-time auto-reply service
+    // Small delay to ensure database is updated
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Always refresh to ensure consistency (handles both enable and disable)
     const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
-    if (enabled) {
-      await autoReplyRealtimeService.connectAccount(accountId);
-    } else {
-      await autoReplyRealtimeService.refresh();
+    try {
+      const refreshSuccess = await autoReplyRealtimeService.refresh();
+      if (refreshSuccess) {
+        console.log(`[AUTO_REPLY] ✅ Refreshed after DM ${enabled ? 'enable' : 'disable'} for account ${accountId}`);
+      } else {
+        console.error(`[AUTO_REPLY] ⚠️ Refresh returned false after DM ${enabled ? 'enable' : 'disable'} for account ${accountId}`);
+        // Retry once after a delay
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.refresh();
+      }
+    } catch (refreshError) {
+      console.error(`[AUTO_REPLY] ❌ Error refreshing after DM toggle:`, refreshError.message);
+      // Try direct connect if refresh fails and enabled
+      if (enabled) {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await autoReplyRealtimeService.connectAccount(accountId);
+        } catch (connectError) {
+          console.error(`[AUTO_REPLY] ❌ Error connecting account:`, connectError.message);
+        }
+      }
     }
     
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: enabled ? '✅ Auto reply DM enabled (2-10s delay)' : '✅ Auto reply DM disabled',
-      show_alert: true,
-    });
-    await handleConfigAutoReplyDm(bot, callbackQuery);
+    try {
+      await safeAnswerCallback(bot, callbackQuery.id, {
+        text: enabled ? '✅ Auto reply DM enabled (2-10s delay)' : '✅ Auto reply DM disabled',
+        show_alert: true,
+      });
+      
+      // Refresh the menu to show updated state
+      await handleConfigAutoReplyDm(bot, callbackQuery);
+    } catch (error) {
+      console.error(`[AUTO_REPLY] Error updating UI after DM toggle:`, error.message);
+      // Try to answer callback even if menu update fails
+      try {
+        await safeAnswerCallback(bot, callbackQuery.id, {
+          text: enabled ? '✅ Auto reply DM enabled' : '✅ Auto reply DM disabled',
+          show_alert: true,
+        });
+      } catch (e) {
+        // Ignore if callback already answered
+      }
+    }
   } else {
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: result.error || 'Failed to update settings',
@@ -1712,15 +1764,32 @@ export async function handleAutoReplyDmSetMessage(bot, callbackQuery) {
     return;
   }
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    '💬 <b>Set Auto Reply DM Message</b>\n\nSend the message to use for auto replies to direct messages:',
-    { parse_mode: 'HTML', ...createBackToAutoReplyDmButton() }
-  );
+  try {
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      '💬 <b>Set Auto Reply DM Message</b>\n\nSend the message to use for auto replies to direct messages:',
+      { parse_mode: 'HTML', ...createBackToAutoReplyDmButton() }
+    );
+  } catch (error) {
+    console.error(`[AUTO_REPLY] Error editing message for DM set message:`, error.message);
+    try {
+      await bot.sendMessage(chatId, '💬 <b>Set Auto Reply DM Message</b>\n\nSend the message to use for auto replies to direct messages:', {
+        parse_mode: 'HTML',
+        ...createBackToAutoReplyDmButton()
+      });
+    } catch (sendError) {
+      console.error(`[AUTO_REPLY] Error sending message for DM set message:`, sendError.message);
+    }
+  }
   
-  await safeAnswerCallback(bot, callbackQuery.id);
+  try {
+    await safeAnswerCallback(bot, callbackQuery.id);
+  } catch (error) {
+    console.log(`[AUTO_REPLY] Callback already answered for DM set message`);
+  }
+  
   return { accountId, messageId: callbackQuery.message.message_id };
 }
 
@@ -1764,9 +1833,31 @@ export async function handleAutoReplyDmMessageInput(bot, msg, accountId, message
   const result = await configService.setAutoReplyDm(accountId, enabled, message);
   
   if (result.success) {
-    // Refresh real-time auto-reply service
+    // Small delay to ensure database is updated
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Always refresh to ensure handler is properly registered
     const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
-    await autoReplyRealtimeService.connectAccount(accountId);
+    try {
+      const refreshSuccess = await autoReplyRealtimeService.refresh();
+      if (refreshSuccess) {
+        console.log(`[AUTO_REPLY] ✅ Refreshed after DM message update for account ${accountId}`);
+      } else {
+        console.error(`[AUTO_REPLY] ⚠️ Refresh returned false after DM message update for account ${accountId}`);
+        // Retry once after a delay
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.refresh();
+      }
+    } catch (refreshError) {
+      console.error(`[AUTO_REPLY] ❌ Error refreshing after message update:`, refreshError.message);
+      // Fallback to direct connect
+      try {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.connectAccount(accountId);
+      } catch (connectError) {
+        console.error(`[AUTO_REPLY] ❌ Error connecting account:`, connectError.message);
+      }
+    }
     
     // Refetch settings for menu
     const updatedSettings = await configService.getAccountSettings(accountId);
@@ -1830,15 +1921,32 @@ export async function handleConfigAutoReplyGroups(bot, callbackQuery) {
     ],
   };
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    configMessage,
-    { parse_mode: 'HTML', reply_markup: keyboard }
-  );
+  try {
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      configMessage,
+      { parse_mode: 'HTML', reply_markup: keyboard }
+    );
+  } catch (error) {
+    console.error(`[AUTO_REPLY] Error editing message for groups config:`, error.message);
+    try {
+      await bot.sendMessage(chatId, configMessage, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard
+      });
+    } catch (sendError) {
+      console.error(`[AUTO_REPLY] Error sending message for groups config:`, sendError.message);
+    }
+  }
   
-  await safeAnswerCallback(bot, callbackQuery.id);
+  try {
+    await safeAnswerCallback(bot, callbackQuery.id);
+  } catch (error) {
+    console.log(`[AUTO_REPLY] Callback already answered for groups config`);
+  }
+  
   return { accountId };
 }
 
@@ -1907,19 +2015,54 @@ export async function handleAutoReplyGroupsToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyGroups(accountId, enabled, currentMessage);
   
   if (result.success) {
-    // Update real-time auto-reply service
+    // Small delay to ensure database is updated
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Always refresh to ensure consistency (handles both enable and disable)
     const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
-    if (enabled) {
-      await autoReplyRealtimeService.connectAccount(accountId);
-    } else {
-      await autoReplyRealtimeService.refresh();
+    try {
+      const refreshSuccess = await autoReplyRealtimeService.refresh();
+      if (refreshSuccess) {
+        console.log(`[AUTO_REPLY] ✅ Refreshed after groups ${enabled ? 'enable' : 'disable'} for account ${accountId}`);
+      } else {
+        console.error(`[AUTO_REPLY] ⚠️ Refresh returned false after groups ${enabled ? 'enable' : 'disable'} for account ${accountId}`);
+        // Retry once after a delay
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.refresh();
+      }
+    } catch (refreshError) {
+      console.error(`[AUTO_REPLY] ❌ Error refreshing after groups toggle:`, refreshError.message);
+      // Try direct connect if refresh fails and enabled
+      if (enabled) {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await autoReplyRealtimeService.connectAccount(accountId);
+        } catch (connectError) {
+          console.error(`[AUTO_REPLY] ❌ Error connecting account:`, connectError.message);
+        }
+      }
     }
     
-    await safeAnswerCallback(bot, callbackQuery.id, {
-      text: enabled ? '✅ Auto reply groups enabled (2-10s delay)' : '✅ Auto reply groups disabled',
-      show_alert: true,
-    });
-    await handleConfigAutoReplyGroups(bot, callbackQuery);
+    try {
+      await safeAnswerCallback(bot, callbackQuery.id, {
+        text: enabled ? '✅ Auto reply groups enabled (2-10s delay)' : '✅ Auto reply groups disabled',
+        show_alert: true,
+      });
+      
+      // Refresh the menu to show updated state
+      await handleConfigAutoReplyGroups(bot, callbackQuery);
+    } catch (error) {
+      console.error(`[AUTO_REPLY] Error updating UI after groups toggle:`, error.message);
+      // Try to answer callback even if menu update fails
+      try {
+        await safeAnswerCallback(bot, callbackQuery.id, {
+          text: enabled ? '✅ Auto reply groups enabled' : '✅ Auto reply groups disabled',
+          show_alert: true,
+        });
+      } catch (e) {
+        // Ignore if callback already answered
+      }
+    }
   } else {
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: result.error || 'Failed to update settings',
@@ -1957,15 +2100,32 @@ export async function handleAutoReplyGroupsSetMessage(bot, callbackQuery) {
     return;
   }
 
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    '💬 <b>Set Auto Reply Groups Message</b>\n\nSend the message to use for auto replies in groups:',
-    { parse_mode: 'HTML', ...createBackToAutoReplyGroupsButton() }
-  );
+  try {
+    await safeEditMessage(
+      bot,
+      chatId,
+      callbackQuery.message.message_id,
+      '💬 <b>Set Auto Reply Groups Message</b>\n\nSend the message to use for auto replies in groups:',
+      { parse_mode: 'HTML', ...createBackToAutoReplyGroupsButton() }
+    );
+  } catch (error) {
+    console.error(`[AUTO_REPLY] Error editing message for groups set message:`, error.message);
+    try {
+      await bot.sendMessage(chatId, '💬 <b>Set Auto Reply Groups Message</b>\n\nSend the message to use for auto replies in groups:', {
+        parse_mode: 'HTML',
+        ...createBackToAutoReplyGroupsButton()
+      });
+    } catch (sendError) {
+      console.error(`[AUTO_REPLY] Error sending message for groups set message:`, sendError.message);
+    }
+  }
   
-  await safeAnswerCallback(bot, callbackQuery.id);
+  try {
+    await safeAnswerCallback(bot, callbackQuery.id);
+  } catch (error) {
+    console.log(`[AUTO_REPLY] Callback already answered for groups set message`);
+  }
+  
   return { accountId, messageId: callbackQuery.message.message_id };
 }
 
@@ -2009,9 +2169,31 @@ export async function handleAutoReplyGroupsMessageInput(bot, msg, accountId, mes
   const result = await configService.setAutoReplyGroups(accountId, enabled, message);
   
   if (result.success) {
-    // Refresh real-time auto-reply service
+    // Small delay to ensure database is updated
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Always refresh to ensure handler is properly registered
     const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
-    await autoReplyRealtimeService.connectAccount(accountId);
+    try {
+      const refreshSuccess = await autoReplyRealtimeService.refresh();
+      if (refreshSuccess) {
+        console.log(`[AUTO_REPLY] ✅ Refreshed after groups message update for account ${accountId}`);
+      } else {
+        console.error(`[AUTO_REPLY] ⚠️ Refresh returned false after groups message update for account ${accountId}`);
+        // Retry once after a delay
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.refresh();
+      }
+    } catch (refreshError) {
+      console.error(`[AUTO_REPLY] ❌ Error refreshing after message update:`, refreshError.message);
+      // Fallback to direct connect
+      try {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await autoReplyRealtimeService.connectAccount(accountId);
+      } catch (connectError) {
+        console.error(`[AUTO_REPLY] ❌ Error connecting account:`, connectError.message);
+      }
+    }
     
     // Refetch settings for menu
     const updatedSettings = await configService.getAccountSettings(accountId);

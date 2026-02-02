@@ -12,6 +12,33 @@ import logger from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
 import { createConfigMenu, createQuietHoursKeyboard, createScheduleKeyboard, createMainMenu, createBackButton, createBackToGroupsButton, createGroupsMenu, createAutoReplyMenu, createIntervalMenu, createMessagesMenu } from './keyboardHandler.js';
 
+/**
+ * Create A/B mode keyboard for A/B testing configuration
+ */
+function createABModeKeyboard(abMode, abModeType) {
+  const modeIcons = {
+    single: abModeType === 'single' ? '●' : '○',
+    rotate: abModeType === 'rotate' ? '●' : '○',
+    split: abModeType === 'split' ? '●' : '○'
+  };
+  
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: `${modeIcons.single} Single`, callback_data: 'config_ab_single' },
+          { text: `${modeIcons.rotate} Rotate`, callback_data: 'config_ab_rotate' }
+        ],
+        [
+          { text: `${modeIcons.split} Split`, callback_data: 'config_ab_split' },
+          { text: abMode ? '❌ Disable' : '✓ Disabled', callback_data: 'config_ab_disable' }
+        ],
+        [{ text: '🔙 Back to Settings', callback_data: 'btn_config' }],
+      ],
+    },
+  };
+}
+
 // Helper function to show verification required (imported from commandHandler)
 // Helper function to create channel buttons keyboard
 function createChannelButtonsKeyboard(channelUsernames) {
@@ -93,22 +120,24 @@ export async function handleConfigButton(bot, callbackQuery) {
   const quietHours = settings?.quietStart && settings?.quietEnd 
     ? { start: settings.quietStart, end: settings.quietEnd }
     : null;
-  
-  const poolModeText = settings?.useMessagePool 
-    ? `${settings.messagePoolMode === 'random' ? '🎲 Random' : settings.messagePoolMode === 'rotate' ? '🔄 Rotate' : '➡️ Sequential'}` 
-    : '⚪ Disabled';
 
-  const autoReplyDmText = settings?.autoReplyDmEnabled ? '🟢 Enabled' : '⚪ Disabled';
-  const autoReplyGroupsText = settings?.autoReplyGroupsEnabled ? '🟢 Enabled' : '⚪ Disabled';
+  const account = accounts.find(a => a.accountId === accountId);
+  const accountName = account?.firstName || account?.phone || 'Unknown';
 
-  const accountPhone = accounts.find(a => a.accountId === accountId)?.phone || 'Unknown';
-  const configMessage = `⚙️ <b>Settings</b>\n\n` +
-    `📱 <b>Account:</b> ${accountPhone}\n\n` +
-    `⏱️ <b>Broadcast Interval:</b> ${currentInterval} min\n` +
-    `🎲 <b>Message Pool:</b> ${poolModeText}\n` +
-    `🌙 <b>Quiet Hours:</b> ${quietHours ? `${quietHours.start} - ${quietHours.end}` : 'Not set'}\n` +
-    `💬 <b>Auto Reply DM:</b> ${autoReplyDmText}\n` +
-    `💬 <b>Auto Reply Groups:</b> ${autoReplyGroupsText}`;
+  // Build clean settings list
+  let settingsList = [];
+  settingsList.push(`⏱️ Interval: <b>${currentInterval} min</b>`);
+  settingsList.push(`🌙 Quiet Hours: ${quietHours ? `<b>${quietHours.start} - ${quietHours.end}</b>` : '<i>Not set</i>'}`);
+  settingsList.push(`📚 Pool: ${settings?.useMessagePool ? '<b>ON</b>' : '<i>OFF</i>'}`);
+  settingsList.push(`💬 DM Reply: ${settings?.autoReplyDmEnabled ? '<b>ON</b>' : '<i>OFF</i>'}`);
+  settingsList.push(`👥 Group Reply: ${settings?.autoReplyGroupsEnabled ? '<b>ON</b>' : '<i>OFF</i>'}`);
+
+  const configMessage = `<b>⚙️ SETTINGS</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+👤 ${accountName}
+
+${settingsList.join('\n')}`;
 
   await safeEditMessage(bot, chatId, callbackQuery.message.message_id, configMessage, { parse_mode: 'HTML', ...createConfigMenu(currentInterval, quietHours) });
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -1633,16 +1662,16 @@ export async function handleAutoReplyDmToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyDm(accountId, enabled, currentMessage);
   
   if (result.success) {
-    // Update connection manager
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    // Update real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
     if (enabled) {
-      await autoReplyConnectionManager.keepAccountConnected(accountId);
+      await autoReplyRealtimeService.connectAccount(accountId);
     } else {
-      await autoReplyConnectionManager.checkAllAccounts();
+      await autoReplyRealtimeService.refresh();
     }
     
     await safeAnswerCallback(bot, callbackQuery.id, {
-      text: enabled ? '✅ Auto reply DM enabled' : '✅ Auto reply DM disabled',
+      text: enabled ? '✅ Auto reply DM enabled (2-10s delay)' : '✅ Auto reply DM disabled',
       show_alert: true,
     });
     await handleConfigAutoReplyDm(bot, callbackQuery);
@@ -1735,13 +1764,18 @@ export async function handleAutoReplyDmMessageInput(bot, msg, accountId, message
   const result = await configService.setAutoReplyDm(accountId, enabled, message);
   
   if (result.success) {
-    // Refresh connection to ensure auto-reply handler is set up
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
-    await autoReplyConnectionManager.keepAccountConnected(accountId);
+    // Refresh real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+    await autoReplyRealtimeService.connectAccount(accountId);
+    
+    // Refetch settings for menu
+    const updatedSettings = await configService.getAccountSettings(accountId);
+    const dmEnabled = updatedSettings?.autoReplyDmEnabled || false;
+    const groupsEnabled = updatedSettings?.autoReplyGroupsEnabled || false;
     
     await editOrSend(
-      '✅ Auto reply DM message set successfully!',
-      { parse_mode: 'HTML', ...createAutoReplyMenu() }
+      '✅ DM auto-reply message saved!',
+      { parse_mode: 'HTML', ...createAutoReplyMenu(dmEnabled, groupsEnabled) }
     );
     return true;
   } else {
@@ -1831,18 +1865,21 @@ export async function handleAutoReplyMenu(bot, callbackQuery) {
   const dmEnabled = settings?.autoReplyDmEnabled || false;
   const groupsEnabled = settings?.autoReplyGroupsEnabled || false;
 
-  let menuMessage = `💬 <b>Auto Reply</b>\n\n`;
-  menuMessage += `Configure automatic replies for direct messages and groups.\n\n`;
-  menuMessage += `📱 <b>Direct Messages:</b> ${dmEnabled ? '🟢 Enabled' : '⚪ Disabled'}\n`;
-  menuMessage += `👥 <b>Groups:</b> ${groupsEnabled ? '🟢 Enabled' : '⚪ Disabled'}\n\n`;
-  menuMessage += `Select an option below to configure:`;
+  let menuMessage = `<b>💬 AUTO REPLY</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>Replies with 2-10s random delay</i>
+<i>Account stays offline between checks</i>
+
+📱 DM Replies: ${dmEnabled ? '<b>ON</b>' : '<i>OFF</i>'}
+👥 Group Replies: ${groupsEnabled ? '<b>ON</b>' : '<i>OFF</i>'}`;
 
   await safeEditMessage(
     bot,
     chatId,
     callbackQuery.message.message_id,
     menuMessage,
-    { parse_mode: 'HTML', ...createAutoReplyMenu() }
+    { parse_mode: 'HTML', ...createAutoReplyMenu(dmEnabled, groupsEnabled) }
   );
   
   await safeAnswerCallback(bot, callbackQuery.id);
@@ -1870,16 +1907,16 @@ export async function handleAutoReplyGroupsToggle(bot, callbackQuery, enabled) {
   const result = await configService.setAutoReplyGroups(accountId, enabled, currentMessage);
   
   if (result.success) {
-    // Update connection manager
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
+    // Update real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
     if (enabled) {
-      await autoReplyConnectionManager.keepAccountConnected(accountId);
+      await autoReplyRealtimeService.connectAccount(accountId);
     } else {
-      await autoReplyConnectionManager.checkAllAccounts();
+      await autoReplyRealtimeService.refresh();
     }
     
     await safeAnswerCallback(bot, callbackQuery.id, {
-      text: enabled ? '✅ Auto reply groups enabled' : '✅ Auto reply groups disabled',
+      text: enabled ? '✅ Auto reply groups enabled (2-10s delay)' : '✅ Auto reply groups disabled',
       show_alert: true,
     });
     await handleConfigAutoReplyGroups(bot, callbackQuery);
@@ -1972,13 +2009,18 @@ export async function handleAutoReplyGroupsMessageInput(bot, msg, accountId, mes
   const result = await configService.setAutoReplyGroups(accountId, enabled, message);
   
   if (result.success) {
-    // Refresh connection to ensure auto-reply handler is set up
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
-    await autoReplyConnectionManager.keepAccountConnected(accountId);
+    // Refresh real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+    await autoReplyRealtimeService.connectAccount(accountId);
+    
+    // Refetch settings for menu
+    const updatedSettings = await configService.getAccountSettings(accountId);
+    const dmEnabled = updatedSettings?.autoReplyDmEnabled || false;
+    const groupsEnabled = updatedSettings?.autoReplyGroupsEnabled || false;
     
     await editOrSend(
-      '✅ Auto reply groups message set successfully!',
-      { parse_mode: 'HTML', ...createAutoReplyMenu() }
+      '✅ Groups auto-reply message saved!',
+      { parse_mode: 'HTML', ...createAutoReplyMenu(dmEnabled, groupsEnabled) }
     );
     return true;
   } else {
@@ -2066,14 +2108,9 @@ export async function handleAutoReplyIntervalSelect(bot, callbackQuery, interval
       show_alert: true,
     });
     
-    // Always use real-time connection manager (no interval polling)
-    const autoReplyIntervalService = (await import('../services/autoReplyIntervalService.js')).default;
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
-    
-    // Stop any interval checking if it was running
-    autoReplyIntervalService.stopIntervalCheck(accountId);
-    // Ensure connection is maintained for real-time auto-reply
-    await autoReplyConnectionManager.keepAccountConnected(accountId);
+    // Use real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+    await autoReplyRealtimeService.connectAccount(accountId);
     
     // Go back to auto-reply DM config
     await handleConfigAutoReplyDm(bot, callbackQuery);
@@ -2182,19 +2219,19 @@ export async function handleAutoReplyIntervalInput(bot, msg, accountId, messageI
   const result = await configService.setAutoReplyCheckInterval(accountId, 0); // Force to 0 (real-time)
   
   if (result.success) {
+    // Refetch settings for menu
+    const updatedSettings = await configService.getAccountSettings(accountId);
+    const dmEnabled = updatedSettings?.autoReplyDmEnabled || false;
+    const groupsEnabled = updatedSettings?.autoReplyGroupsEnabled || false;
+    
     await editOrSend(
-      `✅ Auto-reply uses real-time mode (event-driven, no polling)!`,
-      { parse_mode: 'HTML', ...createAutoReplyMenu() }
+      `✅ Auto-reply configured! (polls every 5s, 2-10s reply delay)`,
+      { parse_mode: 'HTML', ...createAutoReplyMenu(dmEnabled, groupsEnabled) }
     );
     
-    // Always use real-time connection manager (no interval polling)
-    const autoReplyIntervalService = (await import('../services/autoReplyIntervalService.js')).default;
-    const autoReplyConnectionManager = (await import('../services/autoReplyConnectionManager.js')).default;
-    
-    // Stop any interval checking if it was running
-    autoReplyIntervalService.stopIntervalCheck(accountId);
-    // Ensure connection is maintained for real-time auto-reply
-    await autoReplyConnectionManager.keepAccountConnected(accountId);
+    // Use real-time auto-reply service
+    const autoReplyRealtimeService = (await import('../services/autoReplyRealtimeService.js')).default;
+    await autoReplyRealtimeService.connectAccount(accountId);
     
     return true;
   } else {

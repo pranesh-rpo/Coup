@@ -573,6 +573,15 @@ export async function initializeSchema() {
       console.log(`[SCHEMA] Note: Could not update existing auto_reply_check_interval values: ${error.message}`);
     }
 
+    // Fix existing message pool entries - ensure is_active uses 1/0 integers
+    try {
+      // Update any 'true' or 'TRUE' string values to 1
+      await db.query(`UPDATE message_pool SET is_active = 1 WHERE is_active NOT IN (0, 1) OR is_active IS NULL`);
+      console.log('[SCHEMA] Fixed message pool is_active values');
+    } catch (error) {
+      console.log(`[SCHEMA] Note: Could not fix message pool is_active values: ${error.message}`);
+    }
+
     console.log('✅ Database schema initialized');
   } catch (error) {
     logError('❌ Error initializing database schema:', error);

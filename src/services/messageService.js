@@ -273,7 +273,7 @@ class MessageService {
 
       const result = await db.query(
         `INSERT INTO message_pool (account_id, message_text, message_entities, display_order, is_active, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         VALUES ($1, $2, $3, $4, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
          RETURNING id`,
         [accountId, messageText, entitiesJson, nextOrder]
       );
@@ -303,13 +303,16 @@ class MessageService {
                  ORDER BY display_order ASC, created_at ASC`;
         params = [accountId];
       } else {
+        // Use is_active = 1 (SQLite stores booleans as integers)
         query = `SELECT id, message_text, message_entities, display_order, is_active FROM message_pool 
-                 WHERE account_id = $1 AND is_active = TRUE 
+                 WHERE account_id = $1 AND is_active = 1 
                  ORDER BY display_order ASC, created_at ASC`;
         params = [accountId];
       }
 
       const result = await db.query(query, params);
+      
+      console.log(`[MESSAGE_POOL] getMessagePool(${accountId}, includeInactive=${includeInactive}) returned ${result.rows.length} messages`);
 
       return result.rows.map(row => {
         const entities = row.message_entities ? JSON.parse(row.message_entities) : null;
@@ -322,12 +325,15 @@ class MessageService {
           }
         }
         
+        // Check both 1 (integer) and true (boolean) for compatibility
+        const isActive = row.is_active === 1 || row.is_active === true;
+        
         return {
           id: row.id,
           text: row.message_text,
           entities: entities,
           display_order: row.display_order,
-          is_active: row.is_active === 1
+          is_active: isActive
         };
       });
     } catch (error) {
@@ -465,7 +471,7 @@ class MessageService {
   async deleteFromMessagePool(accountId, messageId) {
     try {
       await db.query(
-        `UPDATE message_pool SET is_active = FALSE WHERE account_id = $1 AND id = $2`,
+        `UPDATE message_pool SET is_active = 0 WHERE account_id = $1 AND id = $2`,
         [accountId, messageId]
       );
       logger.logChange('MESSAGE_POOL', accountId, `Message ${messageId} removed from pool`);

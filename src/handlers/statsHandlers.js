@@ -73,27 +73,19 @@ function getTrendEmoji(current, previous) {
  * Create statistics keyboard
  */
 function createStatsKeyboard(period = 'today') {
+  const sel = (p) => period === p ? '●' : '○';
   return {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: period === 'today' ? '🟢 Today' : '⚪ Today', callback_data: 'stats_period_today' },
-          { text: period === 'week' ? '🟢 Week' : '⚪ Week', callback_data: 'stats_period_week' },
-          { text: period === 'month' ? '🟢 Month' : '⚪ Month', callback_data: 'stats_period_month' }
+          { text: `${sel('today')} Today`, callback_data: 'stats_period_today' },
+          { text: `${sel('week')} Week`, callback_data: 'stats_period_week' }
         ],
         [
-          { text: period === 'all' ? '🟢 All Time' : '⚪ All Time', callback_data: 'stats_period_all' },
-          { text: '📈 Trends', callback_data: 'stats_trends' }
+          { text: `${sel('month')} Month`, callback_data: 'stats_period_month' },
+          { text: `${sel('all')} All Time`, callback_data: 'stats_period_all' }
         ],
-        [
-          { text: '🏆 Top Groups', callback_data: 'stats_top_groups' },
-          { text: '⚠️ Problems', callback_data: 'stats_problematic' }
-        ],
-        [
-          { text: '📊 Detailed', callback_data: 'stats_detailed' },
-          { text: '🔄 A/B Results', callback_data: 'stats_ab' }
-        ],
-        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
+        [{ text: '← Back', callback_data: 'btn_main_menu' }],
       ],
     },
   };
@@ -138,8 +130,8 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
     return;
   }
 
-  let statsMessage = `📊 <b>Broadcast Statistics</b>\n`;
-  statsMessage += `━━━━━━━━━━━━━━━━━━\n\n`;
+  let statsMessage = `<b>📊 STATISTICS</b>
+━━━━━━━━━━━━━━━━━━━━━\n`;
 
   // Get data based on period
   let currentStats, comparison, periodLabel;
@@ -150,7 +142,6 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     
-    // Run BOTH queries in PARALLEL
     const [todayData, yesterdayData] = await Promise.all([
       broadcastStatsService.getTodayStats(accountId).catch(() => ({ stats: null })),
       broadcastStatsService.getStats(accountId, yesterday.toISOString().split('T')[0], yesterday.toISOString().split('T')[0]).catch(() => ({ stats: [] }))
@@ -166,28 +157,20 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
       const successRate = total > 0 ? ((sent / total) * 100).toFixed(1) : 0;
       const groups = currentStats.total_groups || 0;
       
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
-      statsMessage += `✅ <b>Sent:</b> ${formatNumber(sent)}\n`;
-      statsMessage += `❌ <b>Failed:</b> ${formatNumber(failed)}\n`;
-      statsMessage += `📊 <b>Total:</b> ${formatNumber(total)}\n\n`;
+      statsMessage += `\n<b>${periodLabel}</b>\n`;
+      statsMessage += `✅ Sent: <b>${formatNumber(sent)}</b>\n`;
+      statsMessage += `❌ Failed: <b>${formatNumber(failed)}</b>\n`;
+      statsMessage += `🎯 Success: <b>${successRate}%</b>\n`;
+      statsMessage += `👥 Groups: <b>${formatNumber(groups)}</b>\n`;
       
-      // Visual progress bar for success rate
-      const successBar = createProgressBar(parseFloat(successRate), 100, 15);
-      statsMessage += `🎯 <b>Success Rate:</b> ${successRate}%\n`;
-      statsMessage += `${successBar}\n\n`;
-      
-      statsMessage += `👥 <b>Groups Reached:</b> ${formatNumber(groups)}\n\n`;
-      
-      // Comparison with yesterday
       if (yesterdayStats) {
         const yesterdaySent = yesterdayStats.messages_sent || 0;
         const trend = getTrendEmoji(sent, yesterdaySent);
         const change = yesterdaySent > 0 ? (((sent - yesterdaySent) / yesterdaySent) * 100).toFixed(1) : 'N/A';
-        statsMessage += `${trend} <b>vs Yesterday:</b> ${change > 0 ? '+' : ''}${change}%\n\n`;
+        statsMessage += `${trend} vs Yesterday: <b>${change > 0 ? '+' : ''}${change}%</b>\n`;
       }
     } else {
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
-      statsMessage += `No broadcasts today yet.\n\n`;
+      statsMessage += `\n<i>No broadcasts today yet</i>\n`;
     }
   } else if (period === 'all') {
     const allTimeData = await broadcastStatsService.getAllTimeStats(accountId);
@@ -203,28 +186,17 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
       const avgRate = parseFloat(currentStats.avg_success_rate || 0).toFixed(1);
       const bestRate = parseFloat(currentStats.best_day_rate || 0).toFixed(1);
       
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
-      statsMessage += `📡 <b>Total Broadcasts:</b> ${formatNumber(broadcasts)}\n`;
-      statsMessage += `✅ <b>Total Sent:</b> ${formatNumber(sent)}\n`;
-      statsMessage += `❌ <b>Total Failed:</b> ${formatNumber(failed)}\n\n`;
-      
-      const successBar = createProgressBar(parseFloat(successRate), 100, 15);
-      statsMessage += `🎯 <b>Overall Success Rate:</b> ${successRate}%\n`;
-      statsMessage += `${successBar}\n\n`;
-      
-      statsMessage += `📊 <b>Average Rate:</b> ${avgRate}%\n`;
-      statsMessage += `🏆 <b>Best Day Rate:</b> ${bestRate}%\n\n`;
-      
-      if (currentStats.first_broadcast) {
-        statsMessage += `📅 <b>First Broadcast:</b> ${currentStats.first_broadcast}\n`;
-        statsMessage += `📅 <b>Last Broadcast:</b> ${currentStats.last_broadcast || 'N/A'}\n`;
-      }
+      statsMessage += `\n<b>${periodLabel}</b>\n`;
+      statsMessage += `📡 Broadcasts: <b>${formatNumber(broadcasts)}</b>\n`;
+      statsMessage += `✅ Sent: <b>${formatNumber(sent)}</b>\n`;
+      statsMessage += `❌ Failed: <b>${formatNumber(failed)}</b>\n`;
+      statsMessage += `🎯 Success: <b>${successRate}%</b>\n`;
+      statsMessage += `📊 Avg: <b>${avgRate}%</b> | Best: <b>${bestRate}%</b>\n`;
     } else {
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
-      statsMessage += `No statistics available yet.\n\n`;
+      statsMessage += `\n<i>No statistics available yet</i>\n`;
     }
   } else {
-    // Week or Month - run BOTH queries in PARALLEL
+    // Week or Month
     periodLabel = period === 'week' ? 'Last 7 Days' : 'Last 30 Days';
     
     const [periodData, compData] = await Promise.all([
@@ -243,34 +215,25 @@ export async function handleStatsButton(bot, callbackQuery, period = 'today') {
       const broadcasts = parseInt(currentStats.total_broadcasts || 0);
       const avgRate = parseFloat(currentStats.avg_success_rate || 0).toFixed(1);
       const maxRate = parseFloat(currentStats.max_success_rate || 0).toFixed(1);
-      const minRate = parseFloat(currentStats.min_success_rate || 0).toFixed(1);
       
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
-      statsMessage += `📡 <b>Broadcasts:</b> ${formatNumber(broadcasts)}\n`;
-      statsMessage += `✅ <b>Sent:</b> ${formatNumber(sent)}\n`;
-      statsMessage += `❌ <b>Failed:</b> ${formatNumber(failed)}\n\n`;
+      statsMessage += `\n<b>${periodLabel}</b>\n`;
+      statsMessage += `📡 Broadcasts: <b>${formatNumber(broadcasts)}</b>\n`;
+      statsMessage += `✅ Sent: <b>${formatNumber(sent)}</b>\n`;
+      statsMessage += `❌ Failed: <b>${formatNumber(failed)}</b>\n`;
+      statsMessage += `🎯 Success: <b>${successRate}%</b>\n`;
+      statsMessage += `📊 Avg: <b>${avgRate}%</b> | Best: <b>${maxRate}%</b>\n`;
       
-      const successBar = createProgressBar(parseFloat(successRate), 100, 15);
-      statsMessage += `🎯 <b>Success Rate:</b> ${successRate}%\n`;
-      statsMessage += `${successBar}\n\n`;
-      
-      statsMessage += `📊 <b>Average:</b> ${avgRate}% | <b>Best:</b> ${maxRate}% | <b>Worst:</b> ${minRate}%\n\n`;
-      
-      // Comparison with previous period
+      // Comparison
       if (comparison && comparison.current && comparison.previous) {
         const prevSent = parseInt(comparison.previous.total_sent || 0);
-        const prevRate = parseFloat(comparison.previous.avg_success_rate || 0);
         if (prevSent > 0) {
           const sentChange = (((sent - prevSent) / prevSent) * 100).toFixed(1);
-          const rateChange = (parseFloat(successRate) - prevRate).toFixed(1);
           const trend = getTrendEmoji(sent, prevSent);
-          statsMessage += `${trend} <b>vs Previous Period:</b>\n`;
-          statsMessage += `   Messages: ${sentChange > 0 ? '+' : ''}${sentChange}%\n`;
-          statsMessage += `   Success Rate: ${rateChange > 0 ? '+' : ''}${rateChange}%\n\n`;
+          statsMessage += `${trend} vs Previous: <b>${sentChange > 0 ? '+' : ''}${sentChange}%</b>\n`;
         }
       }
     } else {
-      statsMessage += `📅 <b>${periodLabel}</b>\n\n`;
+      statsMessage += `\n<b>${periodLabel}</b>\n`;
       statsMessage += `No statistics available for this period.\n\n`;
     }
   }

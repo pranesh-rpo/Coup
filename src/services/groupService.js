@@ -49,6 +49,29 @@ class GroupService {
       }
       console.log(`[GROUPS] Connected client for account ${accountIdNum} to refresh groups`);
 
+      // OPTIMIZATION: Get updates channel IDs ONCE at the start (not per dialog!)
+      const updatesChannels = config.getUpdatesChannels();
+      const excludedChannelIds = new Set();
+      const excludedUsernames = new Set();
+      
+      // Fetch all updates channel entities in parallel (one-time cost)
+      if (updatesChannels.length > 0) {
+        const entityPromises = updatesChannels.map(async (channelConfig) => {
+          const username = channelConfig.replace('@', '').toLowerCase();
+          excludedUsernames.add(username);
+          try {
+            const entity = await client.getEntity(channelConfig);
+            if (entity && entity.id) {
+              excludedChannelIds.add(entity.id.toString());
+            }
+          } catch (e) {
+            // Skip if can't resolve
+          }
+        });
+        await Promise.all(entityPromises);
+        console.log(`[GROUPS] Excluding ${excludedChannelIds.size} updates channels by ID`);
+      }
+
       // Enhanced error handling for getDialogs
       let dialogs = [];
       try {
@@ -59,107 +82,88 @@ class GroupService {
         }
       } catch (dialogError) {
         logError(`[GROUPS ERROR] Error fetching dialogs:`, dialogError);
-        // Check if it's a session error
         if (dialogError.errorMessage === 'SESSION_REVOKED' || (dialogError.code === 401 && dialogError.message && dialogError.message.includes('SESSION_REVOKED'))) {
           return { success: false, error: 'Session revoked. Please re-link your account.' };
         }
         throw dialogError;
       }
       
-      // Helper function to check if dialog is one of the updates channels
-      const isUpdatesChannel = async (dialog) => {
-        const updatesChannels = config.getUpdatesChannels();
-        if (updatesChannels.length === 0) return false;
-        
-        try {
-          const dialogName = (dialog.name || '').toLowerCase();
-          const dialogUsername = (dialog.entity?.username || '').toLowerCase();
-          
-          // Check against all configured updates channels
-          for (const channelConfig of updatesChannels) {
-            const updatesChannelName = channelConfig.replace('@', '').toLowerCase();
-            if (dialogUsername === updatesChannelName || dialogName === updatesChannelName) {
-              return true;
-            }
-            // Check by entity ID
-            try {
-              const updatesEntity = await client.getEntity(channelConfig);
-              if (updatesEntity && dialog.entity && updatesEntity.id && dialog.entity.id) {
-                if (updatesEntity.id.toString() === dialog.entity.id.toString()) {
-                  return true;
-                }
-              }
-            } catch (e) {
-              // Skip ID check if fails
-            }
-          }
-          return false;
-        } catch (error) {
-          return false;
-        }
-      };
-      
-      // Filter out updates channel from groups
+      // FAST: Filter groups using pre-fetched IDs (no network calls in loop!)
       const groups = [];
       for (const dialog of dialogs) {
-        if ((dialog.isGroup || dialog.isChannel)) {
-          const isUpdates = await isUpdatesChannel(dialog);
-          if (!isUpdates) {
+        if (dialog.isGroup || dialog.isChannel) {
+          const dialogId = dialog.entity?.id?.toString() || '';
+          const dialogUsername = (dialog.entity?.username || '').toLowerCase();
+          
+          // Fast O(1) lookup - no network calls!
+          const isExcluded = excludedChannelIds.has(dialogId) || excludedUsernames.has(dialogUsername);
+          
+          if (!isExcluded) {
             groups.push(dialog);
           } else {
-            console.log(`[GROUPS] Excluding updates channel "${dialog.name}" from refresh`);
+            console.log(`[GROUPS] Excluding updates channel "${dialog.name}"`);
           }
         }
       }
+      
+      console.log(`[GROUPS] Found ${groups.length} groups to process`);
 
       let added = 0;
       let updated = 0;
 
-      for (const group of groups) {
-        try {
-          const groupId = group.entity.id.toString();
-          let groupTitle = group.name || 'Unknown';
-          
-          // Enhanced validation for group data
-          if (!groupId || groupId === '0' || groupId === '') {
-            console.warn(`[GROUPS] Skipping group with invalid ID: ${groupId}`);
-            continue;
-          }
-          
-          if (!groupTitle || groupTitle.trim().length === 0) {
-            groupTitle = 'Unknown Group'; // Default name for groups without title
-          }
-          
-          // Truncate group title if too long (database constraint)
-          const maxTitleLength = 255;
-          if (groupTitle.length > maxTitleLength) {
-            groupTitle = groupTitle.substring(0, maxTitleLength - 3) + '...';
-          }
+      // OPTIMIZATION: Get all existing group IDs in ONE query
+      const existingResult = await db.query(
+        'SELECT group_id FROM groups WHERE account_id = $1',
+        [accountIdNum]
+      );
+      // IMPORTANT: Convert to strings for consistent comparison (SQLite returns numbers, dialog IDs are converted to strings)
+      const existingGroupIds = new Set(existingResult.rows.map(r => String(r.group_id)));
+      console.log(`[GROUPS] Found ${existingGroupIds.size} existing groups in DB`);
 
-          const existing = await db.query(
-            'SELECT id FROM groups WHERE account_id = $1 AND group_id = $2',
-            [accountIdNum, groupId]
-          );
+      // Process groups in batches for faster DB operations
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < groups.length; i += BATCH_SIZE) {
+        const batch = groups.slice(i, i + BATCH_SIZE);
+        
+        // Process batch in parallel
+        await Promise.all(batch.map(async (group) => {
+          try {
+            const groupId = group.entity.id.toString();
+            let groupTitle = group.name || 'Unknown';
+            
+            if (!groupId || groupId === '0' || groupId === '') {
+              return;
+            }
+            
+            if (!groupTitle || groupTitle.trim().length === 0) {
+              groupTitle = 'Unknown Group';
+            }
+            
+            const maxTitleLength = 255;
+            if (groupTitle.length > maxTitleLength) {
+              groupTitle = groupTitle.substring(0, maxTitleLength - 3) + '...';
+            }
 
-          if (existing.rows.length > 0) {
-            // Update existing group
-            await db.query(
-              'UPDATE groups SET group_title = $1, is_active = TRUE WHERE account_id = $2 AND group_id = $3',
-              [groupTitle, accountIdNum, groupId]
-            );
-            updated++;
-          } else {
-            // Add new group
-            await db.query(
-              `INSERT INTO groups (account_id, group_id, group_title, is_active, last_message_sent)
-               VALUES ($1, $2, $3, TRUE, NULL)`,
-              [accountIdNum, groupId, groupTitle]
-            );
-            added++;
+            if (existingGroupIds.has(groupId)) {
+              // Update existing - single query
+              await db.query(
+                'UPDATE groups SET group_title = $1, is_active = TRUE WHERE account_id = $2 AND group_id = $3',
+                [groupTitle, accountIdNum, groupId]
+              );
+              updated++;
+            } else {
+              // Insert new - single query
+              await db.query(
+                `INSERT INTO groups (account_id, group_id, group_title, is_active, last_message_sent)
+                 VALUES ($1, $2, $3, TRUE, NULL)`,
+                [accountIdNum, groupId, groupTitle]
+              );
+              added++;
+            }
+          } catch (error) {
+            logError(`[GROUPS ERROR] Error saving group ${group.name}:`, error);
           }
-        } catch (error) {
-          logError(`[GROUPS ERROR] Error saving group ${group.name}:`, error);
-        }
+        }));
       }
 
       console.log(`[GROUPS] Refreshed groups for account ${accountIdNum}: ${added} added, ${updated} updated, total: ${groups.length}`);

@@ -16,6 +16,7 @@ import { config } from '../config.js';
 import logger, { logError } from '../utils/logger.js';
 import { safeEditMessage, safeAnswerCallback } from '../utils/safeEdit.js';
 import { safeBotApiCall } from '../utils/floodWaitHandler.js';
+import { escapeHtml, stripHtmlTags } from '../utils/textHelpers.js';
 import { Api } from 'telegram/tl/index.js';
 import db from '../database/db.js';
 
@@ -45,58 +46,6 @@ function addPendingPhoneNumber(userId) {
       }
     }, 5 * 60 * 1000);
   }
-}
-
-/**
- * Escape HTML entities in text to prevent HTML tags from being rendered
- */
-function escapeHtml(text) {
-  if (!text) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-/**
- * Strip HTML tags from text to convert HTML formatted messages to plain text
- * This is useful when users forward messages with Telegram formatting
- */
-function stripHtmlTags(text) {
-  if (!text) return '';
-  
-  // Ensure we're working with a string
-  let workingText = String(text);
-  
-  // First decode HTML entities
-  let decoded = workingText
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ');
-  
-  // Then strip HTML tags (including Telegram-specific formatting)
-  // Remove common HTML tags like <b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, etc.
-  let stripped = decoded.replace(/<[^>]+>/g, '');
-  
-  // Decode any remaining HTML entities (in case some were nested)
-  stripped = stripped
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ');
-  
-  console.log(`[STRIP_HTML] Original length: ${workingText.length}, Stripped length: ${stripped.length}`);
-  console.log(`[STRIP_HTML] Original: ${workingText.substring(0, 100)}...`);
-  console.log(`[STRIP_HTML] Stripped: ${stripped.substring(0, 100)}...`);
-  
-  return stripped.trim();
 }
 
 /**
@@ -449,9 +398,7 @@ export async function handleStart(bot, msg) {
     createMainMenu(userId)
   ]);
 
-  const welcomeMessage = `📊 <b>Dashboard</b>${statusText}
-
-Use the menu below to manage accounts and start ads.`;
+  const welcomeMessage = `<b>📊 COUP DASHBOARD</b>${statusText}`;
 
   try {
     await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML', ...mainMenu });
@@ -482,9 +429,7 @@ export async function handleMainMenu(bot, callbackQuery) {
     createMainMenu(userId)
   ]);
 
-  const welcomeMessage = `📊 <b>Dashboard</b>${statusText}
-
-Use the menu below to manage accounts and start ads.`;
+  const welcomeMessage = `<b>📊 COUP DASHBOARD</b>${statusText}`;
 
   await safeEditMessage(bot, chatId, messageId, welcomeMessage, { parse_mode: 'HTML', ...mainMenu });
   
@@ -528,115 +473,63 @@ export async function handleLinkButton(bot, callbackQuery) {
     }
   }
 
-  // Show login options menu
-  logger.logChange('LINK', userId, 'Showing login options');
+  // Edit existing message to show phone input instructions (inline keyboard)
+  logger.logChange('LINK', userId, 'Showing unified phone input');
+  
+  const originalMsgId = callbackQuery.message.message_id;
+  
+  // Edit the original message to show instructions
   await safeEditMessage(
     bot,
     chatId,
-    callbackQuery.message.message_id,
-    `📱 <b>Link Account</b>\n\nChoose your preferred login method:\n\n📱 <b>Share Phone:</b> Share your phone number via button\n⌨️ <b>Type Phone:</b> Enter phone number manually\n\n`,
-    { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
+    originalMsgId,
+    `📱 <b>Link Account</b>\n\n` +
+    `Please provide your phone number:\n\n` +
+    `• <b>Tap the button below</b> to share your contact\n` +
+    `• <b>Or type</b> your number: <code>+1234567890</code>\n\n` +
+    `<i>Format: International format with country code</i>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '❌ Cancel', callback_data: 'btn_main_menu' }]
+        ]
+      }
+    }
   );
   
-  await safeAnswerCallback(bot, callbackQuery.id);
-  return false; // Don't set pending state yet - user needs to choose option
-}
-
-
-export async function handleLoginSharePhone(bot, callbackQuery) {
-  const userId = callbackQuery.from.id;
-  const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
-
-  logger.logButtonClick(userId, username, 'Share Phone', chatId);
-  logger.logChange('LINK', userId, 'Requesting phone number via share button');
-
-  await safeAnswerCallback(bot, callbackQuery.id);
-
-  // Send message with request contact keyboard directly (skip intermediate step)
-  await bot.sendMessage(
+  // Send separate message with reply keyboard (required for contact sharing)
+  const keyboardMsg = await bot.sendMessage(
     chatId,
-    '📱 <b>Share Your Phone Number</b>\n\nPlease tap the button below to share your phone number:',
+    '👇 <b>Tap below to share, or type your number:</b>',
     {
       parse_mode: 'HTML',
       reply_markup: {
         keyboard: [
-          [{
-            text: '📱 Share My Phone Number',
-            request_contact: true
-          }]
+          [{ text: '📱 Share My Phone Number', request_contact: true }]
         ],
         resize_keyboard: true,
         one_time_keyboard: true,
       },
     }
   );
+  
+  await safeAnswerCallback(bot, callbackQuery.id);
+  // Return object with message IDs for editing later
+  return { statusMsgId: originalMsgId, keyboardMsgId: keyboardMsg.message_id };
+}
 
-  // Delete the previous message (login options menu)
-  try {
-    await bot.deleteMessage(chatId, callbackQuery.message.message_id);
-  } catch (e) {
-    // Ignore if message already deleted
-  }
+// Legacy handlers - redirect to unified flow
+export async function handleLoginSharePhone(bot, callbackQuery) {
+  return await handleLinkButton(bot, callbackQuery);
 }
 
 export async function handleSharePhoneConfirm(bot, callbackQuery) {
-  const userId = callbackQuery.from.id;
-  const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
-
-  logger.logButtonClick(userId, username, 'Share Phone Confirm', chatId);
-
-  await safeAnswerCallback(bot, callbackQuery.id);
-
-  // Send message with request contact keyboard
-  await bot.sendMessage(
-    chatId,
-    '📱 <b>Share Your Phone Number</b>\n\nPlease tap the button below to share your phone number:',
-    {
-      parse_mode: 'HTML',
-      reply_markup: {
-        keyboard: [
-          [{
-            text: '📱 Share My Phone Number',
-            request_contact: true
-          }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true,
-      },
-    }
-  );
-
-  // Delete the previous message
-  try {
-    await bot.deleteMessage(chatId, callbackQuery.message.message_id);
-  } catch (e) {
-    // Ignore if message already deleted
-  }
+  return await handleLinkButton(bot, callbackQuery);
 }
 
 export async function handleLoginTypePhone(bot, callbackQuery) {
-  const userId = callbackQuery.from.id;
-  const chatId = callbackQuery.message.chat.id;
-  const username = callbackQuery.from.username || 'Unknown';
-
-  logger.logButtonClick(userId, username, 'Type Phone', chatId);
-  logger.logChange('LINK', userId, 'Requesting phone number input for new account');
-
-  await safeAnswerCallback(bot, callbackQuery.id);
-
-  // Allow users to link multiple accounts - no restriction here
-  // The saveLinkedAccount method will handle duplicate phone numbers
-  await safeEditMessage(
-    bot,
-    chatId,
-    callbackQuery.message.message_id,
-    `📱 <b>Link Account</b>\n\nPlease send your phone number in international format:\n\n<b>Format:</b> <code>+1234567890</code> or <code>+1 234 567 8900</code>\n<b>Example:</b> <code>+1234567890</code>`,
-    { parse_mode: 'HTML', ...createBackButton() }
-  );
-  
-  return true; // Signal that phone number input is expected
+  return await handleLinkButton(bot, callbackQuery);
 }
 
 export async function handleLoginCancel(bot, callbackQuery) {
@@ -648,22 +541,29 @@ export async function handleLoginCancel(bot, callbackQuery) {
   // Cancel web login if in progress
   await accountLinker.cancelWebLogin(userId);
 
-  // Show login options again
+  // Remove keyboard and show main menu
   await bot.sendMessage(
     chatId,
-    `📱 <b>Link Account</b>\n\nChoose your preferred login method:\n\n📱 <b>Share Phone:</b> Share your phone number via button\n⌨️ <b>Type Phone:</b> Enter phone number manually\n\n`,
-    { parse_mode: 'HTML', ...createLoginOptionsKeyboard() }
+    '❌ Link cancelled.',
+    { reply_markup: { remove_keyboard: true } }
   );
-
-  // Delete the previous message
+  
+  // Delete previous message
   try {
     await bot.deleteMessage(chatId, callbackQuery.message.message_id);
   } catch (e) {
-    // Ignore if message already deleted
+    // Ignore
   }
+  
+  // Show main menu
+  await bot.sendMessage(
+    chatId,
+    await generateStatusText(userId),
+    { parse_mode: 'HTML', ...createMainMenu() }
+  );
 }
 
-export async function handlePhoneNumber(bot, msg, phoneNumber) {
+export async function handlePhoneNumber(bot, msg, phoneNumber, processingMsgId = null) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const username = msg.from.username || 'Unknown';
@@ -681,12 +581,22 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
   logger.logChange('PHONE_INPUT', userId, `Phone number provided: ${maskedPhone}`);
 
   try {
-    // Show connecting status
-    const connectingMsg = await bot.sendMessage(
-      chatId,
-      '🔌 Connecting to Telegram...',
-      { parse_mode: 'HTML' }
-    );
+    // Use existing processing message or create new one
+    let statusMsgId = processingMsgId;
+    if (!statusMsgId) {
+      const connectingMsg = await bot.sendMessage(
+        chatId,
+        '🔌 Connecting to Telegram...',
+        { parse_mode: 'HTML' }
+      );
+      statusMsgId = connectingMsg.message_id;
+    } else {
+      // Update existing processing message
+      await bot.editMessageText(
+        '🔌 Connecting to Telegram...',
+        { chat_id: chatId, message_id: statusMsgId, parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
     console.log(`[LINK] Showing connecting status for user ${userId}`);
     logger.logInfo('LINK', `Initiating account link for user ${userId}`, userId);
     
@@ -695,10 +605,10 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
       '📤 Sending verification code...',
       {
         chat_id: chatId,
-        message_id: connectingMsg.message_id,
+        message_id: statusMsgId,
         parse_mode: 'HTML'
       }
-    );
+    ).catch(() => {});
     console.log(`[LINK] Showing sending code status for user ${userId}`);
     
     const result = await accountLinker.initiateLink(userId, phoneNumber);
@@ -712,7 +622,7 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
         '✅ <b>Verification code sent!</b>\n\n📱 Enter the 5-digit code from Telegram:',
         {
           chat_id: chatId,
-          message_id: connectingMsg.message_id,
+          message_id: statusMsgId,
           parse_mode: 'HTML',
           reply_markup: createOTPKeypad('').reply_markup
         }
@@ -764,7 +674,7 @@ export async function handlePhoneNumber(bot, msg, phoneNumber) {
           errorMessage,
           {
             chat_id: chatId,
-            message_id: connectingMsg.message_id,
+            message_id: statusMsgId,
             parse_mode: 'HTML',
             ...await createMainMenu(userId)
           }
@@ -1171,7 +1081,7 @@ export async function handleSetStartMessage(bot, msg) {
 }
 
 
-export async function handlePasswordInput(bot, msg, password) {
+export async function handlePasswordInput(bot, msg, password, statusMsgId = null) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const username = msg.from.username || 'Unknown';
@@ -1180,25 +1090,37 @@ export async function handlePasswordInput(bot, msg, password) {
   if (!accountLinker.isPasswordRequired(userId) && !accountLinker.isWebLoginPasswordRequired(userId)) {
     logger.logError('2FA', userId, new Error('No pending password authentication found'), 'Password verification failed');
     console.log(`[2FA] User ${userId} attempted password input but no pending authentication found`);
-    await bot.sendMessage(
-      chatId,
-      '❌ <b>No Active Authentication</b>\n\nPlease start the account linking process again.',
-      { parse_mode: 'HTML', ...await createMainMenu(userId) }
-    );
+    if (statusMsgId) {
+      await bot.editMessageText(
+        '❌ <b>No Active Authentication</b>\n\nPlease start the account linking process again.',
+        { chat_id: chatId, message_id: statusMsgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+      ).catch(() => {});
+    } else {
+      await bot.sendMessage(
+        chatId,
+        '❌ <b>No Active Authentication</b>\n\nPlease start the account linking process again.',
+        { parse_mode: 'HTML', ...await createMainMenu(userId) }
+      );
+    }
     return { success: false, error: 'No pending password authentication found' };
   }
 
   logger.logChange('2FA', userId, '2FA password provided');
   console.log(`[2FA] User ${userId} provided password for 2FA authentication`);
 
-  let verifyingMsg = null;
+  // Use existing message or create new one
+  let msgId = statusMsgId;
   try {
     // Show verifying password status
-    verifyingMsg = await bot.sendMessage(
-      chatId,
-      '🔍 Verifying password...',
-      { parse_mode: 'HTML' }
-    );
+    if (msgId) {
+      await bot.editMessageText(
+        '🔍 Verifying password...',
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
+      ).catch(() => {});
+    } else {
+      const verifyingMsg = await bot.sendMessage(chatId, '🔍 Verifying password...', { parse_mode: 'HTML' });
+      msgId = verifyingMsg.message_id;
+    }
     console.log(`[2FA] Showing verifying password status for user ${userId}`);
     
     const result = await accountLinker.verifyPassword(userId, password);
@@ -1207,12 +1129,8 @@ export async function handlePasswordInput(bot, msg, password) {
       // Show connecting account status
       await bot.editMessageText(
         '🔌 Connecting account...',
-        {
-          chat_id: chatId,
-          message_id: verifyingMsg.message_id,
-          parse_mode: 'HTML'
-        }
-      );
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
+      ).catch(() => {});
       console.log(`[2FA] Showing connecting account status for user ${userId}`);
       
       logger.logSuccess('ACCOUNT_LINKED', userId, `Account ${result.accountId} linked successfully via 2FA`);
@@ -1233,13 +1151,8 @@ export async function handlePasswordInput(bot, msg, password) {
       
       await bot.editMessageText(
         `✅ <b>Account Linked Successfully!</b>\n\n🎉 Your account is now connected and ready to use.`,
-        {
-          chat_id: chatId,
-          message_id: verifyingMsg.message_id,
-          parse_mode: 'HTML',
-          ...await createMainMenu(userId)
-        }
-      );
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+      ).catch(() => {});
       console.log(`[2FA] Account linking completed successfully for user ${userId}`);
     } else {
       logger.logError('2FA', userId, new Error(result.error), 'Password verification failed');
@@ -1267,44 +1180,18 @@ export async function handlePasswordInput(bot, msg, password) {
         
         errorMessage += `You can try again after the wait period.`;
         
-        try {
-          await bot.editMessageText(
-            errorMessage,
-            {
-              chat_id: chatId,
-              message_id: verifyingMsg.message_id,
-              parse_mode: 'HTML',
-              ...await createMainMenu(userId)
-            }
-          );
-        } catch (editError) {
-          await bot.sendMessage(
-            chatId,
-            errorMessage,
-            { parse_mode: 'HTML', ...await createMainMenu(userId) }
-          );
-        }
+        await bot.editMessageText(
+          errorMessage,
+          { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+        ).catch(() => {});
       } else {
         // Handle AUTH_USER_CANCEL gracefully (user cancelled, not an error)
         if (result.error && result.error.includes('AUTH_USER_CANCEL')) {
           console.log(`[2FA] User ${userId} cancelled password authentication`);
-          try {
-            await bot.editMessageText(
-              'ℹ️ <b>Authentication Cancelled</b>\n\nYou cancelled the password entry. You can try linking your account again anytime.',
-              {
-                chat_id: chatId,
-                message_id: verifyingMsg.message_id,
-                parse_mode: 'HTML',
-                ...await createMainMenu(userId)
-              }
-            );
-          } catch (editError) {
-            await bot.sendMessage(
-              chatId,
-              'ℹ️ <b>Authentication Cancelled</b>\n\nYou cancelled the password entry. You can try linking your account again anytime.',
-              { parse_mode: 'HTML', ...await createMainMenu(userId) }
-            );
-          }
+          await bot.editMessageText(
+            'ℹ️ <b>Authentication Cancelled</b>\n\nYou cancelled the password entry. You can try linking your account again anytime.',
+            { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+          ).catch(() => {});
           return { success: false, error: 'User cancelled authentication', cancelled: true };
         }
 
@@ -1327,23 +1214,10 @@ export async function handlePasswordInput(bot, msg, password) {
           errorMessage += `You can try entering your password again after the wait period.`;
         }
         
-        try {
-          await bot.editMessageText(
-            errorMessage,
-            {
-              chat_id: chatId,
-              message_id: verifyingMsg.message_id,
-              parse_mode: 'HTML',
-              ...await createMainMenu(userId)
-            }
-          );
-        } catch (editError) {
-          await bot.sendMessage(
-            chatId,
-            errorMessage,
-            { parse_mode: 'HTML', ...await createMainMenu(userId) }
-          );
-        }
+        await bot.editMessageText(
+          errorMessage,
+          { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+        ).catch(() => {});
       }
     }
   } catch (error) {
@@ -1355,15 +1229,18 @@ export async function handlePasswordInput(bot, msg, password) {
       details: 'Exception during password verification',
     }).catch(() => {}); // Silently fail to avoid blocking
     
-    // Send error message with better formatting
-    try {
+    // Edit message with error
+    if (msgId) {
+      await bot.editMessageText(
+        `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
+      ).catch(() => {});
+    } else {
       await bot.sendMessage(
         chatId,
         `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
-      );
-    } catch (sendError) {
-      logger.logError('2FA', userId, sendError, 'Failed to send error message to user');
+      ).catch(() => {});
     }
   }
 }
@@ -1439,12 +1316,19 @@ export async function handleMessagesMenu(bot, callbackQuery) {
     // Handle both object format {text, entities} and string format for backward compatibility
     const messageText = currentMessage ? (typeof currentMessage === 'string' ? currentMessage : currentMessage.text) : null;
 
-    let menuMessage = `💬 <b>Messages</b>\n\n`;
-    menuMessage += `Manage your broadcast messages and message pool.\n\n`;
-    menuMessage += `✍️ <b>Current Message:</b> ${messageText ? `"${escapeHtml(messageText.substring(0, 50))}${messageText.length > 50 ? '...' : ''}"` : 'Not set'}\n`;
-    menuMessage += `🎲 <b>Message Pool:</b> ${(pool || []).length} messages ${usePool ? '(Enabled)' : '(Disabled)'}\n`;
-    menuMessage += `📤 <b>Forward Mode:</b> ${forwardMode ? '🟢 Enabled' : '⚪ Disabled'}\n\n`;
-    menuMessage += `Select an option below:`;
+    const msgPreview = messageText 
+      ? `"${escapeHtml(messageText.substring(0, 35))}${messageText.length > 35 ? '...' : ''}"` 
+      : '<i>Not set</i>';
+    const poolCount = (pool || []).length;
+
+    let menuMessage = `<b>📝 MESSAGES</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+📄 Current Message:
+${msgPreview}
+
+📚 Pool: ${usePool ? `<b>ON</b> (${poolCount} messages)` : `<i>OFF</i> (${poolCount} saved)`}
+↗️ Forward Mode: ${forwardMode ? '<b>ON</b>' : '<i>OFF</i>'}`;
 
     await safeEditMessage(
       bot,
@@ -2732,11 +2616,27 @@ export async function handleAccountButton(bot, callbackQuery) {
     });
   }
   
-  buttons.push([{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]);
+  buttons.push([{ text: '← Back', callback_data: 'btn_main_menu' }]);
 
-  const accountMessage = accounts.length === 0
-    ? '👤 <b>Account Management</b>\n\n📱 <i>No accounts linked yet</i>\n\nClick "➕ Link New Account" to add your first account and start broadcasting.'
-    : `👤 <b>Account Management</b>\n\n📊 <b>Total:</b> ${accounts.length} account${accounts.length > 1 ? 's' : ''}\n\n✅ <b>Active:</b> ${escapeHtml(accounts.find(a => a.isActive)?.firstName || accounts.find(a => a.isActive)?.phone || 'None')}\n\n<i>Select an account to switch or delete.</i>`;
+  let accountMessage;
+  if (accounts.length === 0) {
+    accountMessage = `<b>👤 ACCOUNTS</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<i>No accounts linked yet</i>
+
+Tap below to link your first account.`;
+  } else {
+    const activeAccount = accounts.find(a => a.isActive);
+    const activeName = activeAccount?.firstName || activeAccount?.phone || 'None';
+    accountMessage = `<b>👤 ACCOUNTS</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+Total: <b>${accounts.length}</b>
+Active: <b>${escapeHtml(activeName)}</b>
+
+<i>Tap to switch or delete</i>`;
+  }
 
   await safeEditMessage(
     bot,
@@ -4000,11 +3900,12 @@ export async function handleGroupsButton(bot, callbackQuery) {
   
   const blacklistCount = blacklistResult.groups?.length || 0;
 
-  const groupsMessage = `👥 <b>Group Management</b>\n\n` +
-    `📊 <b>Active Groups:</b> ${groupsCount}\n` +
-    `⏳ <b>Group Delay:</b> ${groupDelayText}\n` +
-    `🚫 <b>Blacklisted:</b> ${blacklistCount} group(s)\n\n` +
-    `Select an action:`;
+  const groupsMessage = `<b>👥 GROUPS</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 Active Groups: <b>${groupsCount}</b>
+⏳ Delay: <b>${groupDelayText}</b>
+🚫 Blacklisted: <b>${blacklistCount}</b>`;
 
   await safeEditMessage(
     bot,
@@ -4151,6 +4052,19 @@ export async function handleListGroups(bot, callbackQuery) {
   );
 
   await safeAnswerCallback(bot, callbackQuery.id);
+}
+
+export async function handleAutoJoinGroups(bot, callbackQuery) {
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const username = callbackQuery.from.username || 'Unknown';
+
+  logger.logButtonClick(userId, username, 'Auto Join Groups', chatId);
+
+  await safeAnswerCallback(bot, callbackQuery.id, {
+    text: '🚧 This feature is being implemented. Stay tuned!',
+    show_alert: true,
+  });
 }
 
 export async function handleJoinGroups(bot, callbackQuery) {
@@ -4528,30 +4442,19 @@ export async function handlePremium(bot, callbackQuery) {
         year: 'numeric' 
       });
       
-      // Modern premium active UI
-      const message = `╔═══════════════════════════╗
-║   ⭐ <b>PREMIUM ACTIVE</b> ⭐   ║
-╚═══════════════════════════╝
+      const message = `<b>⭐ PREMIUM ACTIVE</b>
+━━━━━━━━━━━━━━━━━━━━━
 
-┌───────────────────────────┐
-│  ✅ <b>Subscription Status</b>  │
-└───────────────────────────┘
+✅ Your subscription is active!
 
-📅 <b>Expires:</b> ${expiresAtFormatted}
-⏰ <b>Days Remaining:</b> <code>${daysRemaining} days</code>
-💰 <b>Amount:</b> ₹${subscription.amount || 30}
+📅 Expires: <b>${expiresAtFormatted}</b>
+⏰ Remaining: <b>${daysRemaining} days</b>
 
-┌───────────────────────────┐
-│  ✨ <b>Premium Benefits</b>   │
-└───────────────────────────┘
-
-✅ No tag verification required
-✅ Tags are not set automatically  
-✅ Works for all your accounts
-✅ Skip tag checks when broadcasting
-✅ Priority support access
-
-<i>Your premium subscription is active and working!</i>`;
+<b>Your Benefits:</b>
+• No tag verification
+• Profile stays untouched
+• All accounts covered
+• Priority support`;
       
       await safeEditMessage(
         bot,
@@ -4562,50 +4465,25 @@ export async function handlePremium(bot, callbackQuery) {
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
-              [{ text: '🏠 Back to Menu', callback_data: 'btn_main_menu' }]
+              [{ text: '← Back', callback_data: 'btn_main_menu' }]
             ]
           }
         }
       );
     } else {
-      // Premium purchase UI - contact support only
-      const message = `╔═══════════════════════════╗
-║   ⭐ <b>PREMIUM SUBSCRIPTION</b>   ║
-╚═══════════════════════════╝
+      const message = `<b>⭐ PREMIUM</b>
+━━━━━━━━━━━━━━━━━━━━━
 
-┌───────────────────────────┐
-│  💰 <b>Pricing</b>              │
-└───────────────────────────┘
+<b>₹30/month</b>
 
-<b>₹30/month</b> - One-time payment
-<i>30 days of premium access</i>
+<b>Benefits:</b>
+• No tag verification
+• Profile stays untouched
+• All accounts covered
+• Instant activation
+• Priority support
 
-┌───────────────────────────┐
-│  ✨ <b>Premium Benefits</b>   │
-└───────────────────────────┘
-
-✅ <b>No Tag Verification</b>
-   Skip tag checks completely
-
-✅ <b>No Auto Tag Setting</b>
-   Your profile stays untouched
-
-✅ <b>All Accounts Covered</b>
-   Works for every linked account
-
-✅ <b>Instant Activation</b>
-   Start broadcasting immediately
-
-✅ <b>Priority Support</b>
-   Get help faster
-
-┌───────────────────────────┐
-│  💳 <b>How to Purchase</b>      │
-└───────────────────────────┘
-
-To purchase premium, please contact our support team. They will guide you through the payment process and activate your premium subscription.
-
-<i>Click the button below to contact support</i>`;
+<i>Contact support to purchase</i>`;
       
       await safeEditMessage(
         bot,
@@ -4617,8 +4495,7 @@ To purchase premium, please contact our support team. They will guide you throug
           reply_markup: {
             inline_keyboard: [
               [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupportBot' }],
-              [{ text: '❓ FAQ', callback_data: 'premium_faq' }, { text: '📊 View Benefits', callback_data: 'premium_benefits' }],
-              [{ text: '🏠 Back to Menu', callback_data: 'btn_main_menu' }]
+              [{ text: '← Back', callback_data: 'btn_main_menu' }]
             ]
           }
         }

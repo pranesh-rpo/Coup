@@ -18,59 +18,59 @@ function normalizeTextForSearch(text) {
     return '';
   }
 
-  let normalized = text;
-
-  // Helper function to convert Unicode font variant to base ASCII
-  const convertFontVariant = (code, baseOffset, baseChar) => {
-    if (code >= baseOffset && code < baseOffset + 26) {
-      return String.fromCharCode(baseChar + (code - baseOffset));
-    }
-    return null;
-  };
-
-  // Convert each character
-  normalized = Array.from(normalized).map(char => {
+  // Convert each character using correct Unicode mathematical alphanumeric ranges
+  let normalized = Array.from(text).map(char => {
     const code = char.codePointAt(0);
     
-    // Mathematical Bold (U+1D400-1D433 for A-Z, U+1D434-1D45D for a-z)
-    if (code >= 0x1D400 && code <= 0x1D433) {
+    // Mathematical Bold: A-Z: U+1D400-U+1D419, a-z: U+1D41A-U+1D433
+    if (code >= 0x1D400 && code <= 0x1D419) {
       return String.fromCharCode(0x41 + (code - 0x1D400)); // A-Z
     }
-    if (code >= 0x1D434 && code <= 0x1D45D) {
-      return String.fromCharCode(0x61 + (code - 0x1D434)); // a-z
+    if (code >= 0x1D41A && code <= 0x1D433) {
+      return String.fromCharCode(0x61 + (code - 0x1D41A)); // a-z
     }
     
-    // Mathematical Italic (U+1D434-1D45D for A-Z, U+1D45E-1D487 for a-z)
-    // Note: U+1D434-1D45D overlaps with bold, handle italic separately
-    if (code >= 0x1D45E && code <= 0x1D487) {
-      return String.fromCharCode(0x61 + (code - 0x1D45E)); // a-z
+    // Mathematical Italic: A-Z: U+1D434-U+1D44D, a-z: U+1D44E-U+1D467
+    if (code >= 0x1D434 && code <= 0x1D44D) {
+      return String.fromCharCode(0x41 + (code - 0x1D434)); // A-Z
+    }
+    if (code >= 0x1D44E && code <= 0x1D467) {
+      return String.fromCharCode(0x61 + (code - 0x1D44E)); // a-z
     }
     
-    // Mathematical Bold Italic (U+1D468-1D491 for A-Z, U+1D492-1D4BB for a-z)
-    if (code >= 0x1D468 && code <= 0x1D491) {
+    // Mathematical Bold Italic: A-Z: U+1D468-U+1D481, a-z: U+1D482-U+1D49B
+    if (code >= 0x1D468 && code <= 0x1D481) {
       return String.fromCharCode(0x41 + (code - 0x1D468)); // A-Z
     }
-    if (code >= 0x1D492 && code <= 0x1D4BB) {
-      return String.fromCharCode(0x61 + (code - 0x1D492)); // a-z
+    if (code >= 0x1D482 && code <= 0x1D49B) {
+      return String.fromCharCode(0x61 + (code - 0x1D482)); // a-z
     }
     
-    // Mathematical Script (U+1D49C-1D4C5 for A-Z, U+1D4C6-1D4EF for a-z)
-    if (code >= 0x1D49C && code <= 0x1D4C5) {
+    // Mathematical Script: A-Z: U+1D49C-U+1D4B5, a-z: U+1D4B6-U+1D4CF
+    if (code >= 0x1D49C && code <= 0x1D4B5) {
       return String.fromCharCode(0x41 + (code - 0x1D49C)); // A-Z
     }
-    if (code >= 0x1D4C6 && code <= 0x1D4EF) {
-      return String.fromCharCode(0x61 + (code - 0x1D4C6)); // a-z
+    if (code >= 0x1D4B6 && code <= 0x1D4CF) {
+      return String.fromCharCode(0x61 + (code - 0x1D4B6)); // a-z
     }
     
-    // Mathematical Fraktur (U+1D504-1D51D for A-Z, U+1D51E-1D547 for a-z)
+    // Mathematical Bold Script: A-Z: U+1D4D0-U+1D4E9, a-z: U+1D4EA-U+1D503
+    if (code >= 0x1D4D0 && code <= 0x1D4E9) {
+      return String.fromCharCode(0x41 + (code - 0x1D4D0)); // A-Z
+    }
+    if (code >= 0x1D4EA && code <= 0x1D503) {
+      return String.fromCharCode(0x61 + (code - 0x1D4EA)); // a-z
+    }
+    
+    // Mathematical Fraktur: A-Z: U+1D504-U+1D51D, a-z: U+1D51E-U+1D537
     if (code >= 0x1D504 && code <= 0x1D51D) {
       return String.fromCharCode(0x41 + (code - 0x1D504)); // A-Z
     }
-    if (code >= 0x1D51E && code <= 0x1D547) {
+    if (code >= 0x1D51E && code <= 0x1D537) {
       return String.fromCharCode(0x61 + (code - 0x1D51E)); // a-z
     }
     
-    // Mathematical Double-Struck (U+1D538-1D551 for A-Z, U+1D552-1D56B for a-z)
+    // Mathematical Double-Struck: A-Z: U+1D538-U+1D551, a-z: U+1D552-U+1D56B
     if (code >= 0x1D538 && code <= 0x1D551) {
       return String.fromCharCode(0x41 + (code - 0x1D538)); // A-Z
     }
@@ -78,7 +78,15 @@ function normalizeTextForSearch(text) {
       return String.fromCharCode(0x61 + (code - 0x1D552)); // a-z
     }
     
-    // Mathematical Sans-Serif (U+1D5A0-1D5B9 for A-Z, U+1D5BA-1D5D3 for a-z)
+    // Mathematical Bold Fraktur: A-Z: U+1D56C-U+1D585, a-z: U+1D586-U+1D59F
+    if (code >= 0x1D56C && code <= 0x1D585) {
+      return String.fromCharCode(0x41 + (code - 0x1D56C)); // A-Z
+    }
+    if (code >= 0x1D586 && code <= 0x1D59F) {
+      return String.fromCharCode(0x61 + (code - 0x1D586)); // a-z
+    }
+    
+    // Mathematical Sans-Serif: A-Z: U+1D5A0-U+1D5B9, a-z: U+1D5BA-U+1D5D3
     if (code >= 0x1D5A0 && code <= 0x1D5B9) {
       return String.fromCharCode(0x41 + (code - 0x1D5A0)); // A-Z
     }
@@ -86,7 +94,7 @@ function normalizeTextForSearch(text) {
       return String.fromCharCode(0x61 + (code - 0x1D5BA)); // a-z
     }
     
-    // Mathematical Sans-Serif Bold (U+1D5D4-1D5ED for A-Z, U+1D5EE-1D607 for a-z)
+    // Mathematical Sans-Serif Bold: A-Z: U+1D5D4-U+1D5ED, a-z: U+1D5EE-U+1D607
     if (code >= 0x1D5D4 && code <= 0x1D5ED) {
       return String.fromCharCode(0x41 + (code - 0x1D5D4)); // A-Z
     }
@@ -94,11 +102,27 @@ function normalizeTextForSearch(text) {
       return String.fromCharCode(0x61 + (code - 0x1D5EE)); // a-z
     }
     
-    // Mathematical Monospace (U+1D670-1D689 for A-Z, U+1D68A-1D69B for a-z)
+    // Mathematical Sans-Serif Italic: A-Z: U+1D608-U+1D621, a-z: U+1D622-U+1D63B
+    if (code >= 0x1D608 && code <= 0x1D621) {
+      return String.fromCharCode(0x41 + (code - 0x1D608)); // A-Z
+    }
+    if (code >= 0x1D622 && code <= 0x1D63B) {
+      return String.fromCharCode(0x61 + (code - 0x1D622)); // a-z
+    }
+    
+    // Mathematical Sans-Serif Bold Italic: A-Z: U+1D63C-U+1D655, a-z: U+1D656-U+1D66F
+    if (code >= 0x1D63C && code <= 0x1D655) {
+      return String.fromCharCode(0x41 + (code - 0x1D63C)); // A-Z
+    }
+    if (code >= 0x1D656 && code <= 0x1D66F) {
+      return String.fromCharCode(0x61 + (code - 0x1D656)); // a-z
+    }
+    
+    // Mathematical Monospace: A-Z: U+1D670-U+1D689, a-z: U+1D68A-U+1D6A3
     if (code >= 0x1D670 && code <= 0x1D689) {
       return String.fromCharCode(0x41 + (code - 0x1D670)); // A-Z
     }
-    if (code >= 0x1D68A && code <= 0x1D69B) {
+    if (code >= 0x1D68A && code <= 0x1D6A3) {
       return String.fromCharCode(0x61 + (code - 0x1D68A)); // a-z
     }
     
@@ -107,7 +131,30 @@ function normalizeTextForSearch(text) {
       return String.fromCharCode(code - 0xFF00 + 0x20);
     }
     
-    // Keep emojis and other characters as-is for now
+    // Circled Latin letters: Ⓐ-Ⓩ (U+24B6-U+24CF) -> A-Z, ⓐ-ⓩ (U+24D0-U+24E9) -> a-z
+    if (code >= 0x24B6 && code <= 0x24CF) {
+      return String.fromCharCode(0x41 + (code - 0x24B6)); // A-Z
+    }
+    if (code >= 0x24D0 && code <= 0x24E9) {
+      return String.fromCharCode(0x61 + (code - 0x24D0)); // a-z
+    }
+    
+    // Regional Indicator Symbols (🇦-🇿) U+1F1E6-U+1F1FF -> A-Z
+    if (code >= 0x1F1E6 && code <= 0x1F1FF) {
+      return String.fromCharCode(0x41 + (code - 0x1F1E6)); // A-Z
+    }
+    
+    // Squared Latin letters: 🄰-🅉 (U+1F130-U+1F149) -> A-Z
+    if (code >= 0x1F130 && code <= 0x1F149) {
+      return String.fromCharCode(0x41 + (code - 0x1F130)); // A-Z
+    }
+    
+    // Negative Squared Latin: 🅰-🆉 (U+1F170-U+1F189) -> A-Z
+    if (code >= 0x1F170 && code <= 0x1F189) {
+      return String.fromCharCode(0x41 + (code - 0x1F170)); // A-Z
+    }
+    
+    // Keep emojis and other characters as-is
     return char;
   }).join('');
 

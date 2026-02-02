@@ -2,22 +2,12 @@ import automationService from '../services/automationService.js';
 import accountLinker from '../services/accountLinker.js';
 import messageService from '../services/messageService.js';
 import premiumService from '../services/premiumService.js';
+import configService from '../services/configService.js';
+import groupService from '../services/groupService.js';
+import { escapeHtml } from '../utils/textHelpers.js';
 
 /**
- * Escape HTML entities in text to prevent HTML tags from being rendered
- */
-function escapeHtml(text) {
-  if (!text) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-/**
- * Generate status text for the main menu
+ * Generate status text for the main menu - Clean Dashboard
  */
 export async function generateStatusText(userId) {
   if (!userId) {
@@ -29,28 +19,70 @@ export async function generateStatusText(userId) {
     const accounts = await accountLinker.getAccounts(userId);
     const activeAccountId = accountLinker.getActiveAccountId(userId);
     
-    // Check if broadcast is running for the current active account
     const isBroadcasting = activeAccountId ? automationService.isBroadcasting(userId, activeAccountId) : false;
-    const broadcastingAccountId = automationService.getBroadcastingAccountId(userId);
 
-    // Modern status display with better formatting
-    let statusText = '\n\n━━━━━━━━━━━━━━━━━━\n';
+    if (!isLinked || accounts.length === 0) {
+      return `
+
+<i>No account linked yet</i>
+<i>Tap the button below to get started</i>`;
+    }
+
+    const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
+    const displayName = activeAccount ? (activeAccount.firstName || activeAccount.phone) : 'Unknown';
+
+    // Get account settings and group count in parallel
+    let settings = null;
+    let groupCount = 0;
     
-    if (isLinked && accounts.length > 0) {
-      const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
-      const displayName = activeAccount ? (activeAccount.firstName || activeAccount.phone) : 'None';
-      statusText += `👤 <b>Account:</b> ${escapeHtml(displayName)}\n`;
-      
-      if (isBroadcasting) {
-        statusText += `📡 <b>Broadcast:</b> <code>🟢 Active</code>\n`;
-      } else {
-        statusText += `📡 <b>Broadcast:</b> <code>⚪ Inactive</code>\n`;
+    if (activeAccountId) {
+      try {
+        [settings, groupCount] = await Promise.all([
+          configService.getAccountSettings(activeAccountId).catch(e => {
+            console.log('[DASHBOARD] Error fetching account settings:', e.message);
+            return null;
+          }),
+          groupService.getActiveGroupsCount(activeAccountId).catch(() => 0)
+        ]);
+      } catch (e) {
+        console.log('[DASHBOARD] Error in Promise.all:', e.message);
       }
-    } else {
-      statusText += `👤 <b>Account:</b> <code>Not linked</code>\n`;
+    }
+
+    // Build dashboard
+    const broadcastStatus = isBroadcasting ? '🟢 LIVE' : '⚪ OFF';
+    
+    const dailySent = settings?.dailySent || 0;
+    const dailyCap = settings?.dailyCap || 1500;
+    const progress = Math.min(Math.round((dailySent / dailyCap) * 100), 100);
+    const interval = settings?.manualInterval || 11;
+    
+    // Build active features list
+    const active = [];
+    if (settings?.quietStart && settings?.quietEnd) active.push(`🌙 Quiet: ${settings.quietStart}-${settings.quietEnd}`);
+    if (settings?.useMessagePool) active.push('📚 Pool: ON');
+    if (settings?.forwardMode) active.push('↗️ Forward: ON');
+    if (settings?.autoReplyDmEnabled) active.push('💬 DM Reply: ON');
+    if (settings?.autoReplyGroupsEnabled) active.push('👥 Grp Reply: ON');
+    if (settings?.autoMention) active.push(`🔔 Mentions: @${settings.mentionCount}`);
+    
+    let statusText = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👤 <b>${escapeHtml(displayName)}</b>
+📡 ${broadcastStatus}  •  👥 ${groupCount} groups
+📨 ${dailySent}/${dailyCap} sent (${progress}%)
+⏱️ ${interval} min interval`;
+
+    if (active.length > 0) {
+      statusText += `
+
+<b>ACTIVE</b>
+${active.join('\n')}`;
     }
     
-    statusText += '━━━━━━━━━━━━━━━━━━';
+    statusText += `
+━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 
     return statusText;
   } catch (error) {
@@ -64,41 +96,39 @@ export async function createMainMenu(userId = null) {
   let isBroadcasting = false;
   if (userId) {
     try {
-      // Check if broadcast is running for the current active account
       const activeAccountId = accountLinker.getActiveAccountId(userId);
       isBroadcasting = activeAccountId ? automationService.isBroadcasting(userId, activeAccountId) : false;
     } catch (error) {
-      // If check fails, default to false
       isBroadcasting = false;
     }
   }
 
-  // Show toggle button based on broadcast state with modern design
+  // Dynamic broadcast button
   const broadcastButton = isBroadcasting
-    ? [{ text: '🟢 Broadcast Active', callback_data: 'btn_start_broadcast' }]
-    : [{ text: '🚀 Start Broadcast', callback_data: 'btn_start_broadcast' }];
+    ? [{ text: '⏹️ STOP BROADCAST', callback_data: 'btn_start_broadcast' }]
+    : [{ text: '▶️ START BROADCAST', callback_data: 'btn_start_broadcast' }];
 
-  // Get account info to show in button text
-  let accountButtonText = '👤 Manage Account';
-  let premiumButtonText = '⭐ Premium';
+  // Get account info
+  let accountButtonText = '➕ Link Account';
+  let hasAccount = false;
+  
   if (userId) {
     try {
       const accounts = await accountLinker.getAccounts(userId);
       const activeAccountId = accountLinker.getActiveAccountId(userId);
       
       if (activeAccountId && accounts.length > 0) {
+        hasAccount = true;
         const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
         if (activeAccount && activeAccount.firstName) {
-          accountButtonText = `👤 ${escapeHtml(activeAccount.firstName)}`;
+          accountButtonText = `👤 ${escapeHtml(activeAccount.firstName.substring(0, 15))}`;
         } else if (activeAccount && activeAccount.phone) {
           accountButtonText = `👤 ${escapeHtml(activeAccount.phone)}`;
+        } else {
+          accountButtonText = '👤 Account';
         }
       }
-
-      // Premium button is just the star symbol
-      premiumButtonText = '⭐';
     } catch (error) {
-      // If check fails, use default text
       console.log(`[KEYBOARD] Error getting account info: ${error.message}`);
     }
   }
@@ -106,28 +136,32 @@ export async function createMainMenu(userId = null) {
   return {
     reply_markup: {
       inline_keyboard: [
-        // Account Management - Full Width (Top Priority)
+        // ═══ ACCOUNT (Top Row) ═══
         [{ text: accountButtonText, callback_data: 'btn_account' }],
-        // Premium - Full Width (Prominent)
-        [{ text: premiumButtonText, callback_data: 'btn_premium' }],
-        // Core Functions - 2 columns (most used)
+        
+        // ═══ CORE FEATURES ═══
         [
-          { text: '💬 Messages', callback_data: 'btn_messages_menu' },
+          { text: '📝 Messages', callback_data: 'btn_messages_menu' },
           { text: '⚙️ Settings', callback_data: 'btn_config' }
         ],
-        // Advanced Features - 2 columns
+        
+        // ═══ GROUPS & AUTO REPLY ═══
         [
-          { text: '📊 Statistics', callback_data: 'btn_stats' },
-          { text: '🔔 Mentions', callback_data: 'btn_mention' }
+          { text: '👥 Groups', callback_data: 'btn_groups' },
+          { text: '💬 Auto Reply', callback_data: 'btn_auto_reply' }
         ],
-        // Additional Tools - Full Width
-        [{ text: '💬 Auto Reply', callback_data: 'btn_auto_reply' }],
-        // Groups - Full Width
-        [{ text: '👥 Groups', callback_data: 'btn_groups' }],
-        // Broadcast Control - Moved Down (Full Width)
+        
+        // ═══ MENTIONS & PREMIUM ═══
+        [
+          { text: '🔔 Mentions', callback_data: 'btn_mention' },
+          { text: '⭐ Premium', callback_data: 'btn_premium' }
+        ],
+        
+        // ═══ BROADCAST (Bottom) ═══
         broadcastButton,
-        // Support - Full Width
-        [{ text: '💬 Get Support', url: 'https://t.me/CoupSupportBot' }],
+        
+        // ═══ SUPPORT ═══
+        [{ text: '💭 Support', url: 'https://t.me/CoupSupportBot' }],
       ],
     },
   };
@@ -137,17 +171,19 @@ export function createGroupsMenu(groupDelayMin = null, groupDelayMax = null, bla
   return {
     reply_markup: {
       inline_keyboard: [
-        // Group Management Actions - 2 columns
+        // Actions Row
         [
-          { text: '🔄 Refresh Groups', callback_data: 'btn_refresh_groups' },
-          { text: '📋 List Groups', callback_data: 'btn_list_groups' }
+          { text: '🔄 Refresh', callback_data: 'btn_refresh_groups' },
+          { text: '📋 View All', callback_data: 'btn_list_groups' }
         ],
-        // Group Settings - Full width
+        // Auto Join
+        [{ text: '➕ Auto Join Groups', callback_data: 'btn_auto_join_groups' }],
+        // Management Row
         [
-          { text: '🚫 Blacklist', callback_data: 'btn_config_blacklist' }
+          { text: `🚫 Blacklist${blacklistCount > 0 ? ` (${blacklistCount})` : ''}`, callback_data: 'btn_config_blacklist' }
         ],
-        // Back - Full Width
-        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
+        // Navigation
+        [{ text: '← Back', callback_data: 'btn_main_menu' }],
       ],
     },
   };
@@ -212,6 +248,36 @@ export function createLoginOptionsKeyboard() {
   };
 }
 
+/**
+ * Create unified phone input keyboard (reply keyboard with share contact button)
+ * User can either tap the button to share OR type the number directly
+ */
+export function createPhoneInputKeyboard() {
+  return {
+    reply_markup: {
+      keyboard: [
+        [{
+          text: '📱 Share My Phone Number',
+          request_contact: true
+        }]
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: true,
+    },
+  };
+}
+
+/**
+ * Remove reply keyboard
+ */
+export function removeReplyKeyboard() {
+  return {
+    reply_markup: {
+      remove_keyboard: true,
+    },
+  };
+}
+
 export function createStopButton() {
   return {
     reply_markup: {
@@ -224,22 +290,25 @@ export function createStopButton() {
 }
 
 export function createConfigMenu(currentInterval = 11, quietHours = null) {
+  const intervalText = `${currentInterval} min`;
+  const quietText = quietHours ? '✓' : '✗';
+  
   return {
     reply_markup: {
       inline_keyboard: [
-        // Core Broadcast Settings - 2 columns
+        // Timing
         [
-          { text: '⏱️ Interval', callback_data: 'btn_config_interval_menu' },
-          { text: '🌙 Quiet Hours', callback_data: 'btn_config_quiet_hours' }
+          { text: `⏱️ Interval (${intervalText})`, callback_data: 'btn_config_interval_menu' },
+          { text: `🌙 Quiet [${quietText}]`, callback_data: 'btn_config_quiet_hours' }
         ],
-        // Schedule - Full Width
+        // Tools
         [
-          { text: '📅 Schedule', callback_data: 'btn_config_schedule' }
+          { text: '📅 Schedule', callback_data: 'btn_config_schedule' },
+          { text: '📝 Logger', callback_data: 'btn_logger_bot' }
         ],
-        // Logger Bot - Full Width
-        [{ text: '📝 Logger Bot', callback_data: 'btn_logger_bot' }],
-        // Back - Full Width
-        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
+        // Stats
+        [{ text: '📊 Statistics', callback_data: 'btn_stats' }],
+        [{ text: '← Back', callback_data: 'btn_main_menu' }],
       ],
     },
   };
@@ -288,26 +357,31 @@ export function createScheduleKeyboard() {
 export function createMessagePoolKeyboard(poolSize, poolMode = 'random', usePool = false) {
   const buttons = [];
   
-  // Main actions - 2 columns
+  // Actions
   buttons.push([
-    { text: '👁️ View Pool', callback_data: 'pool_view_messages' },
+    { text: '📋 View All', callback_data: 'pool_view_messages' },
     { text: '🔄 Refresh', callback_data: 'pool_add_message' }
   ]);
   
-  // Status toggle - Full width with modern design
+  // Toggle
+  const poolStatus = usePool ? '✓ ON' : '✗ OFF';
   buttons.push([
-    { text: usePool ? '✅ Pool Enabled' : '❌ Pool Disabled', callback_data: 'pool_toggle' }
+    { text: `Pool: ${poolStatus}`, callback_data: 'pool_toggle' }
   ]);
   
-  // Mode selection - 3 columns for better layout
+  // Mode selection - cleaner icons
+  const modeIcons = {
+    random: poolMode === 'random' ? '●' : '○',
+    rotate: poolMode === 'rotate' ? '●' : '○',
+    sequential: poolMode === 'sequential' ? '●' : '○'
+  };
   buttons.push([
-    { text: poolMode === 'random' ? '🟢 🎲 Random' : '⚪ 🎲 Random', callback_data: 'pool_mode_random' },
-    { text: poolMode === 'rotate' ? '🟢 🔄 Rotate' : '⚪ 🔄 Rotate', callback_data: 'pool_mode_rotate' },
-    { text: poolMode === 'sequential' ? '🟢 ➡️ Sequential' : '⚪ ➡️ Sequential', callback_data: 'pool_mode_sequential' }
+    { text: `${modeIcons.random} Random`, callback_data: 'pool_mode_random' },
+    { text: `${modeIcons.rotate} Rotate`, callback_data: 'pool_mode_rotate' },
+    { text: `${modeIcons.sequential} Sequential`, callback_data: 'pool_mode_sequential' }
   ]);
   
-  // Back button - Full width
-  buttons.push([{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]);
+  buttons.push([{ text: '← Back', callback_data: 'btn_main_menu' }]);
   
   return {
     reply_markup: {
@@ -398,17 +472,18 @@ export function createSavedTemplatesKeyboard(activeSlot, hasSlot1, hasSlot2, has
   };
 }
 
-export function createAutoReplyMenu() {
+export function createAutoReplyMenu(dmEnabled = false, groupsEnabled = false) {
+  const dmIcon = dmEnabled ? '✓' : '✗';
+  const groupIcon = groupsEnabled ? '✓' : '✗';
+  
   return {
     reply_markup: {
       inline_keyboard: [
-        // Auto Reply Options - 2 columns
         [
-          { text: '💬 DM Replies', callback_data: 'btn_config_auto_reply_dm' },
-          { text: '👥 Group Replies', callback_data: 'btn_config_auto_reply_groups' }
+          { text: `💬 DM [${dmIcon}]`, callback_data: 'btn_config_auto_reply_dm' },
+          { text: `👥 Groups [${groupIcon}]`, callback_data: 'btn_config_auto_reply_groups' }
         ],
-        // Back - Full width
-        [{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }],
+        [{ text: '← Back', callback_data: 'btn_main_menu' }],
       ],
     },
   };
@@ -431,28 +506,26 @@ export function createIntervalMenu() {
 }
 
 export function createMessagesMenu(forwardMode = false, savedMessagesUrl = null) {
-  const forwardModeText = forwardMode ? '🟢 Forward Mode' : '⚪ Forward Mode';
+  const forwardIcon = forwardMode ? '✓' : '✗';
   
-  // Build keyboard dynamically based on whether we have a valid saved messages URL
   const keyboard = [
-    // Message Options - 2 per row
+    // Message Setup
     [
-      { text: '✍️ Set Message', callback_data: 'btn_set_start_msg' },
-      { text: '🎲 Message Pool', callback_data: 'btn_message_pool' }
+      { text: '✏️ Set Message', callback_data: 'btn_set_start_msg' },
+      { text: '📚 Pool', callback_data: 'btn_message_pool' }
     ],
-    // Forward Mode - Full Width
-    [{ text: forwardModeText, callback_data: 'btn_config_forward_mode' }],
+    // Mode Toggle
+    [{ text: `↗️ Forward Mode: ${forwardIcon}`, callback_data: 'btn_config_forward_mode' }],
   ];
   
-  // Add Saved Messages button - use URL if available, otherwise callback
+  // Saved Messages Link
   if (savedMessagesUrl) {
-    keyboard.push([{ text: '📱 Go to Saved Messages', url: savedMessagesUrl }]);
+    keyboard.push([{ text: '📱 Open Saved Messages', url: savedMessagesUrl }]);
   } else {
-    keyboard.push([{ text: '📱 Go to Saved Messages', callback_data: 'btn_go_to_saved_messages' }]);
+    keyboard.push([{ text: '📱 Open Saved Messages', callback_data: 'btn_go_to_saved_messages' }]);
   }
   
-  // Back button
-  keyboard.push([{ text: '🔙 Back to Menu', callback_data: 'btn_main_menu' }]);
+  keyboard.push([{ text: '← Back', callback_data: 'btn_main_menu' }]);
   
   return {
     reply_markup: {

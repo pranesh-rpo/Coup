@@ -677,15 +677,22 @@ class AutomationService {
           const useMessagePool = settings?.useMessagePool || false;
           // messageData and messageEntities are already declared at function scope
 
+          // Debug: Log message pool status
+          console.log(`[BROADCAST] Start: Message Pool Enabled: ${useMessagePool}, Mode: ${settings?.messagePoolMode || 'random'}`);
+
           // Try message pool first if enabled
           if (useMessagePool) {
             const poolMode = settings?.messagePoolMode || 'random';
             const poolLastIndex = settings?.messagePoolLastIndex || 0;
 
+            console.log(`[BROADCAST] Start: Trying to get message from pool (mode: ${poolMode})`);
+
             if (poolMode === 'random') {
               messageData = await messageService.getRandomFromPool(accountId);
+              console.log(`[BROADCAST] Start: Pool random returned:`, messageData ? 'message found' : 'null');
             } else if (poolMode === 'rotate') {
               const result = await messageService.getNextFromPool(accountId, poolLastIndex);
+              console.log(`[BROADCAST] Start: Pool rotate returned:`, result ? 'message found' : 'null');
               if (result) {
                 messageData = { text: result.text, entities: result.entities };
                 // Update last index for next rotation
@@ -695,13 +702,23 @@ class AutomationService {
               // Sequential mode: use message index based on group index
               // This will be handled per-group in sendSingleMessageToAllGroups
               messageData = await messageService.getMessageByIndex(accountId, poolLastIndex);
+              console.log(`[BROADCAST] Start: Pool sequential returned:`, messageData ? 'message found' : 'null');
               // Note: sequential index is updated per group, not here
             }
+            
+            if (messageData) {
+              console.log(`[BROADCAST] Start: ✅ Using message from pool`);
+            } else {
+              console.log(`[BROADCAST] Start: ⚠️ Pool returned null, falling back to regular message`);
+            }
+          } else {
+            console.log(`[BROADCAST] Start: Message pool disabled, using regular message`);
           }
 
           // Fall back to regular message if pool is empty or not enabled
           if (!messageData) {
             messageData = await messageService.getActiveMessage(accountId);
+            console.log(`[BROADCAST] Start: Using regular message:`, messageData ? 'found' : 'null');
           }
           
           // If no saved_message_id found, try to get last message from Saved Messages automatically
@@ -1061,30 +1078,43 @@ class AutomationService {
         try {
           const useMessagePool = settings?.useMessagePool || false;
           
+          // Debug: Log message pool status
+          console.log(`[BROADCAST] Cycle: Message Pool Enabled: ${useMessagePool}, Mode: ${settings?.messagePoolMode || 'random'}`);
+          
           // Try message pool first if enabled (for random and rotate modes)
           // Sequential mode is handled per-group in sendSingleMessageToAllGroups
           if (useMessagePool) {
             const poolMode = settings?.messagePoolMode || 'random';
             const poolLastIndex = settings?.messagePoolLastIndex || 0;
             
+            console.log(`[BROADCAST] Cycle: Trying to get message from pool (mode: ${poolMode})`);
+            
             if (poolMode === 'random') {
               const poolMessage = await messageService.getRandomFromPool(broadcast.accountId);
+              console.log(`[BROADCAST] Cycle: Pool returned:`, poolMessage ? 'message found' : 'null');
               if (poolMessage) {
                 messageToSend = poolMessage.text || null;
                 storedEntities = poolMessage.entities || null;
-                console.log(`[BROADCAST] Cycle: Selected random message from pool`);
+                console.log(`[BROADCAST] Cycle: ✅ Selected random message from pool (${messageToSend?.substring(0, 50)}...)`);
+              } else {
+                console.log(`[BROADCAST] Cycle: ⚠️ Pool is empty or all messages inactive`);
               }
             } else if (poolMode === 'rotate') {
               const poolResult = await messageService.getNextFromPool(broadcast.accountId, poolLastIndex);
+              console.log(`[BROADCAST] Cycle: Pool rotate returned:`, poolResult ? 'message found' : 'null');
               if (poolResult) {
                 messageToSend = poolResult.text || null;
                 storedEntities = poolResult.entities || null;
                 // Update last index for next rotation
                 await configService.updateMessagePoolLastIndex(broadcast.accountId, poolResult.nextIndex);
-                console.log(`[BROADCAST] Cycle: Selected next message from pool (index ${poolResult.nextIndex})`);
+                console.log(`[BROADCAST] Cycle: ✅ Selected next message from pool (index ${poolResult.nextIndex})`);
+              } else {
+                console.log(`[BROADCAST] Cycle: ⚠️ Pool is empty or all messages inactive (rotate mode)`);
               }
             }
             // Sequential mode is handled per-group in sendSingleMessageToAllGroups, so we don't need to handle it here
+          } else {
+            console.log(`[BROADCAST] Cycle: Message pool disabled, using regular message`);
           }
           
           // Fall back to A/B variant message if pool is empty, not enabled, or in sequential mode
@@ -1547,24 +1577,26 @@ class AutomationService {
       }
     }
 
-    // Check if current time is within schedule window
+    // OPTIMIZATION: Check schedule and quiet hours in parallel
     // Bypass schedule if:
     // 1. This is a user-initiated initial message (bypassSchedule = true)
     // 2. OR the broadcast was manually started by user (manuallyStarted = true)
     const shouldBypassSchedule = bypassSchedule || broadcast.manuallyStarted;
     
-    if (!shouldBypassSchedule) {
-      const isWithinSchedule = await configService.isWithinSchedule(accountId);
-      if (!isWithinSchedule) {
-        console.log(`[BROADCAST] Current time is outside schedule window for account ${accountId}, skipping send`);
-        return; // Skip this send, but keep broadcast running for next scheduled time
-      }
-    } else {
+    // Run checks in parallel for better performance
+    const [isWithinSchedule, isWithinQuietHours] = await Promise.all([
+      shouldBypassSchedule ? Promise.resolve(true) : configService.isWithinSchedule(accountId),
+      configService.isWithinQuietHours(accountId)
+    ]);
+    
+    if (!shouldBypassSchedule && !isWithinSchedule) {
+      console.log(`[BROADCAST] Current time is outside schedule window for account ${accountId}, skipping send`);
+      return; // Skip this send, but keep broadcast running for next scheduled time
+    } else if (shouldBypassSchedule) {
       console.log(`[BROADCAST] Bypassing schedule check (manually started broadcast or initial message) for account ${accountId}`);
     }
 
     // Check quiet hours (always enforced, even for manually started broadcasts)
-    const isWithinQuietHours = await configService.isWithinQuietHours(accountId);
     if (isWithinQuietHours) {
       console.log(`[BROADCAST] Current time is within quiet hours for account ${accountId}, skipping send`);
       return; // Skip this send, but keep broadcast running for next scheduled time

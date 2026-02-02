@@ -575,8 +575,8 @@ function registerAdminCommands(bot) {
         return;
       }
 
-      const accounts = await db.query('SELECT * FROM accounts WHERE user_id = $1', [userId]);
-      const logs = await db.query('SELECT COUNT(*) as count FROM logs WHERE user_id = $1', [userId]);
+      const accounts = await db.query('SELECT * FROM accounts WHERE user_id = $1', [targetUserId]);
+      const logs = await db.query('SELECT COUNT(*) as count FROM logs WHERE user_id = $1', [targetUserId]);
 
       const userData = user.rows[0];
       let message = `👤 <b>User Details</b>\n\n`;

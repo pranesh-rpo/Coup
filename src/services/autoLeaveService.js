@@ -51,12 +51,6 @@ class AutoLeaveService {
             continue; // Skip this group
           }
 
-          const userId = await this.getUserIdFromAccountId(accountId);
-          if (!userId) continue;
-
-          const client = await accountLinker.getClient(userId, accountId);
-          if (!client) continue;
-
           await client.invoke(new (await import('telegram/tl/index.js')).Api.channels.LeaveChannel({
             channel: await client.getEntity(group.group_id)
           }));

@@ -113,6 +113,10 @@ class AccountLinker {
     this.passwordAttempts = new Map(); // userId -> { attempts: number, cooldownUntil: timestamp }
     // Keep-alive removed - clients connect on-demand
     this.initialized = false;
+    
+    // OPTIMIZATION: Connection locks to prevent race conditions when multiple calls
+    // try to connect the same account simultaneously
+    this.connectionLocks = new Map(); // accountId -> Promise (lock)
   }
 
   async initialize() {
@@ -216,6 +220,7 @@ class AccountLinker {
   }
 
   // Ensure client is connected (reconnect if disconnected)
+  // OPTIMIZED: Uses connection lock to prevent race conditions
   async ensureConnected(accountId) {
     const accountIdStr = accountId.toString();
     const account = this.linkedAccounts.get(accountIdStr);
@@ -229,73 +234,94 @@ class AccountLinker {
       throw new Error(`Cannot connect main account (${account.phone}). This account is used to create the bot and APIs.`);
     }
     
-    // Enhanced connection state checking with retry logic
-    if (!account.client.connected) {
-      console.log(`[CONNECTION] Connecting client for account ${accountId}...`);
-      let retries = 2; // Reduced from 3 to 2 to prevent excessive retries
-      let lastError = null;
+    // If already connected, return immediately (fast path)
+    if (account.client.connected) {
+      // Update last used timestamp
+      this.updateLastUsed(accountId);
       
-      while (retries > 0) {
-        try {
-          await account.client.connect();
-          console.log(`[CONNECTION] Connected client for account ${accountId}`);
-          // Setup auto-reply handler when client connects
-          autoReplyHandler.setupAutoReply(account.client, accountId);
-          // Update last used timestamp
-          this.updateLastUsed(accountId);
-          return account.client;
-        } catch (error) {
-          lastError = error;
-          retries--;
-          
-          const errorCode = error.code || error.errorCode;
-          const errorMessage = error.message || error.toString() || '';
-          
-          // Check for session errors (AUTH_KEY_DUPLICATED, SESSION_REVOKED, etc.)
-          const isSessionError = 
-            errorCode === 406 || // AUTH_KEY_DUPLICATED
-            errorCode === 401 || // SESSION_REVOKED
-            errorMessage.includes('AUTH_KEY_DUPLICATED') ||
-            errorMessage.includes('SESSION_REVOKED') ||
-            errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
-            error.errorMessage === 'AUTH_KEY_DUPLICATED' ||
-            error.errorMessage === 'SESSION_REVOKED' ||
-            error.errorMessage === 'AUTH_KEY_UNREGISTERED';
-          
-          if (isSessionError) {
-            console.log(`[CONNECTION] Session error (${errorCode}) for account ${accountId} - handling revocation`);
-            await this.handleSessionRevoked(accountId).catch(err => {
-              console.log(`[CONNECTION] Error handling session revocation: ${err.message}`);
-            });
-            throw error; // Don't retry on session errors
-          }
-          
-          // For other errors, wait before retry (exponential backoff with longer delays)
-          if (retries > 0) {
-            const waitTime = (3 - retries) * 3000; // 3s, 6s (increased delays)
-            console.log(`[CONNECTION] Retry ${2 - retries}/2 in ${waitTime}ms for account ${accountId}...`);
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-          }
-        }
-      }
+      // Setup auto-reply handler if not already set up
+      // This ensures handler is active whenever client is connected
+      await autoReplyHandler.setupAutoReply(account.client, accountId);
       
-      // All retries failed
-      logError(`[CONNECTION ERROR] Failed to connect account ${accountId} after 2 attempts:`, lastError);
-      throw lastError;
+      return account.client;
     }
     
-    // REMOVED: Excessive getMe() call on every check
-    // This was causing too many API calls and triggering rate limits
-    // Just trust the connected state - if it fails, we'll catch it during actual API calls
+    // OPTIMIZATION: Check if there's already a connection attempt in progress
+    // This prevents multiple simultaneous connection attempts for the same account
+    const existingLock = this.connectionLocks.get(accountIdStr);
+    if (existingLock) {
+      console.log(`[CONNECTION] Waiting for existing connection attempt for account ${accountId}...`);
+      return existingLock;
+    }
     
-    // Update last used timestamp
-    this.updateLastUsed(accountId);
+    // Create a new connection promise and store it as a lock
+    const connectionPromise = this._performConnection(accountId, account);
+    this.connectionLocks.set(accountIdStr, connectionPromise);
     
-    // Setup auto-reply handler if not already set up
-    // This ensures handler is active whenever client is connected
-    await autoReplyHandler.setupAutoReply(account.client, accountId);
+    try {
+      const result = await connectionPromise;
+      return result;
+    } finally {
+      // Always clean up the lock when done
+      this.connectionLocks.delete(accountIdStr);
+    }
+  }
+  
+  // Internal method to perform the actual connection with retries
+  async _performConnection(accountId, account) {
+    const accountIdStr = accountId.toString();
     
-    return account.client;
+    console.log(`[CONNECTION] Connecting client for account ${accountId}...`);
+    let retries = 2; // Reduced from 3 to 2 to prevent excessive retries
+    let lastError = null;
+    
+    while (retries > 0) {
+      try {
+        await account.client.connect();
+        console.log(`[CONNECTION] Connected client for account ${accountId}`);
+        // Setup auto-reply handler when client connects
+        autoReplyHandler.setupAutoReply(account.client, accountId);
+        // Update last used timestamp
+        this.updateLastUsed(accountId);
+        return account.client;
+      } catch (error) {
+        lastError = error;
+        retries--;
+        
+        const errorCode = error.code || error.errorCode;
+        const errorMessage = error.message || error.toString() || '';
+        
+        // Check for session errors (AUTH_KEY_DUPLICATED, SESSION_REVOKED, etc.)
+        const isSessionError = 
+          errorCode === 406 || // AUTH_KEY_DUPLICATED
+          errorCode === 401 || // SESSION_REVOKED
+          errorMessage.includes('AUTH_KEY_DUPLICATED') ||
+          errorMessage.includes('SESSION_REVOKED') ||
+          errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+          error.errorMessage === 'AUTH_KEY_DUPLICATED' ||
+          error.errorMessage === 'SESSION_REVOKED' ||
+          error.errorMessage === 'AUTH_KEY_UNREGISTERED';
+        
+        if (isSessionError) {
+          console.log(`[CONNECTION] Session error (${errorCode}) for account ${accountId} - handling revocation`);
+          await this.handleSessionRevoked(accountId).catch(err => {
+            console.log(`[CONNECTION] Error handling session revocation: ${err.message}`);
+          });
+          throw error; // Don't retry on session errors
+        }
+        
+        // For other errors, wait before retry (exponential backoff with longer delays)
+        if (retries > 0) {
+          const waitTime = (3 - retries) * 3000; // 3s, 6s (increased delays)
+          console.log(`[CONNECTION] Retry ${2 - retries}/2 in ${waitTime}ms for account ${accountId}...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
+    }
+    
+    // All retries failed
+    logError(`[CONNECTION ERROR] Failed to connect account ${accountId} after 2 attempts:`, lastError);
+    throw lastError;
   }
 
   async handleSessionRevoked(accountId) {

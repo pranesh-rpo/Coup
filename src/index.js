@@ -232,6 +232,7 @@ import {
   handleGroupsButton,
   handleRefreshGroups,
   handleListGroups,
+  handleAutoJoinGroups,
   handleMessagePoolButton,
   handlePoolAddMessage,
   handlePoolMessageInput,
@@ -309,7 +310,7 @@ import {
 import notificationService from './services/notificationService.js';
 import channelVerificationService from './services/channelVerificationService.js';
 import { initializeAdminBot } from './handlers/adminBotHandlers.js';
-import { createMainMenu, createBackButton } from './handlers/keyboardHandler.js';
+import { createMainMenu, createBackButton, generateStatusText } from './handlers/keyboardHandler.js';
 import express from 'express';
 import paymentVerificationService from './services/paymentVerificationService.js';
 import premiumService from './services/premiumService.js';
@@ -433,14 +434,11 @@ function checkProcessLock() {
       // Non-critical, continue startup
     }
     
-    // Auto-reply interval service disabled - using real-time mode only
-    console.log('[INIT] Auto-reply using real-time mode (interval service disabled)');
-    
-    // Start auto-reply connection manager (keeps clients connected for real-time auto-reply)
-    console.log('[INIT] Starting auto-reply connection manager...');
-    const autoReplyConnectionManager = (await import('./services/autoReplyConnectionManager.js')).default;
-    autoReplyConnectionManager.start();
-    console.log('✅ Auto-reply connection manager started');
+    // Start real-time auto-reply service (persistent connections with 2-10s delay)
+    console.log('[INIT] Starting real-time auto-reply service...');
+    const autoReplyRealtimeService = (await import('./services/autoReplyRealtimeService.js')).default;
+    await autoReplyRealtimeService.start();
+    console.log('✅ Real-time auto-reply service started (2-10s delay)');
     
     // Start periodic cleanup for stopped broadcasts (every hour)
     setInterval(() => {
@@ -677,9 +675,9 @@ bot.on('chat_member', async (msg) => {
 console.log('🤖 Bot is running with polling...');
 
 // Store pending inputs
-const pendingPhoneNumbers = new Set();
+const pendingPhoneInputs = new Map(); // userId -> { messageId } - tracks the message to edit during phone input
 const pendingStartMessages = new Set();
-const pendingPasswords = new Set();
+const pendingPasswords = new Map(); // userId -> { messageId } - tracks the message to edit during 2FA
 const pendingQuietHoursInputs = new Map(); // userId -> { accountId, messageId }
 const pendingScheduleInputs = new Map(); // userId -> { accountId, messageId }
 const pendingCustomIntervalInputs = new Map(); // userId -> { accountId, messageId }
@@ -711,8 +709,8 @@ async function safeDeleteMessage(chatId, messageId) {
 function clearConflictingPendingStates(userId, excludeState = null) {
   const cleared = [];
   
-  if (excludeState !== 'phone' && pendingPhoneNumbers.has(userId)) {
-    pendingPhoneNumbers.delete(userId);
+  if (excludeState !== 'phone' && pendingPhoneInputs.has(userId)) {
+    pendingPhoneInputs.delete(userId);
     cleared.push('phone');
   }
   if (excludeState !== 'startMessage' && pendingStartMessages.has(userId)) {
@@ -762,7 +760,7 @@ function clearConflictingPendingStates(userId, excludeState = null) {
 }
 
 // Set the reference in commandHandler so it can set pending state when redirecting to link
-setPendingPhoneNumbersReference(pendingPhoneNumbers);
+setPendingPhoneNumbersReference(pendingPhoneInputs);
 
 // Pending state timeout (5 minutes)
 const PENDING_STATE_TIMEOUT = 5 * 60 * 1000;
@@ -980,23 +978,24 @@ bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
     
     // Track messages sent in the last minute
     const messageTimestamps = [];
-    const now = Date.now();
-    const oneMinuteAgo = now - 60000;
 
     // Send message to each user with proper rate limiting
     for (const targetUserId of userIds) {
       try {
-        // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+        // FIXED: Recalculate timestamps each iteration to get accurate rate limiting
+        const currentTime = Date.now();
+        const oneMinuteAgo = currentTime - 60000;
+        
+        // Clean up old timestamps and check rate limit
         const recentMessages = messageTimestamps.filter(ts => ts > oneMinuteAgo);
         if (recentMessages.length >= MAX_MESSAGES_PER_MINUTE) {
           // Calculate wait time until oldest message is 1 minute old
           const oldestMessage = Math.min(...recentMessages);
-          const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+          const waitTime = 60000 - (currentTime - oldestMessage) + 1000; // Add 1 second buffer
           console.log(`[ADMIN_BROADCAST] Rate limit reached (${recentMessages.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
-          // Update timestamps after waiting
-          const newNow = Date.now();
-          const newOneMinuteAgo = newNow - 60000;
+          // Update timestamps after waiting - remove old entries
+          const newOneMinuteAgo = Date.now() - 60000;
           messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
         }
 
@@ -1159,23 +1158,24 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
     
     // Track messages sent in the last minute
     const messageTimestamps = [];
-    const now = Date.now();
-    const oneMinuteAgo = now - 60000;
 
     // Send message to each user with proper rate limiting
     for (const targetUserId of userIds) {
       try {
-        // Check rate limit: don't exceed MAX_MESSAGES_PER_MINUTE
+        // FIXED: Recalculate timestamps each iteration to get accurate rate limiting
+        const currentTime = Date.now();
+        const oneMinuteAgo = currentTime - 60000;
+        
+        // Clean up old timestamps and check rate limit
         const recentMessages = messageTimestamps.filter(ts => ts > oneMinuteAgo);
         if (recentMessages.length >= MAX_MESSAGES_PER_MINUTE) {
           // Calculate wait time until oldest message is 1 minute old
           const oldestMessage = Math.min(...recentMessages);
-          const waitTime = 60000 - (now - oldestMessage) + 1000; // Add 1 second buffer
+          const waitTime = 60000 - (currentTime - oldestMessage) + 1000; // Add 1 second buffer
           console.log(`[ADMIN_BROADCAST] Rate limit reached (${recentMessages.length}/${MAX_MESSAGES_PER_MINUTE} messages in last minute). Waiting ${(waitTime / 1000).toFixed(1)}s...`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
-          // Update timestamps after waiting
-          const newNow = Date.now();
-          const newOneMinuteAgo = newNow - 60000;
+          // Update timestamps after waiting - remove old entries
+          const newOneMinuteAgo = Date.now() - 60000;
           messageTimestamps.splice(0, messageTimestamps.length, ...messageTimestamps.filter(ts => ts > newOneMinuteAgo));
         }
 
@@ -1194,30 +1194,30 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
           console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId} after retries`);
           logger.logError('ADMIN_BROADCAST', targetUserId, new Error('Failed after retries'), `Failed to resend broadcast to user ${targetUserId}`);
         }
-        } catch (error) {
-          failedCount++;
-          
-          // CRITICAL: Check if user blocked the bot
-          const errorMessage = error.message || error.toString() || '';
-          const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
-          const isBotBlocked = errorMessage.includes('bot was blocked') ||
-                              errorMessage.includes('bot blocked') ||
-                              errorMessage.includes('BLOCKED') ||
-                              errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden')) ||
-                              errorMessage.includes('chat not found');
-          
-          if (isBotBlocked) {
-            // CRITICAL: Mark user as blocked to prevent future sends
-            automationService.blockedUsers.set(targetUserId, {
-              blocked: true,
-              lastChecked: Date.now()
-            });
-            console.log(`[ADMIN_BROADCAST] User ${targetUserId} has blocked the bot - added to blocked list`);
-          }
-          
-          console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId}: ${error.message}`);
-          logger.logError('ADMIN_BROADCAST', targetUserId, error, `Failed to resend broadcast to user ${targetUserId}`);
+      } catch (error) {
+        failedCount++;
+        
+        // CRITICAL: Check if user blocked the bot
+        const errorMessage = error.message || error.toString() || '';
+        const errorCode = error.code || error.errorCode || error.response?.error_code || 'N/A';
+        const isBotBlocked = errorMessage.includes('bot was blocked') ||
+                            errorMessage.includes('bot blocked') ||
+                            errorMessage.includes('BLOCKED') ||
+                            errorCode === 403 && (errorMessage.includes('blocked') || errorMessage.includes('forbidden')) ||
+                            errorMessage.includes('chat not found');
+        
+        if (isBotBlocked) {
+          // CRITICAL: Mark user as blocked to prevent future sends
+          automationService.blockedUsers.set(targetUserId, {
+            blocked: true,
+            lastChecked: Date.now()
+          });
+          console.log(`[ADMIN_BROADCAST] User ${targetUserId} has blocked the bot - added to blocked list`);
         }
+        
+        console.log(`[ADMIN_BROADCAST] Failed to resend to user ${targetUserId}: ${error.message}`);
+        logger.logError('ADMIN_BROADCAST', targetUserId, error, `Failed to resend broadcast to user ${targetUserId}`);
+      }
 
       // CRITICAL: Wait at least MIN_DELAY_BETWEEN_MESSAGES between messages to avoid rate limits
       // This ensures we never exceed Telegram's rate limits
@@ -1534,82 +1534,113 @@ bot.on('message', async (msg) => {
   
   // Log all incoming messages for debugging
   console.log(`[MESSAGE HANDLER] User ${userId} sent message: "${msg.text?.substring(0, 50) || 'non-text'}"`);
-  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneNumbers.has(userId)}, Password: ${pendingPasswords.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}, CustomInterval: ${pendingCustomIntervalInputs.has(userId)}, BlacklistSearch: ${pendingBlacklistSearchInputs.has(userId)}`);
+  console.log(`[MESSAGE HANDLER] Pending states - Phone: ${pendingPhoneInputs.has(userId)}, Password: ${pendingPasswords.has(userId)}, QuietHours: ${pendingQuietHoursInputs.has(userId)}, Schedule: ${pendingScheduleInputs.has(userId)}, CustomInterval: ${pendingCustomIntervalInputs.has(userId)}, BlacklistSearch: ${pendingBlacklistSearchInputs.has(userId)}`);
   
   // Handle contact sharing (phone number via button)
   if (msg.contact && msg.contact.phone_number) {
     const phoneNumber = msg.contact.phone_number;
-    // Ensure phone number has + prefix
     const normalizedPhone = phoneNumber.startsWith('+') ? phoneNumber : `+${phoneNumber}`;
     logger.logChange('PHONE_SHARE', userId, 'Phone number shared via contact button');
     
-    // Remove the keyboard
-    await bot.sendMessage(chatId, '✅ Phone number received! Processing...', {
-      reply_markup: {
-        remove_keyboard: true,
-      },
-    });
+    // Get stored message IDs
+    const pendingData = pendingPhoneInputs.get(userId);
+    pendingPhoneInputs.delete(userId);
     
-    await handlePhoneNumber(bot, msg, normalizedPhone);
+    // Delete the user's contact share message
+    await safeDeleteMessage(chatId, msg.message_id);
+    
+    // Delete the keyboard message
+    if (pendingData?.keyboardMsgId) {
+      await safeDeleteMessage(chatId, pendingData.keyboardMsgId);
+    }
+    
+    // Remove keyboard with temp message (needed because user tapped share button)
+    const tempMsg = await bot.sendMessage(chatId, '⏳', { reply_markup: { remove_keyboard: true } });
+    await safeDeleteMessage(chatId, tempMsg.message_id);
+    
+    // Pass the status message ID to edit it instead of creating new messages
+    await handlePhoneNumber(bot, msg, normalizedPhone, pendingData?.statusMsgId);
     return;
   }
   
-  if (pendingPhoneNumbers.has(userId)) {
-    pendingPhoneNumbers.delete(userId);
+  if (pendingPhoneInputs.has(userId)) {
+    const pendingData = pendingPhoneInputs.get(userId);
+    pendingPhoneInputs.delete(userId);
     
     // SECURITY: Sanitize and validate phone number input
     const rawPhoneNumber = msg.text?.trim() || '';
-    const sanitizedPhone = sanitizeString(rawPhoneNumber, 20); // Max 20 chars for phone
+    const sanitizedPhone = sanitizeString(rawPhoneNumber, 20);
     
-    // Strip all spaces, dashes, parentheses, and other formatting characters
-    // Users might type "+1 234 567 8900", "+1-234-567-8900", or "(+1) 234 567 8900"
+    // Strip formatting characters
     let phoneNumber = sanitizedPhone.replace(/[\s\-\(\)\.]/g, '');
     
-    // If phone number doesn't start with +, try to add it
-    // Some users might enter "1234567890" or "1 234 567 8900"
+    // Add + prefix if missing
     if (phoneNumber && !phoneNumber.startsWith('+')) {
-      // If it starts with a digit, add +
       if (/^\d/.test(phoneNumber)) {
         phoneNumber = '+' + phoneNumber;
       }
     }
     
-    // Validate phone number format (E.164: + followed by 1-15 digits, first digit after + should be 1-9)
+    // Delete user's phone number input message for privacy
+    await safeDeleteMessage(chatId, msg.message_id);
+    
+    // Delete the keyboard message
+    if (pendingData?.keyboardMsgId) {
+      await safeDeleteMessage(chatId, pendingData.keyboardMsgId);
+    }
+    
+    // Remove keyboard with temp message
+    const tempMsg = await bot.sendMessage(chatId, '⏳', { reply_markup: { remove_keyboard: true } });
+    await safeDeleteMessage(chatId, tempMsg.message_id);
+    
+    // Validate phone number format
     const phoneRegex = /^\+[1-9]\d{1,14}$/;
     if (phoneNumber && phoneRegex.test(phoneNumber)) {
-      await handlePhoneNumber(bot, msg, phoneNumber);
+      // Pass the status message ID to edit instead of creating new messages
+      await handlePhoneNumber(bot, msg, phoneNumber, pendingData?.statusMsgId);
     } else {
-      // Provide more helpful error message
-      let errorMsg = '❌ Invalid phone number format.\n\n';
+      // Invalid format - show error on the status message
+      let errorMsg = '❌ <b>Invalid phone number format</b>\n\n';
       errorMsg += 'Please use international format:\n';
       errorMsg += '• Must start with +\n';
       errorMsg += '• Followed by country code and number\n';
-      errorMsg += '• Examples: +1234567890, +1 234 567 8900, +919876543210\n\n';
-      errorMsg += 'Your input: ' + (msg.text || 'empty') + '\n\n';
-      errorMsg += 'Try the "Link Account" button again.';
+      errorMsg += '• Examples: <code>+1234567890</code>, <code>+919876543210</code>';
       
-      await bot.sendMessage(
-        chatId,
-        errorMsg,
-        { parse_mode: 'HTML', ...createMainMenu() }
-      );
+      if (pendingData?.statusMsgId) {
+        await bot.editMessageText(errorMsg, {
+          chat_id: chatId,
+          message_id: pendingData.statusMsgId,
+          parse_mode: 'HTML',
+          ...createMainMenu()
+        }).catch(() => {});
+      } else {
+        await bot.sendMessage(chatId, errorMsg, { parse_mode: 'HTML', ...createMainMenu() });
+      }
     }
   } else if (pendingPasswords.has(userId) || accountLinker.isPasswordRequired(userId)) {
-    // Only remove from pendingPasswords if password is successfully verified
-    // Keep it if verification fails so user can retry
+    // Get stored data (message ID to edit)
+    const pendingData = pendingPasswords.get(userId);
     const password = msg.text?.trim();
+    
+    // Delete user's password message for security
+    await safeDeleteMessage(chatId, msg.message_id);
+    
     if (password) {
-      const result = await handlePasswordInput(bot, msg, password);
+      const result = await handlePasswordInput(bot, msg, password, pendingData?.messageId);
       // Only remove pending state if password was successful or max attempts/cooldown reached
       if (result && (result.success || result.maxAttemptsReached)) {
         pendingPasswords.delete(userId);
       }
     } else {
-      await bot.sendMessage(
-        chatId,
-        '❌ Please provide a valid password.\n\nTry the "Link Account" button again.',
-        createMainMenu()
-      );
+      // Edit existing message to show error
+      if (pendingData?.messageId) {
+        await bot.editMessageText(
+          '❌ Please provide a valid password.\n\nTry the "Link Account" button again.',
+          { chat_id: chatId, message_id: pendingData.messageId, ...createMainMenu() }
+        ).catch(() => {});
+      } else {
+        await bot.sendMessage(chatId, '❌ Please provide a valid password.\n\nTry the "Link Account" button again.', createMainMenu());
+      }
       // Don't remove pending state for invalid input, allow retry
     }
   } else if (accountLinker.isWebLoginPasswordRequired(userId)) {
@@ -1618,17 +1649,20 @@ bot.on('message', async (msg) => {
     const password = msg.text?.trim();
     
     if (password) {
+      // Delete user's password message for security
+      await safeDeleteMessage(chatId, msg.message_id);
       // User sent password, handle it
-      await handlePasswordInput(bot, msg, password);
+      const pendingData = pendingPasswords.get(userId);
+      await handlePasswordInput(bot, msg, password, pendingData?.messageId);
     } else if (notification && !notification.notified) {
       // Notify user that 2FA password is needed (only once)
-      await bot.sendMessage(
+      const pwMsg = await bot.sendMessage(
         notification.chatId,
         '🔐 <b>2FA Password Required</b>\n\n🔒 Your account has two-factor authentication enabled.\n\nPlease enter your 2FA password to complete the login:',
         { parse_mode: 'HTML' }
       );
       accountLinker.markWebLoginPasswordNotified(userId);
-      addPendingStateWithTimeout(pendingPasswords, userId);
+      addPendingStateWithTimeout(pendingPasswords, userId, { messageId: pwMsg.message_id });
     }
   } else if (pendingQuietHoursInputs.has(userId)) {
     const pendingData = pendingQuietHoursInputs.get(userId);
@@ -1837,14 +1871,17 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data.startsWith('otp_')) {
       const result = await handleOTPCallback(bot, callbackQuery);
       if (result === true) {
-        addPendingStateWithTimeout(pendingPasswords, userId);
+        // Store the message ID so we can edit it during password input
+        addPendingStateWithTimeout(pendingPasswords, userId, { 
+          messageId: callbackQuery.message.message_id 
+        });
         logger.logChange('PASSWORD_AUTH', userId, 'Password authentication required');
       }
     } else if (data === 'btn_main_menu') {
       // Clear all pending states when returning to main menu
       // userId is already declared above, no need to redeclare
-      if (pendingPhoneNumbers.has(userId)) {
-        pendingPhoneNumbers.delete(userId);
+      if (pendingPhoneInputs.has(userId)) {
+        pendingPhoneInputs.delete(userId);
         console.log(`[CALLBACK] Cleared pending phone number state for user ${userId}`);
       }
       if (pendingStartMessages.has(userId)) {
@@ -1875,8 +1912,12 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_link') {
       clearConflictingPendingStates(userId, 'phone');
       const result = await handleLinkButton(bot, callbackQuery);
-      if (result) {
-        addPendingStateWithTimeout(pendingPhoneNumbers, userId);
+      if (result && result.statusMsgId) {
+        // Store message IDs for editing during phone input flow
+        addPendingStateWithTimeout(pendingPhoneInputs, userId, { 
+          statusMsgId: result.statusMsgId, 
+          keyboardMsgId: result.keyboardMsgId 
+        });
         logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
       }
     } else if (data === 'btn_login_share_phone') {
@@ -1884,8 +1925,11 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_login_type_phone') {
       clearConflictingPendingStates(userId, 'phone');
       const result = await handleLoginTypePhone(bot, callbackQuery);
-      if (result) {
-        addPendingStateWithTimeout(pendingPhoneNumbers, userId);
+      if (result && result.statusMsgId) {
+        addPendingStateWithTimeout(pendingPhoneInputs, userId, {
+          statusMsgId: result.statusMsgId,
+          keyboardMsgId: result.keyboardMsgId
+        });
         logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
       }
     } else if (data === 'btn_login_cancel') {
@@ -1925,6 +1969,8 @@ bot.on('callback_query', async (callbackQuery) => {
       await handleRefreshGroups(bot, callbackQuery);
     } else if (data === 'btn_list_groups') {
       await handleListGroups(bot, callbackQuery);
+    } else if (data === 'btn_auto_join_groups') {
+      await handleAutoJoinGroups(bot, callbackQuery);
     } else if (data === 'btn_config') {
       await handleConfigButton(bot, callbackQuery);
     } else if (data === 'btn_mention') {

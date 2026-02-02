@@ -280,25 +280,25 @@ class PremiumService {
    */
   async getStatistics() {
     try {
-      const active = await db.query(
-        `SELECT COUNT(*) as count FROM premium_subscriptions 
-         WHERE status = 'active' AND expires_at > CURRENT_TIMESTAMP`
-      );
-      
-      const expired = await db.query(
-        `SELECT COUNT(*) as count FROM premium_subscriptions 
-         WHERE status = 'expired' OR expires_at < CURRENT_TIMESTAMP`
-      );
-      
-      const cancelled = await db.query(
-        `SELECT COUNT(*) as count FROM premium_subscriptions 
-         WHERE status = 'cancelled'`
-      );
-      
-      const totalRevenue = await db.query(
-        `SELECT SUM(amount) as total FROM premium_subscriptions 
-         WHERE status = 'active' OR (status = 'expired' AND expires_at > datetime('now', '-30 days'))`
-      );
+      // Run all queries in parallel for better performance
+      const [active, expired, cancelled, totalRevenue] = await Promise.all([
+        db.query(
+          `SELECT COUNT(*) as count FROM premium_subscriptions 
+           WHERE status = 'active' AND expires_at > CURRENT_TIMESTAMP`
+        ),
+        db.query(
+          `SELECT COUNT(*) as count FROM premium_subscriptions 
+           WHERE status = 'expired' OR expires_at < CURRENT_TIMESTAMP`
+        ),
+        db.query(
+          `SELECT COUNT(*) as count FROM premium_subscriptions 
+           WHERE status = 'cancelled'`
+        ),
+        db.query(
+          `SELECT SUM(amount) as total FROM premium_subscriptions 
+           WHERE status = 'active' OR (status = 'expired' AND expires_at > datetime('now', '-30 days'))`
+        )
+      ]);
 
       return {
         active: parseInt(active.rows[0].count) || 0,

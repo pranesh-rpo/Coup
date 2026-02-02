@@ -161,7 +161,7 @@ export async function createMainMenu(userId = null) {
         broadcastButton,
         
         // ═══ SUPPORT ═══
-        [{ text: '💭 Support', url: 'https://t.me/CoupSupportBot' }],
+        [{ text: '💭 Support', url: 'https://t.me/CoupSupBot' }],
       ],
     },
   };

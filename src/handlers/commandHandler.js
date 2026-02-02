@@ -4494,7 +4494,7 @@ export async function handlePremium(bot, callbackQuery) {
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
-              [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupportBot' }],
+              [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupBot' }],
               [{ text: '← Back', callback_data: 'btn_main_menu' }]
             ]
           }
@@ -4555,7 +4555,7 @@ A: Currently manual renewal. We'll notify you before expiry.
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupportBot' }],
+          [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupBot' }],
           [{ text: '🔙 Back to Premium', callback_data: 'btn_premium' }]
         ]
       }
@@ -4624,7 +4624,7 @@ Start broadcasting immediately:
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupportBot' }],
+          [{ text: '💬 Contact Support', url: 'https://t.me/CoupSupBot' }],
           [{ text: '🔙 Back to Premium', callback_data: 'btn_premium' }]
         ]
       }

@@ -111,12 +111,12 @@ export function initializeAdminBot(mainBotInstance = null) {
         autoStart: false, // We'll start after deleting webhook
         interval: 300,
         params: {
-          timeout: 10,
+          timeout: 60, // Increased from 10 to 60 seconds to prevent timeout errors
           allowed_updates: ['message', 'callback_query']
         }
       },
       request: {
-        timeout: 90000, // 90 seconds timeout for requests (increased from 60s to handle slow networks)
+        timeout: 120000, // Increased from 90s to 120 seconds timeout for requests to handle slow networks
         agentOptions: {
           keepAlive: true,
           keepAliveMsecs: 10000
@@ -434,7 +434,8 @@ function registerAdminCommands(bot) {
         message += `${i + 1}. <b>${user.first_name || 'Unknown'}</b> (${username})\n`;
         message += `   ID: <code>${user.user_id}</code>\n`;
         message += `   Verified: ${user.is_verified ? '✅' : '❌'}\n`;
-        message += `   Joined: ${new Date(user.joined_at).toLocaleString()}\n\n`;
+        const joinedDate = new Date(user.joined_at);
+        message += `   Joined: ${joinedDate.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n`;
       });
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
@@ -472,7 +473,8 @@ function registerAdminCommands(bot) {
         message += `   User ID: <code>${account.user_id}</code>\n`;
         message += `   Active: ${account.is_active ? '✅' : '❌'}\n`;
         message += `   Broadcasting: ${account.is_broadcasting ? '📢' : '⏸️'}\n`;
-        message += `   Created: ${new Date(account.created_at).toLocaleString()}\n\n`;
+        const createdDate = new Date(account.created_at);
+        message += `   Created: ${createdDate.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n`;
       }
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
@@ -536,7 +538,7 @@ function registerAdminCommands(bot) {
 
       let message = `📋 <b>Recent Logs</b> (Last 10)\n\n`;
       logs.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString();
+        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
         const status = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : 'ℹ️';
         message += `${status} <b>${time}</b>\n`;
         message += `${log.message.substring(0, 80)}${log.message.length > 80 ? '...' : ''}\n\n`;
@@ -569,7 +571,7 @@ function registerAdminCommands(bot) {
 
       let message = `❌ <b>Recent Errors</b> (Last 10)\n\n`;
       errors.rows.forEach((error, i) => {
-        const time = new Date(error.timestamp).toLocaleString();
+        const time = new Date(error.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
         message += `${i + 1}. <b>${time}</b>\n`;
         message += `<code>${error.message.substring(0, 100)}${error.message.length > 100 ? '...' : ''}</code>\n\n`;
       });
@@ -624,7 +626,8 @@ function registerAdminCommands(bot) {
       message += `Username: @${userData.username || 'N/A'}\n`;
       message += `Name: ${userData.first_name || 'N/A'}\n`;
       message += `Verified: ${userData.is_verified ? '✅' : '❌'}\n`;
-      message += `Joined: ${new Date(userData.joined_at).toLocaleString()}\n\n`;
+      const joinedDate = new Date(userData.joined_at);
+      message += `Joined: ${joinedDate.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n`;
       message += `Accounts: ${accounts.rows.length}\n`;
       message += `Log Entries: ${logs.rows[0]?.count || 0}`;
 
@@ -751,7 +754,8 @@ function registerAdminCommands(bot) {
       message += `Phone: ${accountData.phone || 'N/A'}\n`;
       message += `Active: ${accountData.is_active ? '✅' : '❌'}\n`;
       message += `Broadcasting: ${isBroadcasting ? '📢 Yes' : '⏸️ No'}\n`;
-      message += `Created: ${new Date(accountData.created_at).toLocaleString()}\n\n`;
+      const createdDate = new Date(accountData.created_at);
+      message += `Created: ${createdDate.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n\n`;
       message += `Active Groups: ${groups.rows[0]?.count || 0}\n`;
       message += `Log Entries: ${logs.rows[0]?.count || 0}`;
 
@@ -900,7 +904,7 @@ function registerAdminCommands(bot) {
       const seconds = Math.floor(uptime % 60);
 
       const uptimeMessage = `⏱️ <b>Uptime Information</b>\n\n` +
-        `Started: ${startTime.toLocaleString()}\n` +
+        `Started: ${startTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n` +
         `Uptime: ${days} days, ${hours} hours, ${minutes} minutes, ${seconds} seconds\n` +
         `Total Seconds: ${Math.floor(uptime)}`;
 
@@ -931,7 +935,7 @@ function registerAdminCommands(bot) {
 
       let message = `❌ <b>Error Logs</b> (Last 20)\n\n`;
       errors.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString();
+        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
         message += `${i + 1}. <b>${time}</b>\n`;
         message += `Account: ${log.account_id || 'N/A'}\n`;
         message += `<code>${log.message.substring(0, 100)}${log.message.length > 100 ? '...' : ''}</code>\n\n`;
@@ -964,7 +968,7 @@ function registerAdminCommands(bot) {
 
       let message = `✅ <b>Success Logs</b> (Last 20)\n\n`;
       logs.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString();
+        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
         message += `${i + 1}. <b>${time}</b>\n`;
         message += `Account: ${log.account_id || 'N/A'}\n`;
         message += `${log.message.substring(0, 80)}${log.message.length > 80 ? '...' : ''}\n\n`;

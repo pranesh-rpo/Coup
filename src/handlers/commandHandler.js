@@ -19,6 +19,7 @@ import { safeBotApiCall } from '../utils/floodWaitHandler.js';
 import { escapeHtml, stripHtmlTags } from '../utils/textHelpers.js';
 import { Api } from 'telegram/tl/index.js';
 import db from '../database/db.js';
+import { getUserFriendlyErrorMessage } from '../utils/security.js';
 
 // Store reference to pending phone numbers Map/Set for setting pending state
 // This will be set by index.js (currently a Map: userId -> { messageId })
@@ -526,14 +527,6 @@ export async function handleLinkButton(bot, callbackQuery) {
   return { statusMsgId: originalMsgId, keyboardMsgId: keyboardMsg.message_id };
 }
 
-// Legacy handlers - redirect to unified flow
-export async function handleLoginSharePhone(bot, callbackQuery) {
-  return await handleLinkButton(bot, callbackQuery);
-}
-
-export async function handleSharePhoneConfirm(bot, callbackQuery) {
-  return await handleLinkButton(bot, callbackQuery);
-}
 
 export async function handleLoginTypePhone(bot, callbackQuery) {
   return await handleLinkButton(bot, callbackQuery);
@@ -646,36 +639,8 @@ export async function handlePhoneNumber(bot, msg, phoneNumber, processingMsgId =
       
       // Try to edit the status message, or send new one if it fails
       try {
-        let errorMessage = `❌ <b>Account Linking Failed</b>\n\n`;
-        errorMessage += `<b>Error:</b> ${result.error}\n\n`;
-        
-        // Add helpful guidance based on error type
-        if (result.error.includes('Too many failed password attempts') || result.error.includes('wait') && result.error.includes('minute')) {
-          // Cooldown message - already has wait time, just add context
-          errorMessage += `🔒 <b>Security Cooldown:</b> This prevents too many login attempts.\n\n`;
-        } else if (result.error.includes('PHONE_PASSWORD_FLOOD') || (result.error.includes('FLOOD') && result.error.includes('PASSWORD'))) {
-          errorMessage += `⏳ <b>Rate Limited:</b> Too many login attempts detected.\n\n`;
-          errorMessage += `🔒 <b>Security Protection:</b> Telegram has temporarily restricted login attempts for this phone number.\n\n`;
-          errorMessage += `⏰ <b>Please wait:</b> 10-15 minutes before trying again.\n\n`;
-          errorMessage += `💡 <b>Tip:</b> This is a security measure to prevent unauthorized access.`;
-        } else if (result.error.includes('PHONE') || result.error.includes('phone')) {
-          if (result.error.includes('PHONE_NUMBER_INVALID') || result.error.includes('invalid')) {
-            errorMessage += `📱 <b>Invalid Phone Number:</b> The phone number format is incorrect.\n\n`;
-            errorMessage += `Please ensure:\n`;
-            errorMessage += `• Phone number starts with + (e.g., +1234567890)\n`;
-            errorMessage += `• Includes country code (e.g., +1 for US, +91 for India)\n`;
-            errorMessage += `• No spaces, dashes, or special characters\n`;
-            errorMessage += `• Valid format: <code>+1234567890</code>\n\n`;
-          } else {
-            errorMessage += `📱 <b>Phone Number Error:</b> ${result.error}\n\n`;
-          }
-        } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
-          errorMessage += `⏳ <b>Rate Limited:</b> Too many requests. Please wait a few minutes before trying again.\n\n`;
-        } else if (result.error.includes('invalid') || result.error.includes('Invalid')) {
-          errorMessage += `❌ <b>Invalid Input:</b> ${result.error}\n\n`;
-        }
-        
-        errorMessage += `Click "🔗 Link Account" to try again.`;
+        // Use generic error message - don't expose technical details
+        const errorMessage = `❌ <b>Account Linking Failed</b>\n\n${getUserFriendlyErrorMessage()}\n\nClick "🔗 Link Account" to try again.`;
         
         await bot.editMessageText(
           errorMessage,
@@ -689,7 +654,7 @@ export async function handlePhoneNumber(bot, msg, phoneNumber, processingMsgId =
       } catch (editError) {
         await bot.sendMessage(
           chatId,
-          `❌ <b>Account Linking Failed</b>\n\n<b>Error:</b> ${result.error}\n\nPlease try again using the "Link Account" button.`,
+          `❌ <b>Account Linking Failed</b>\n\n${getUserFriendlyErrorMessage()}\n\nPlease try again using the "Link Account" button.`,
           { parse_mode: 'HTML', ...await createMainMenu(userId) }
         );
       }
@@ -708,7 +673,7 @@ export async function handlePhoneNumber(bot, msg, phoneNumber, processingMsgId =
     try {
       await bot.sendMessage(
         chatId,
-        `❌ <b>Account Linking Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
+        `❌ <b>Account Linking Error</b>\n\n${getUserFriendlyErrorMessage()}\n\nClick "🔗 Link Account" to retry.`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
     } catch (sendError) {
@@ -813,12 +778,12 @@ export async function handleOTPCallback(bot, callbackQuery) {
       // Clear the OTP code so user can enter a new one
       otpHandler.clearOTP(userId);
       
-      // Provide helpful error message
-      let errorText = `❌ Invalid Code\n\n${verifyResult.error}`;
-      if (verifyResult.error.includes('code') || verifyResult.error.includes('invalid')) {
-        errorText = `❌ Invalid Code\n\nThe code you entered is incorrect. Please try again.`;
-      } else if (verifyResult.error.includes('expired') || verifyResult.error.includes('timeout')) {
+      // Provide helpful error message (don't expose technical details)
+      let errorText = `❌ Invalid Code\n\nThe code you entered is incorrect. Please try again.`;
+      if (verifyResult.error && (verifyResult.error.includes('expired') || verifyResult.error.includes('timeout'))) {
         errorText = `❌ Code Expired\n\nThe verification code has expired. Please request a new code.`;
+      } else if (verifyResult.error && verifyResult.error.includes('Rate limited')) {
+        errorText = `❌ Rate Limited\n\n${verifyResult.error}`;
       }
       
       await safeAnswerCallback(bot, callbackQuery.id, {
@@ -827,10 +792,29 @@ export async function handleOTPCallback(bot, callbackQuery) {
       });
       
       // Show error message and OTP keypad again so user can enter a new code
+      const errorMsg = verifyResult.error || '';
       let errorMessage = `❌ <b>Verification Failed</b>\n\n`;
-      if (verifyResult.error.includes('code') || verifyResult.error.includes('invalid')) {
+      
+      if (errorMsg && (errorMsg.includes('code') || errorMsg.includes('invalid'))) {
         errorMessage += `The code you entered is incorrect.\n\n`;
-      } else if (verifyResult.error.includes('expired') || verifyResult.error.includes('timeout')) {
+        errorMessage += `Please enter the correct code using the keypad below:`;
+        
+        // Clear OTP and show fresh keypad for retry
+        otpHandler.clearOTP(userId);
+        
+        // Show OTP keypad again so user can enter a new code
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          errorMessage,
+          { 
+            parse_mode: 'HTML',
+            reply_markup: createOTPKeypad('').reply_markup
+          }
+        );
+        return false;
+      } else if (errorMsg && (errorMsg.includes('expired') || errorMsg.includes('timeout'))) {
         errorMessage += `The verification code has expired.\n\n`;
         errorMessage += `Please click "🔗 Link Account" to request a new code.`;
         await safeEditMessage(
@@ -850,26 +834,26 @@ export async function handleOTPCallback(bot, callbackQuery) {
         );
         return false;
       } else {
-        errorMessage += `<b>Error:</b> ${verifyResult.error}\n\n`;
+        // Use generic error message for other errors
+        errorMessage += `An error occurred. Please try again.\n\n`;
+        errorMessage += `Please enter the correct code using the keypad below:`;
+        
+        // Clear OTP and show fresh keypad for retry
+        otpHandler.clearOTP(userId);
+        
+        // Show OTP keypad again so user can enter a new code
+        await safeEditMessage(
+          bot,
+          chatId,
+          callbackQuery.message.message_id,
+          errorMessage,
+          { 
+            parse_mode: 'HTML',
+            reply_markup: createOTPKeypad('').reply_markup
+          }
+        );
+        return false;
       }
-      
-      errorMessage += `Please enter the correct code using the keypad below:`;
-      
-      // Clear OTP and show fresh keypad for retry
-      otpHandler.clearOTP(userId);
-      
-      // Show OTP keypad again so user can enter a new code
-      await safeEditMessage(
-        bot,
-        chatId,
-        callbackQuery.message.message_id,
-        errorMessage,
-        { 
-          parse_mode: 'HTML',
-          reply_markup: createOTPKeypad('').reply_markup
-        }
-      );
-      return false;
     }
   } else if (result.action === 'ignore') {
     // User clicked on display area - just acknowledge
@@ -1071,11 +1055,7 @@ export async function handleSetStartMessage(bot, msg) {
     console.log(`[handleSetStartMessage] User ${userId} successfully set message, returning true`);
     return true; // Success - clear pending state
   } else {
-    let errorMessage = `❌ <b>Failed to Save Message</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-    if (result.error.includes('database') || result.error.includes('Database')) {
-    } else {
-    }
-    errorMessage += `Your message is still saved - you can retry.`;
+    const errorMessage = `❌ <b>Failed to Save Message</b>\n\n${getUserFriendlyErrorMessage()}\n\nYour message is still saved - you can retry.`;
     
     await bot.sendMessage(
       chatId,
@@ -1207,13 +1187,9 @@ export async function handlePasswordInput(bot, msg, password, statusMsgId = null
         const attempts = result.attempts !== undefined ? result.attempts : 1;
         
         // Try to edit the status message, or send new one if it fails
-        let errorMessage = `❌ <b>Password Verification Failed</b>\n\n<b>Error:</b> ${result.error}\n\n`;
+        let errorMessage = `❌ <b>Password Verification Failed</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
         errorMessage += `⚠️ <b>Attempts:</b> ${attempts}/3\n`;
         errorMessage += `🔄 <b>Remaining:</b> ${remainingAttempts} ${remainingAttempts === 1 ? 'try' : 'tries'}\n\n`;
-        
-        if (result.error.includes('password') || result.error.includes('incorrect')) {
-        } else if (result.error.includes('FLOOD') || result.error.includes('rate')) {
-        }
         
         if (remainingAttempts > 0) {
           errorMessage += `Please try entering your password again.`;
@@ -1239,13 +1215,13 @@ export async function handlePasswordInput(bot, msg, password, statusMsgId = null
     // Edit message with error
     if (msgId) {
       await bot.editMessageText(
-        `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
+        `❌ <b>Password Verification Error</b>\n\n${getUserFriendlyErrorMessage()}\n\nClick "🔗 Link Account" to retry.`,
         { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...await createMainMenu(userId) }
       ).catch(() => {});
     } else {
       await bot.sendMessage(
         chatId,
-        `❌ <b>Password Verification Error</b>\n\n<b>Error:</b> ${error.message}\n\nClick "🔗 Link Account" to retry.`,
+        `❌ <b>Password Verification Error</b>\n\n${getUserFriendlyErrorMessage()}\n\nClick "🔗 Link Account" to retry.`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       ).catch(() => {});
     }
@@ -1805,7 +1781,7 @@ export async function handleSetStartMessageButton(bot, callbackQuery) {
       bot,
       chatId,
       callbackQuery.message.message_id,
-      `❌ <b>Error</b>\n\nFailed to set message from Saved Messages: ${error.message}\n\nPlease make sure you have sent a message to Saved Messages first.`,
+      `❌ <b>Error</b>\n\n${getUserFriendlyErrorMessage()}\n\nPlease make sure you have sent a message to Saved Messages first.`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
   }
@@ -1943,12 +1919,7 @@ export async function handleStartBroadcast(bot, msg) {
       }
     );
   } else {
-    let errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-    
-    if (result.error.includes('message') || result.error.includes('Message')) {
-    } else if (result.error.includes('account') || result.error.includes('Account')) {
-    } else {
-    }
+    const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
     
     await bot.sendMessage(
       chatId,
@@ -2082,7 +2053,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
             }
           );
         } else {
-          let errorMessage = `❌ <b>Failed to Stop Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
+          const errorMessage = `❌ <b>Failed to Stop Broadcast</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
           
           await safeEditMessage(
             bot,
@@ -2098,7 +2069,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
           bot,
           chatId,
           callbackQuery.message.message_id,
-          `❌ <b>Error Stopping Broadcast</b>\n\n<b>Error:</b> ${error.message}`,
+          `❌ <b>Error Stopping Broadcast</b>\n\n${getUserFriendlyErrorMessage()}`,
           { parse_mode: 'HTML', ...await createMainMenu(userId) }
         );
       }
@@ -2177,10 +2148,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
           }
         );
       } else {
-        let errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n<b>Error:</b> ${result.error}\n\n`;
-        if (result.error.includes('message') || result.error.includes('Message')) {
-        } else {
-        }
+        const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
         
         await safeEditMessage(
           bot,
@@ -2196,7 +2164,7 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
         bot,
         chatId,
         callbackQuery.message.message_id,
-        `❌ <b>Error Starting Broadcast</b>\n\n<b>Error:</b> ${error.message}`,
+        `❌ <b>Error Starting Broadcast</b>\n\n${getUserFriendlyErrorMessage()}`,
         { parse_mode: 'HTML', ...await createMainMenu(userId) }
       );
     }
@@ -2666,10 +2634,6 @@ Active: <b>${escapeHtml(activeName)}</b>
   await safeAnswerCallback(bot, callbackQuery.id);
 }
 
-// Keep old handler for backward compatibility (redirects to new handler)
-export async function handleSwitchAccountButton(bot, callbackQuery) {
-  await handleAccountButton(bot, callbackQuery);
-}
 
 // ==================== MESSAGE POOL HANDLERS ====================
 
@@ -3009,7 +2973,7 @@ export async function handlePoolAddMessage(bot, callbackQuery) {
       bot,
       chatId,
       callbackQuery.message.message_id,
-      `❌ <b>Error</b>\n\nFailed to add message from Saved Messages: ${error.message}\n\nPlease make sure you have sent a message to Saved Messages first.`,
+      `❌ <b>Error</b>\n\n${getUserFriendlyErrorMessage()}\n\nPlease make sure you have sent a message to Saved Messages first.`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
   }
@@ -3202,28 +3166,12 @@ export async function handlePoolAddFromSaved(bot, callbackQuery) {
       bot,
       chatId,
       callbackQuery.message.message_id,
-      `❌ <b>Error</b>\n\nFailed to add message from Saved Messages: ${error.message}`,
+      `❌ <b>Error</b>\n\n${getUserFriendlyErrorMessage()}`,
       { parse_mode: 'HTML', ...createBackButton() }
     );
   }
 }
 
-// Keep old handler for backward compatibility (but it won't be used anymore)
-export async function handlePoolMessageInput(bot, msg, accountId) {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-
-  // This handler is deprecated - users should use Saved Messages instead
-  await bot.sendMessage(
-    chatId,
-    `ℹ️ <b>Message Pool Update</b>\n\n` +
-    `To add messages to the pool, please:\n\n` +
-    `1️⃣ Send your message to <b>Saved Messages</b>\n` +
-    `2️⃣ Use the "Add to Pool" button in the Message Pool menu\n\n` +
-    `This ensures premium emojis are preserved correctly.`,
-    { parse_mode: 'HTML', ...await createMainMenu(userId) }
-  );
-}
 
 export async function handlePoolViewMessages(bot, callbackQuery, page = 0) {
   const userId = callbackQuery.from.id;
@@ -3323,7 +3271,7 @@ export async function handlePoolDeleteMessage(bot, callbackQuery, messageId) {
     }
   } else {
     await safeAnswerCallback(bot, callbackQuery.id, {
-      text: `Failed to delete: ${result.error}`,
+      text: getUserFriendlyErrorMessage(),
       show_alert: true,
     });
   }
@@ -3361,7 +3309,7 @@ export async function handlePoolToggleMessage(bot, callbackQuery, messageId) {
     await handlePoolViewMessages(bot, callbackQuery, page);
   } else {
     await safeAnswerCallback(bot, callbackQuery.id, {
-      text: `Failed to toggle: ${result.error}`,
+      text: getUserFriendlyErrorMessage(),
       show_alert: true,
     });
   }
@@ -3578,7 +3526,7 @@ export async function handleTemplateSync(bot, callbackQuery) {
       if (result.success) {
         await handleSavedTemplatesButton(bot, callbackQuery);
       } else {
-        let errorMessage = `❌ <b>Failed to Sync Templates</b>\n\n<b>Error:</b> ${result.error}\n\n`;
+        const errorMessage = `❌ <b>Failed to Sync Templates</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
         
         await safeEditMessage(
           bot,
@@ -4073,10 +4021,32 @@ export async function handleAutoJoinGroups(bot, callbackQuery) {
 
   logger.logButtonClick(userId, username, 'Auto Join Groups', chatId);
 
-  await safeAnswerCallback(bot, callbackQuery.id, {
-    text: '🚧 This feature is being implemented. Stay tuned!',
-    show_alert: true,
-  });
+  const message = `<b>➕ Auto Join Groups</b>
+
+Use <b>@CoupJoinerBot</b> to automatically join groups!
+
+Simply forward group invites to the bot and it will automatically join them using your linked account.
+
+Click the button below to open @CoupJoinerBot:`;
+
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🤖 Open @CoupJoinerBot', url: 'https://t.me/CoupJoinerBot' }],
+        [{ text: '🔙 Back to Groups', callback_data: 'btn_groups' }],
+      ],
+    },
+  };
+
+  await safeEditMessage(
+    bot,
+    chatId,
+    callbackQuery.message.message_id,
+    message,
+    { parse_mode: 'HTML', ...keyboard }
+  );
+
+  await safeAnswerCallback(bot, callbackQuery.id);
 }
 
 export async function handleJoinGroups(bot, callbackQuery) {

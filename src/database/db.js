@@ -78,6 +78,15 @@ class DatabaseWrapper {
       // Convert PostgreSQL-style $1, $2, etc. to SQLite ? placeholders
       let convertedSql = this.convertPlaceholders(text);
       
+      // Convert ILIKE to SQLite-compatible syntax (SQLite doesn't support ILIKE)
+      // ILIKE is case-insensitive LIKE - convert to UPPER() comparison
+      // Pattern: column ILIKE pattern -> UPPER(column) LIKE UPPER(pattern)
+      // Handle both ? and $N placeholders (before and after placeholder conversion)
+      convertedSql = convertedSql.replace(/\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s+ILIKE\s+(\?|\$\d+)/gi, (match, column, placeholder) => {
+        // For SQLite, use UPPER() on both sides for case-insensitive comparison
+        return `UPPER(${column}) LIKE UPPER(${placeholder})`;
+      });
+      
       // Handle RETURNING clause (SQLite doesn't support RETURNING, use lastInsertRowid instead)
       const hasReturning = /RETURNING\s+\w+/i.test(convertedSql);
       let returningColumn = null;
@@ -190,8 +199,15 @@ class DatabaseWrapper {
       }
     } catch (error) {
       // Don't log duplicate column errors - these are expected during schema migrations
-      const errorMessage = error?.message || '';
-      if (!errorMessage.includes('duplicate column') && !errorMessage.includes('duplicate column name')) {
+      // SQLite error messages can vary: "duplicate column", "duplicate column name", "duplicate column: column_name"
+      const errorMessage = (error?.message || '').toLowerCase();
+      const isDuplicateColumnError = 
+        errorMessage.includes('duplicate column') ||
+        errorMessage.includes('duplicate column name') ||
+        errorMessage.includes('duplicate column:') ||
+        errorMessage.includes('sqlite_error') && errorMessage.includes('duplicate');
+      
+      if (!isDuplicateColumnError) {
         logError('[DB] Query error:', error);
       }
       throw error;

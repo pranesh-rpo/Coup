@@ -94,12 +94,29 @@ class Logger {
       return; // Suppress these recoverable errors
     }
     
+    // Check for "bot was blocked" errors - these are expected and shouldn't flood admin notifications
+    const errorCode = error?.code || error?.errorCode || error?.response?.error_code || '';
+    const isBotBlocked = errorMsg.includes('bot was blocked') ||
+                        errorMsg.includes('bot blocked') ||
+                        errorMsg.includes('BLOCKED') ||
+                        errorMsg.includes('chat not found') ||
+                        (errorCode === 403 && (errorMsg.includes('blocked') || errorMsg.includes('forbidden'))) ||
+                        detailsStr.includes('bot was blocked') ||
+                        detailsStr.includes('bot blocked') ||
+                        contextStr.includes('ADMIN_BROADCAST') && errorMsg.includes('403');
+    
     const timestamp = new Date().toISOString();
     const detailsStr2 = details ? ` - ${details}` : '';
     const message = `[ERROR] [${timestamp}] [${context}] User ${userId}: ${errorMsg}${detailsStr2}`;
     console.error(`${colors.red}${colors.bright}${message}${colors.reset}`);
     if (error instanceof Error && error.stack) {
       console.error(`${colors.red}[ERROR STACK] ${error.stack}${colors.reset}`);
+    }
+    
+    // Skip admin notifications for "bot was blocked" errors - these are expected and shouldn't flood admins
+    if (isBotBlocked) {
+      console.log(`${colors.yellow}[LOGGER] Skipping admin notification for blocked bot error (expected behavior)${colors.reset}`);
+      return; // Don't send admin notifications for blocked bot errors
     }
     
     // Send important errors to admins (async, don't await to avoid blocking)

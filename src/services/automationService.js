@@ -1488,15 +1488,18 @@ class AutomationService {
         return { canSend: true, dailySent: 0, dailyCap: defaultDailyCap };
       }
       
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-      const capResetDate = account.cap_reset_date ? new Date(account.cap_reset_date).toISOString().split('T')[0] : null;
+      // Get today's date in IST timezone
+      const now = new Date();
+      const istDateStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // en-CA gives YYYY-MM-DD format
+      const capResetDate = account.cap_reset_date ? new Date(account.cap_reset_date).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) : null;
       
-      // Reset if it's a new day
-      if (capResetDate !== today) {
+      // Reset if it's a new day (in IST)
+      if (capResetDate !== istDateStr) {
         try {
+          // Use IST date for cap reset
           await db.query(
-            'UPDATE accounts SET daily_sent = 0, cap_reset_date = CURRENT_DATE WHERE account_id = $1',
-            [accountIdNum]
+            'UPDATE accounts SET daily_sent = 0, cap_reset_date = ? WHERE account_id = ?',
+            [istDateStr, accountIdNum]
           );
           loggingService.logInfo(accountIdNum, `Daily cap reset - new day started`, null);
           // Use account's daily_cap or default from config

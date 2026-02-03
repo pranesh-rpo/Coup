@@ -34,13 +34,15 @@ class MessagePreviewService {
         previewText = messages.messageA || messages.messageB || 'No message set';
       }
 
-      // Replace variables if any
+      // Replace variables if any (using IST timezone)
+      const istOptions = { timeZone: 'Asia/Kolkata' };
+      const now = new Date();
       const variables = {
         group_name: groupName,
         group_id: groupId,
-        date: new Date().toLocaleDateString(),
-        time: new Date().toLocaleTimeString(),
-        datetime: new Date().toLocaleString()
+        date: now.toLocaleDateString('en-IN', istOptions),
+        time: now.toLocaleTimeString('en-IN', istOptions),
+        datetime: now.toLocaleString('en-IN', istOptions)
       };
 
       let rendered = previewText;

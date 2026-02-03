@@ -77,11 +77,13 @@ class MessageTemplateService {
   renderTemplate(templateText, variables = {}, context = {}) {
     let rendered = templateText;
     
-    // Default variables
+    // Default variables (using IST timezone)
+    const istOptions = { timeZone: 'Asia/Kolkata' };
+    const now = new Date();
     const defaultVars = {
-      date: new Date().toLocaleDateString(),
-      time: new Date().toLocaleTimeString(),
-      datetime: new Date().toLocaleString(),
+      date: now.toLocaleDateString('en-IN', istOptions),
+      time: now.toLocaleTimeString('en-IN', istOptions),
+      datetime: now.toLocaleString('en-IN', istOptions),
       ...context
     };
     

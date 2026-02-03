@@ -56,6 +56,55 @@ export function stripHtmlTags(text) {
 }
 
 /**
+ * Sanitize text for use in Telegram inline keyboard buttons
+ * Ensures the text is valid UTF-8 and removes any invalid characters
+ * @param {string} text - Text to sanitize
+ * @returns {string} - Sanitized UTF-8 text safe for button text
+ */
+export function sanitizeButtonText(text) {
+  if (!text) return '';
+  
+  try {
+    // Convert to string first
+    let str = String(text);
+    
+    // Remove any null bytes and other control characters that might cause issues
+    // Keep common whitespace characters (space, tab, newline) but remove others
+    str = str.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
+    
+    // Ensure valid UTF-8 encoding by encoding and decoding
+    // Use 'utf8' encoding which will replace invalid sequences with replacement characters
+    // Then filter out replacement characters (U+FFFD)
+    const buffer = Buffer.from(str, 'utf8');
+    let sanitized = buffer.toString('utf8');
+    
+    // Remove replacement characters (invalid UTF-8 sequences that were replaced)
+    sanitized = sanitized.replace(/\uFFFD/g, '');
+    
+    // Telegram button text has a max length of 64 bytes, but we'll limit by characters
+    // to be safe (some characters might be multi-byte)
+    // Limit to 60 characters to leave room for emojis/prefixes
+    if (sanitized.length > 60) {
+      sanitized = sanitized.substring(0, 60);
+    }
+    
+    return sanitized;
+  } catch (error) {
+    // If encoding fails, return a safe fallback
+    console.error('[sanitizeButtonText] Error sanitizing text:', error);
+    try {
+      // Try to extract safe ASCII and basic Unicode characters
+      return String(text)
+        .replace(/[^\x20-\x7E\u00A0-\uD7FF\uE000-\uFFFF]/g, '')
+        .substring(0, 60);
+    } catch (fallbackError) {
+      // Last resort: return empty string or a placeholder
+      return '...';
+    }
+  }
+}
+
+/**
  * Truncate text to a maximum length with ellipsis
  * @param {string} text - Text to truncate
  * @param {number} maxLength - Maximum length (default: 100)

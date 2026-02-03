@@ -235,7 +235,7 @@ class LoggerBotService {
           // Get recent log count
           try {
             const logCount = await db.query(
-              'SELECT COUNT(*) as count FROM logs WHERE user_id = ? AND timestamp > datetime("now", "-24 hours")',
+              'SELECT COUNT(*) as count FROM logs WHERE user_id = ? AND timestamp > datetime(\'now\', \'-24 hours\')',
               [userId]
             );
             const count = logCount.rows[0]?.count || 0;
@@ -311,7 +311,7 @@ class LoggerBotService {
           let message = '📋 <b>Recent Logs</b>\n\n';
           logs.rows.forEach((log, index) => {
             const icon = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : log.status === 'warning' ? '⚠️' : 'ℹ️';
-            const time = new Date(log.timestamp).toLocaleString();
+            const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
             message += `${icon} <b>${log.log_type || 'LOG'}</b>\n`;
             message += `${log.message}\n`;
             message += `<i>${time}</i>\n\n`;

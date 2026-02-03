@@ -1213,7 +1213,22 @@ class AccountLinker {
       // Setup error handlers to prevent crashes from MTProto errors
       setupClientErrorHandlers(client);
 
-      await client.connect();
+      // CRITICAL: Ensure client connects successfully before proceeding
+      try {
+        await client.connect();
+        console.log(`[LINK] Client connected successfully for user ${userId}`);
+      } catch (connectError) {
+        logError(`[LINK ERROR] Failed to connect client for user ${userId}:`, connectError);
+        try {
+          await client.disconnect();
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+        return { 
+          success: false, 
+          error: 'Failed to connect to Telegram. Please check your internet connection and try again.' 
+        };
+      }
       
       // Log the exact phone number being sent to Telegram API for debugging
       console.log(`[LINK] Sending code to phone: "${normalizedPhone}" (length: ${normalizedPhone.length})`);
@@ -1225,6 +1240,18 @@ class AccountLinker {
         },
         normalizedPhone
       );
+
+      // CRITICAL: Validate result and phoneCodeHash
+      if (!result || !result.phoneCodeHash || typeof result.phoneCodeHash !== 'string') {
+        logError(`[LINK ERROR] Invalid result from sendCode for user ${userId}:`, result);
+        try {
+          await client.disconnect();
+        } catch (e) {}
+        return { 
+          success: false, 
+          error: 'Failed to receive verification code. Please try again.' 
+        };
+      }
 
       // Prevent Map from growing too large (limit to 100 entries)
       if (this.pendingVerifications.size > 100) {
@@ -1248,6 +1275,31 @@ class AccountLinker {
       return { success: true, phoneCodeHash: result.phoneCodeHash };
     } catch (error) {
       logError('Error initiating link:', error);
+      
+      // Handle specific Telegram error codes
+      const errorMsg = error.errorMessage || error.message || '';
+      const errorCode = error.code || error.errorCode || '';
+      
+      // Check for flood wait errors
+      if (isFloodWaitError(error)) {
+        const waitSeconds = extractWaitTime(error) || 60;
+        const waitMinutes = Math.ceil(waitSeconds / 60);
+        return { 
+          success: false, 
+          error: `Rate limited by Telegram. Please wait ${waitMinutes} minute(s) (${waitSeconds} seconds) before requesting a new code.` 
+        };
+      }
+      
+      // Check for invalid phone number errors
+      if (errorMsg.includes('PHONE_NUMBER_INVALID') || 
+          errorMsg.includes('PHONE_NUMBER_BANNED') ||
+          errorMsg.includes('PHONE_NUMBER_FLOOD')) {
+        return { 
+          success: false, 
+          error: 'Invalid phone number. Please check your phone number format and try again.' 
+        };
+      }
+      
       // Clean up on error
       const pending = this.pendingVerifications.get(userId);
       if (pending && pending.client) {
@@ -1259,7 +1311,12 @@ class AccountLinker {
         this.pendingVerifications.delete(userId);
       }
       await this.deletePendingVerification(userId);
-      return { success: false, error: error.message };
+      
+      // Return generic error message (don't expose technical details)
+      return { 
+        success: false, 
+        error: 'Failed to send verification code. Please try again later.' 
+      };
     }
   }
 
@@ -1303,6 +1360,43 @@ class AccountLinker {
     try {
       const { phone, phoneCodeHash, client } = pending;
       
+      // CRITICAL: Validate all required data exists
+      if (!phone || !phoneCodeHash || !client) {
+        logError(`[OTP ERROR] Missing required data for user ${userId}: phone=${!!phone}, phoneCodeHash=${!!phoneCodeHash}, client=${!!client}`);
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { success: false, error: 'Verification data is incomplete. Please start the linking process again.' };
+      }
+      
+      // CRITICAL: Ensure client exists and is valid before using it
+      if (!client || typeof client.invoke !== 'function') {
+        logError(`[OTP ERROR] Client is invalid for user ${userId}`);
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { success: false, error: 'Connection error. Please start the linking process again.' };
+      }
+      
+      // Ensure client is connected before making API call
+      if (!client.connected) {
+        console.log(`[OTP] Client not connected, connecting...`);
+        try {
+          await client.connect();
+        } catch (connectError) {
+          logError(`[OTP ERROR] Failed to connect client for user ${userId}:`, connectError);
+          this.pendingVerifications.delete(userId);
+          await this.deletePendingVerification(userId);
+          return { success: false, error: 'Connection error. Please try again.' };
+        }
+      }
+      
+      // Validate phoneCodeHash format
+      if (typeof phoneCodeHash !== 'string' || phoneCodeHash.trim().length === 0) {
+        logError(`[OTP ERROR] Invalid phoneCodeHash for user ${userId}`);
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { success: false, error: 'Verification code expired. Please request a new code.' };
+      }
+      
       // Use proper MTProto API request
       const result = await client.invoke(
         new Api.auth.SignIn({
@@ -1311,27 +1405,70 @@ class AccountLinker {
           phoneCode: normalizedCode,
         })
       );
-
-      // Check if password is required (2FA)
-      if (result instanceof Api.auth.AuthorizationSignUpRequired) {
-        return { success: false, error: 'Account requires sign up. Please use Telegram app first.' };
+      
+      // CRITICAL: Validate result exists
+      if (!result) {
+        logError(`[OTP ERROR] Empty result from SignIn for user ${userId}`);
+        return { success: false, error: 'Invalid response from Telegram. Please try again.' };
       }
 
-      // Check if 2FA password is required
+      // Check if account requires sign-up (new account)
+      if (result instanceof Api.auth.AuthorizationSignUpRequired) {
+        // Clean up verification
+        if (pending.client) {
+          try {
+            await pending.client.disconnect();
+          } catch (e) {}
+        }
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { success: false, error: 'Account requires sign up. Please use Telegram app first to create your account.' };
+      }
+
+      // Check if 2FA password is required - Telegram returns this as a specific error type
+      // Check for password requirement BEFORE checking successful authorization
       if (result instanceof Api.auth.Authorization && result.user) {
         // Successfully signed in
+        // CRITICAL: Validate result.user exists and has required properties
+        if (!result.user || typeof result.user !== 'object') {
+          logError(`[OTP ERROR] Invalid user object in result for user ${userId}:`, result);
+          this.pendingVerifications.delete(userId);
+          await this.deletePendingVerification(userId);
+          return { success: false, error: 'Invalid response from Telegram. Please try again.' };
+        }
+        
         // CRITICAL: Ensure client is connected before saving session
         if (!client.connected) {
           console.log(`[OTP] Client not connected, connecting...`);
-          await client.connect();
+          try {
+            await client.connect();
+          } catch (connectError) {
+            logError(`[OTP ERROR] Failed to connect client for user ${userId}:`, connectError);
+            this.pendingVerifications.delete(userId);
+            await this.deletePendingVerification(userId);
+            return { success: false, error: 'Connection error. Please try again.' };
+          }
         }
         
         // Save session string - ensure it's not null
-        let sessionString = client.session.save();
+        let sessionString = null;
+        try {
+          sessionString = client.session.save();
+        } catch (sessionError) {
+          logError(`[OTP ERROR] Failed to save session for user ${userId}:`, sessionError);
+          this.pendingVerifications.delete(userId);
+          await this.deletePendingVerification(userId);
+          return { success: false, error: 'Failed to save session. Please try again.' };
+        }
+        
         if (!sessionString || typeof sessionString !== 'string' || sessionString.trim().length === 0) {
           // Try to get session string from session object directly
           if (client.session && typeof client.session.save === 'function') {
-            sessionString = client.session.save();
+            try {
+              sessionString = client.session.save();
+            } catch (e) {
+              // Ignore
+            }
           }
           // If still null, try alternative method
           if (!sessionString && client.session && client.session.sessionString) {
@@ -1339,13 +1476,16 @@ class AccountLinker {
           }
           // If still null, throw error
           if (!sessionString || typeof sessionString !== 'string' || sessionString.trim().length === 0) {
-            throw new Error('Failed to save session string - session is invalid or not properly initialized');
+            logError(`[OTP ERROR] Session string is invalid for user ${userId}`);
+            this.pendingVerifications.delete(userId);
+            await this.deletePendingVerification(userId);
+            return { success: false, error: 'Failed to save session. Please try again.' };
           }
         }
         
         console.log(`[OTP] Session string saved successfully (length: ${sessionString.length})`);
         const userIdStr = userId.toString();
-        const firstName = result.user.firstName || null;
+        const firstName = (result.user && result.user.firstName) ? result.user.firstName : null;
 
         this.pendingVerifications.delete(userId);
         
@@ -1365,11 +1505,30 @@ class AccountLinker {
     } catch (error) {
       logError(`[OTP ERROR] Error verifying OTP for user ${userId}:`, error);
       
-      // Check if 2FA password is required
-      if (error.errorMessage === 'SESSION_PASSWORD_NEEDED' || error.code === 401) {
+      // Check if 2FA password is required - Telegram throws SESSION_PASSWORD_NEEDED error
+      // Also check for various error formats that indicate password requirement
+      const errorMsg = error.errorMessage || error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || '';
+      const errorName = error.name || '';
+      
+      // Comprehensive check for password requirement
+      const isPasswordRequired = 
+        errorMsg === 'SESSION_PASSWORD_NEEDED' ||
+        errorMsg.includes('SESSION_PASSWORD_NEEDED') ||
+        errorMsg.includes('PASSWORD_NEEDED') ||
+        errorMsg.includes('password required') ||
+        errorMsg.includes('two-step verification') ||
+        errorMsg.includes('two step verification') ||
+        errorMsg.includes('2FA') ||
+        (errorCode === 401 && (errorMsg.includes('password') || errorMsg.includes('SESSION'))) ||
+        (errorName === 'SessionPasswordNeededError') ||
+        (error instanceof Error && error.message && error.message.includes('SESSION_PASSWORD_NEEDED'));
+      
+      if (isPasswordRequired) {
         console.log(`[2FA] Password required for user ${userId} - OTP was correct`);
         
         // OTP was verified successfully, now password is needed
+        // Don't disconnect client - we need it for password authentication
         // Clean up OTP verification since it's complete (password is next step)
         this.pendingVerifications.delete(userId);
         await this.deletePendingVerification(userId);
@@ -1379,6 +1538,22 @@ class AccountLinker {
         if (this.pendingPasswordAuth.size > 100) {
           console.warn(`[MEMORY] Pending password auth Map is large (${this.pendingPasswordAuth.size} entries), cleaning up...`);
           this.cleanupPendingVerifications();
+        }
+        
+        // CRITICAL: Ensure client exists and is connected before storing for password auth
+        if (!pending || !pending.client) {
+          logError(`[2FA ERROR] Client lost during OTP verification for user ${userId}`);
+          return { success: false, error: 'Connection error. Please start the linking process again.' };
+        }
+        
+        if (!pending.client.connected) {
+          console.log(`[2FA] Client disconnected, reconnecting for password auth...`);
+          try {
+            await pending.client.connect();
+          } catch (connectError) {
+            logError(`[2FA ERROR] Failed to reconnect client for password auth:`, connectError);
+            return { success: false, error: 'Connection error. Please try again.' };
+          }
         }
         
         this.pendingPasswordAuth.set(userId, {
@@ -1399,18 +1574,69 @@ class AccountLinker {
       }
       
       // Check error type to determine if we should keep pending verification
-      const errorMsg = error.errorMessage || error.message || '';
-      const isInvalidCode = errorMsg.includes('PHONE_CODE_INVALID') || 
-                           errorMsg.includes('code') && errorMsg.includes('invalid');
-      const isExpired = errorMsg.includes('PHONE_CODE_EXPIRED') || 
-                       errorMsg.includes('expired') || 
-                       errorMsg.includes('timeout');
+      // Handle all Telegram error codes properly
+      const isInvalidCode = 
+        errorMsg.includes('PHONE_CODE_INVALID') || 
+        errorMsg.includes('PHONE_CODE_EMPTY') ||
+        (errorMsg.includes('code') && errorMsg.includes('invalid')) ||
+        errorCode === 400 && errorMsg.includes('code');
+      
+      const isExpired = 
+        errorMsg.includes('PHONE_CODE_EXPIRED') || 
+        errorMsg.includes('expired') || 
+        errorMsg.includes('timeout') ||
+        errorCode === 400 && errorMsg.includes('expired');
+      
+      const isFloodWait = 
+        errorMsg.includes('FLOOD_WAIT') ||
+        errorMsg.includes('FLOOD') ||
+        isFloodWaitError(error);
+      
+      const isPhoneInvalid = 
+        errorMsg.includes('PHONE_NUMBER_INVALID') ||
+        errorMsg.includes('PHONE_NUMBER_BANNED') ||
+        errorMsg.includes('PHONE_NUMBER_FLOOD');
+      
+      // Handle flood wait errors
+      if (isFloodWait) {
+        const waitSeconds = extractWaitTime(error) || 60;
+        const waitMinutes = Math.ceil(waitSeconds / 60);
+        logError(`[OTP ERROR] Flood wait during OTP verification for user ${userId}: ${waitSeconds}s wait required`, error);
+        // Clean up verification on flood wait
+        if (pending.client) {
+          try {
+            await pending.client.disconnect();
+          } catch (e) {}
+        }
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { 
+          success: false, 
+          error: `Rate limited by Telegram. Please wait ${waitMinutes} minute(s) (${waitSeconds} seconds) before requesting a new code.` 
+        };
+      }
+      
+      // Handle phone number errors
+      if (isPhoneInvalid) {
+        logError(`[OTP ERROR] Invalid phone number for user ${userId}:`, error);
+        if (pending.client) {
+          try {
+            await pending.client.disconnect();
+          } catch (e) {}
+        }
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { 
+          success: false, 
+          error: 'Invalid phone number. Please check your phone number and try again.' 
+        };
+      }
       
       // Only clean up verification for critical errors (expired, not invalid code)
       // Keep pending verification for wrong code so user can try again
-      if (isExpired || !isInvalidCode) {
-        console.log(`[OTP] Critical error (expired or other) - cleaning up verification for user ${userId}`);
-        // Clean up failed verification for expired codes or other critical errors
+      if (isExpired) {
+        console.log(`[OTP] Code expired - cleaning up verification for user ${userId}`);
+        // Clean up failed verification for expired codes
         if (pending.client) {
           try {
             await pending.client.disconnect();
@@ -1420,11 +1646,31 @@ class AccountLinker {
         }
         this.pendingVerifications.delete(userId);
         await this.deletePendingVerification(userId);
-        return { success: false, error: error.message };
-      } else {
+        return { 
+          success: false, 
+          error: 'Verification code expired. Please request a new code.' 
+        };
+      } else if (isInvalidCode) {
         // Wrong code - keep pending verification so user can try again
         console.log(`[OTP] Invalid code entered - keeping pending verification for retry (user ${userId})`);
-        return { success: false, error: error.message || 'Invalid verification code. Please try again.' };
+        return { 
+          success: false, 
+          error: 'Invalid verification code. Please check the code and try again.' 
+        };
+      } else {
+        // Other errors - clean up and return generic error
+        console.log(`[OTP] Other error - cleaning up verification for user ${userId}: ${errorMsg}`);
+        if (pending.client) {
+          try {
+            await pending.client.disconnect();
+          } catch (e) {}
+        }
+        this.pendingVerifications.delete(userId);
+        await this.deletePendingVerification(userId);
+        return { 
+          success: false, 
+          error: 'An error occurred during verification. Please try again.' 
+        };
       }
     }
   }
@@ -1432,10 +1678,29 @@ class AccountLinker {
   async verifyPassword(userId, password) {
     console.log(`[2FA] verifyPassword called for user ${userId}`);
     
+    // CRITICAL: Validate password input
+    if (!password || typeof password !== 'string' || password.trim().length === 0) {
+      logError(`[2FA ERROR] Empty or invalid password provided for user ${userId}`);
+      return { success: false, error: 'Password is required' };
+    }
+    
+    // Validate password length (Telegram passwords are typically 8+ characters)
+    const trimmedPassword = password.trim();
+    if (trimmedPassword.length < 1) {
+      return { success: false, error: 'Password cannot be empty' };
+    }
+    
     const pending = this.pendingPasswordAuth.get(userId);
     if (!pending) {
       logError(`[2FA ERROR] No pending password authentication found for user ${userId}`);
-      return { success: false, error: 'No pending password authentication found' };
+      return { success: false, error: 'No pending password authentication found. Please start the linking process again.' };
+    }
+    
+    // CRITICAL: Validate pending data
+    if (!pending.phone || !pending.client) {
+      logError(`[2FA ERROR] Invalid pending data for user ${userId}: phone=${!!pending.phone}, client=${!!pending.client}`);
+      this.pendingPasswordAuth.delete(userId);
+      return { success: false, error: 'Authentication data is incomplete. Please start the linking process again.' };
     }
 
     // Check password attempt limit (max 3 attempts)
@@ -1476,6 +1741,25 @@ class AccountLinker {
     try {
       const { phone, client } = pending;
       
+      // CRITICAL: Ensure client exists before using it
+      if (!client) {
+        logError(`[2FA ERROR] Client is null for user ${userId}`);
+        this.pendingPasswordAuth.delete(userId);
+        return { success: false, error: 'Connection error. Please start the linking process again.' };
+      }
+      
+      // Ensure client is connected before making API call
+      if (!client.connected) {
+        console.log(`[2FA] Client not connected, connecting...`);
+        try {
+          await client.connect();
+        } catch (connectError) {
+          logError(`[2FA ERROR] Failed to connect client for user ${userId}:`, connectError);
+          this.pendingPasswordAuth.delete(userId);
+          return { success: false, error: 'Connection error. Please try again.' };
+        }
+      }
+      
       console.log(`[2FA] Verifying password for user ${userId}, phone: ${phone}`);
       
       // Use signInWithPassword method with proper callbacks
@@ -1486,11 +1770,12 @@ class AccountLinker {
       }, {
         password: async () => {
           console.log(`[2FA] Password function called for user ${userId}`);
-          if (!password) {
-            logError(`[2FA ERROR] Password is empty for user ${userId}`);
+          // Password is already validated above, but double-check here
+          if (!trimmedPassword || trimmedPassword.length === 0) {
+            logError(`[2FA ERROR] Password is empty in callback for user ${userId}`);
             throw new Error('Password is required');
           }
-          return password;
+          return trimmedPassword;
         },
         onError: async (err) => {
           // Return false to retry, true to cancel
@@ -1509,32 +1794,59 @@ class AccountLinker {
       if (result && result.id) {
         console.log(`[2FA] Password verified successfully for user ${userId}`);
         
+        // CRITICAL: Validate result exists and has required properties
+        if (!result || typeof result !== 'object' || !result.id) {
+          logError(`[2FA ERROR] Invalid result object for user ${userId}:`, result);
+          this.pendingPasswordAuth.delete(userId);
+          return { success: false, error: 'Invalid response from Telegram. Please try again.' };
+        }
+        
         // CRITICAL: Ensure client is connected before saving session
         if (!client.connected) {
           console.log(`[2FA] Client not connected, connecting...`);
-          await client.connect();
+          try {
+            await client.connect();
+          } catch (connectError) {
+            logError(`[2FA ERROR] Failed to connect client for user ${userId}:`, connectError);
+            this.pendingPasswordAuth.delete(userId);
+            return { success: false, error: 'Connection error. Please try again.' };
+          }
         }
         
         // Save session string - ensure it's not null
-        let sessionString = client.session.save();
+        let sessionString = null;
+        try {
+          sessionString = client.session.save();
+        } catch (sessionError) {
+          logError(`[2FA ERROR] Failed to save session for user ${userId}:`, sessionError);
+          this.pendingPasswordAuth.delete(userId);
+          return { success: false, error: 'Failed to save session. Please try again.' };
+        }
+        
         if (!sessionString || typeof sessionString !== 'string' || sessionString.trim().length === 0) {
           // Try to get session string from session object directly
           if (client.session && typeof client.session.save === 'function') {
-            sessionString = client.session.save();
+            try {
+              sessionString = client.session.save();
+            } catch (e) {
+              // Ignore
+            }
           }
           // If still null, try alternative method
           if (!sessionString && client.session && client.session.sessionString) {
             sessionString = client.session.sessionString;
           }
-          // If still null, throw error
+          // If still null, return error
           if (!sessionString || typeof sessionString !== 'string' || sessionString.trim().length === 0) {
-            throw new Error('Failed to save session string - session is invalid or not properly initialized');
+            logError(`[2FA ERROR] Session string is invalid for user ${userId}`);
+            this.pendingPasswordAuth.delete(userId);
+            return { success: false, error: 'Failed to save session. Please try again.' };
           }
         }
         
         console.log(`[2FA] Session string saved successfully (length: ${sessionString.length})`);
         const userIdStr = userId.toString();
-        const firstName = result.firstName || null;
+        const firstName = (result.firstName) ? result.firstName : null;
         
         // Get phone number - always use pending phone (has + prefix) if available
         // result.phone might not have + prefix, so we prefer pending phone
@@ -2398,6 +2710,72 @@ class AccountLinker {
       }
     } catch (error) {
       logError(`[TAGS ERROR] Error setting profile tags for account ${accountId}:`, error);
+    }
+  }
+
+  /**
+   * Remove profile tags from account (for premium users)
+   * @param {TelegramClient} client - Telegram client
+   * @param {number} accountId - Account ID
+   */
+  async removeProfileTags(client, accountId) {
+    try {
+      if (!client) {
+        return { success: false, error: 'Client not available' };
+      }
+
+      console.log(`[TAGS] Removing profile tags for account ${accountId}`);
+      
+      // Ensure client is connected
+      if (!client.connected) {
+        await client.connect();
+      }
+
+      // Get current profile to preserve firstName
+      const me = await client.getMe();
+      const fullUser = await client.invoke(
+        new Api.users.GetFullUser({
+          id: me.id,
+        })
+      );
+
+      // Clean firstName (remove any existing tags)
+      let cleanedFirstName = me.firstName || '';
+      cleanedFirstName = cleanedFirstName
+        .replace('| Ora Ads', '')
+        .replace(' | Ora Ads', '')
+        .replace('| Lux Cast', '')
+        .replace(' | Lux Cast', '')
+        .replace('| Coup Bot', '')
+        .replace(' | Coup Bot', '')
+        .replace('| CoupBot', '')
+        .replace(' | CoupBot', '')
+        .trim();
+
+      // Remove tags: set lastName to empty and about to empty
+      await client.invoke(
+        new Api.account.UpdateProfile({
+          firstName: cleanedFirstName,
+          lastName: '', // Remove lastName tag
+          about: '', // Remove bio tag
+        })
+      );
+
+      // Wait for update to propagate
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      console.log(`[TAGS] Profile tags removed successfully for account ${accountId}`);
+      
+      // Update tags_last_verified timestamp
+      await db.query(
+        'UPDATE accounts SET tags_last_verified = CURRENT_TIMESTAMP WHERE account_id = ?',
+        [accountId]
+      );
+
+      return { success: true };
+    } catch (error) {
+      logError(`[TAGS ERROR] Error removing profile tags for account ${accountId}:`, error);
+      return { success: false, error: error.message };
     }
   }
 

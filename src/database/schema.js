@@ -47,13 +47,20 @@ async function addColumnIfNotExists(tableName, columnName, columnDefinition) {
     await db.query(`ALTER TABLE "${tableName}" ADD COLUMN "${columnName}" ${columnDefinition}`);
   } catch (error) {
     // Silently ignore duplicate column errors - these are expected if column already exists
-    const errorMessage = error?.message || '';
-    if (errorMessage.includes('duplicate column') || errorMessage.includes('duplicate column name')) {
+    // SQLite error messages can vary: "duplicate column", "duplicate column name", "duplicate column: column_name"
+    const errorMessage = (error?.message || '').toLowerCase();
+    const isDuplicateColumnError = 
+      errorMessage.includes('duplicate column') ||
+      errorMessage.includes('duplicate column name') ||
+      errorMessage.includes('duplicate column:') ||
+      errorMessage.includes('sqlite_error') && errorMessage.includes('duplicate');
+    
+    if (isDuplicateColumnError) {
       // Column already exists, which is fine - silently ignore
       return;
     }
     // Only log non-duplicate errors
-    console.log(`[SCHEMA] Note: Could not add column ${columnName} to ${tableName}: ${errorMessage}`);
+    console.log(`[SCHEMA] Note: Could not add column ${columnName} to ${tableName}: ${error?.message || 'Unknown error'}`);
   }
 }
 

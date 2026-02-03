@@ -156,12 +156,26 @@ export function validateTableName(tableName, allowedTables) {
 }
 
 /**
+ * Get user-friendly error message (never shows technical details)
+ * @returns {string} Generic error message for users
+ */
+export function getUserFriendlyErrorMessage() {
+  return 'An error occurred. Please try again later or contact support if the problem persists.';
+}
+
+/**
  * Sanitize error message to prevent information leakage
  * @param {Error|string} error - Error object or message
- * @param {boolean} includeDetails - Whether to include error details
+ * @param {boolean} includeDetails - Whether to include error details (for admin/internal use)
+ * @param {boolean} forUser - If true, always return generic message (default: false for backward compatibility)
  * @returns {string} Sanitized error message
  */
-export function sanitizeErrorMessage(error, includeDetails = false) {
+export function sanitizeErrorMessage(error, includeDetails = false, forUser = false) {
+  // If this is for a user, always return generic message
+  if (forUser || !includeDetails) {
+    return getUserFriendlyErrorMessage();
+  }
+  
   let message = '';
   
   if (error instanceof Error) {
@@ -191,19 +205,22 @@ export function sanitizeErrorMessage(error, includeDetails = false) {
   // Remove file paths that might expose system structure
   sanitized = sanitized.replace(/\/[^\s]+/g, '[PATH]');
   
+  // Remove code snippets, stack traces, and technical details
+  sanitized = sanitized.replace(/at\s+.*?\(.*?\)/g, '[STACK]');
+  sanitized = sanitized.replace(/Error:\s*/gi, '');
+  sanitized = sanitized.replace(/TypeError|ReferenceError|SyntaxError/gi, 'Error');
+  
   // Limit length
   if (sanitized.length > 200) {
     sanitized = sanitized.substring(0, 197) + '...';
   }
   
-  if (!includeDetails) {
-    // For user-facing errors, be generic
-    if (sanitized.toLowerCase().includes('sql') || sanitized.toLowerCase().includes('database')) {
-      return 'Database error occurred. Please try again.';
-    }
-    if (sanitized.toLowerCase().includes('connection') || sanitized.toLowerCase().includes('network')) {
-      return 'Connection error occurred. Please try again.';
-    }
+  // For user-facing errors, be generic
+  if (sanitized.toLowerCase().includes('sql') || sanitized.toLowerCase().includes('database')) {
+    return 'Database error occurred. Please try again.';
+  }
+  if (sanitized.toLowerCase().includes('connection') || sanitized.toLowerCase().includes('network')) {
+    return 'Connection error occurred. Please try again.';
   }
   
   return sanitized;

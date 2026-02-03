@@ -166,6 +166,48 @@ class PremiumService {
       }
 
       const subscription = await this.getSubscription(userId);
+      
+      // CRITICAL: Remove profile tags from all linked accounts when premium is activated
+      // Premium users don't need tags
+      try {
+        const accountLinker = (await import('./accountLinker.js')).default;
+        const accounts = await accountLinker.getAccounts(userId);
+        
+        if (accounts && accounts.length > 0) {
+          console.log(`[PREMIUM] Removing profile tags from ${accounts.length} account(s) for premium user ${userId}`);
+          
+          for (const account of accounts) {
+            try {
+              const accountId = account.accountId;
+              const client = accountLinker.getClient(userId, accountId);
+              
+              if (client) {
+                // Ensure client is connected
+                try {
+                  await accountLinker.ensureConnected(accountId);
+                  // Remove tags from this account
+                  await accountLinker.removeProfileTags(client, accountId);
+                  console.log(`[PREMIUM] Removed tags from account ${accountId}`);
+                } catch (connectError) {
+                  console.log(`[PREMIUM] Could not connect account ${accountId} to remove tags: ${connectError.message}`);
+                  // Continue with other accounts
+                }
+              }
+            } catch (accountError) {
+              console.error(`[PREMIUM] Error removing tags from account ${account.accountId}:`, accountError);
+              // Continue with other accounts
+            }
+            
+            // Small delay between accounts
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      } catch (tagsError) {
+        // Log but don't fail premium activation if tag removal fails
+        console.error(`[PREMIUM] Error removing tags from accounts:`, tagsError);
+        logger.logError('PREMIUM', userId, tagsError, 'Failed to remove tags from accounts');
+      }
+      
       return { success: true, subscription };
     } catch (error) {
       logger.logError('PREMIUM', userId, error, 'Failed to create subscription');

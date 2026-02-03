@@ -12,7 +12,7 @@ import automationService from './services/automationService.js';
 import logger, { colors, logError } from './utils/logger.js';
 import { safeAnswerCallback } from './utils/safeEdit.js';
 import { isFloodWaitError, extractWaitTime, waitForFloodError, safeBotApiCall } from './utils/floodWaitHandler.js';
-import { validateUserId, validateAccountId, sanitizeCallbackData, validateCallbackData, sanitizeErrorMessage, adminCommandRateLimiter, verifyAccountOwnership, sanitizeString } from './utils/security.js';
+import { validateUserId, validateAccountId, sanitizeCallbackData, validateCallbackData, sanitizeErrorMessage, getUserFriendlyErrorMessage, adminCommandRateLimiter, verifyAccountOwnership, sanitizeString } from './utils/security.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -225,7 +225,6 @@ import {
   handleStatusButton,
   handlePasswordInput,
   handleAccountButton,
-  handleSwitchAccountButton,
   handleSwitchAccount,
   handleDeleteAccount,
   handleVerifyChannel,
@@ -235,7 +234,6 @@ import {
   handleAutoJoinGroups,
   handleMessagePoolButton,
   handlePoolAddMessage,
-  handlePoolMessageInput,
   handlePoolViewMessages,
   handlePoolDeleteMessage,
   handlePoolToggleMessage,
@@ -246,8 +244,6 @@ import {
   handlePremium,
   handlePremiumFAQ,
   handlePremiumBenefits,
-  handleLoginSharePhone,
-  handleSharePhoneConfirm,
   handleLoginTypePhone,
   handleLoginCancel,
   handleCheckPaymentStatus,
@@ -293,10 +289,6 @@ import {
   handleAutoReplyGroupsToggle,
   handleAutoReplyGroupsSetMessage,
   handleAutoReplyGroupsMessageInput,
-  handleAutoReplySetInterval,
-  handleAutoReplyIntervalSelect,
-  handleAutoReplyIntervalCustom,
-  handleAutoReplyIntervalInput,
 } from './handlers/configHandlers.js';
 import {
   handleStatsButton,
@@ -707,7 +699,6 @@ const pendingGroupDelayInputs = new Map(); // userId -> { accountId, messageId }
 const pendingBlacklistSearchInputs = new Map(); // userId -> { accountId, messageId }
 const pendingAutoReplyDmMessageInputs = new Map(); // userId -> { accountId, messageId }
 const pendingAutoReplyGroupsMessageInputs = new Map(); // userId -> { accountId, messageId }
-const pendingAutoReplyIntervalInputs = new Map(); // userId -> { accountId, messageId }
 
 /**
  * Safely delete a message (user's input message)
@@ -770,10 +761,6 @@ function clearConflictingPendingStates(userId, excludeState = null) {
   if (excludeState !== 'autoReplyGroupsMessage' && pendingAutoReplyGroupsMessageInputs.has(userId)) {
     pendingAutoReplyGroupsMessageInputs.delete(userId);
     cleared.push('autoReplyGroupsMessage');
-  }
-  if (excludeState !== 'autoReplyInterval' && pendingAutoReplyIntervalInputs.has(userId)) {
-    pendingAutoReplyIntervalInputs.delete(userId);
-    cleared.push('autoReplyInterval');
   }
   
   if (cleared.length > 0) {
@@ -1102,9 +1089,8 @@ bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg) => {
   } catch (error) {
     console.error('[ADMIN_BROADCAST] Error:', error);
     logger.logError('ADMIN_BROADCAST', userId, error, 'Admin broadcast error');
-    // SECURITY: Sanitize error message to prevent information leakage
-    const safeErrorMessage = sanitizeErrorMessage(error, false);
-    await bot.sendMessage(chatId, `❌ Error: ${safeErrorMessage}`);
+    // SECURITY: Use generic error message for users
+    await bot.sendMessage(chatId, `❌ Error: ${getUserFriendlyErrorMessage()}`);
   }
 });
 
@@ -1265,7 +1251,7 @@ bot.onText(/\/abroadcast_last/, async (msg) => {
   } catch (error) {
     console.error('[ADMIN_BROADCAST] Error:', error);
     logger.logError('ADMIN_BROADCAST', userId, error, 'Resend last broadcast error');
-    await bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+    await bot.sendMessage(chatId, `❌ Error: ${getUserFriendlyErrorMessage()}`);
   }
 });
 
@@ -1776,17 +1762,6 @@ bot.on('message', async (msg) => {
     if (result) {
       pendingAutoReplyGroupsMessageInputs.delete(userId);
     }
-  } else if (pendingAutoReplyIntervalInputs.has(userId)) {
-    const pendingData = pendingAutoReplyIntervalInputs.get(userId);
-    if (!pendingData || !pendingData.accountId) {
-      pendingAutoReplyIntervalInputs.delete(userId);
-      return;
-    }
-    const { accountId, messageId } = pendingData;
-    const result = await handleAutoReplyIntervalInput(bot, msg, accountId, messageId);
-    if (result) {
-      pendingAutoReplyIntervalInputs.delete(userId);
-    }
   } else {
     // Normal message not in any pending state - ignore it
     console.log(`[MESSAGE HANDLER] User ${userId} sent normal message but not in any pending state - ignoring`);
@@ -1943,7 +1918,16 @@ bot.on('callback_query', async (callbackQuery) => {
         logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
       }
     } else if (data === 'btn_login_share_phone') {
-      await handleLoginSharePhone(bot, callbackQuery);
+      // Redirect to unified link flow
+      clearConflictingPendingStates(userId, 'phone');
+      const result = await handleLinkButton(bot, callbackQuery);
+      if (result && result.statusMsgId) {
+        addPendingStateWithTimeout(pendingPhoneInputs, userId, { 
+          statusMsgId: result.statusMsgId, 
+          keyboardMsgId: result.keyboardMsgId 
+        });
+        logger.logChange('PHONE_INPUT', userId, 'Waiting for phone number input');
+      }
     } else if (data === 'btn_login_type_phone') {
       clearConflictingPendingStates(userId, 'phone');
       const result = await handleLoginTypePhone(bot, callbackQuery);
@@ -1969,7 +1953,8 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_status') {
       await handleStatusButton(bot, callbackQuery);
     } else if (data === 'btn_switch_account') {
-      await handleSwitchAccountButton(bot, callbackQuery);
+      // Redirect to account button handler
+      await handleAccountButton(bot, callbackQuery);
     } else if (data === 'btn_verify_channel') {
       await handleVerifyChannel(bot, callbackQuery);
     } else if (data === 'btn_apply_tags') {
@@ -2247,20 +2232,6 @@ bot.on('callback_query', async (callbackQuery) => {
         text: 'ℹ️ Interval mode has been removed. Auto-reply now uses real-time mode with a 30-minute cooldown per chat.',
         show_alert: true,
       });
-      return;
-      // Old code below (disabled)
-      const intervalStr = data.replace('auto_reply_interval_', '');
-      if (intervalStr === 'custom') {
-        const result = await handleAutoReplyIntervalCustom(bot, callbackQuery);
-        if (result && result.accountId) {
-          addPendingStateWithTimeout(pendingAutoReplyIntervalInputs, userId, result);
-        }
-      } else {
-        const intervalSeconds = parseInt(intervalStr);
-        if (!isNaN(intervalSeconds)) {
-          await handleAutoReplyIntervalSelect(bot, callbackQuery, intervalSeconds);
-        }
-      }
     }
   } catch (error) {
     // Check if it's a "message not modified" error - these should be handled by safeEditMessage

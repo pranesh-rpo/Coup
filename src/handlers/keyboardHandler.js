@@ -4,7 +4,7 @@ import messageService from '../services/messageService.js';
 import premiumService from '../services/premiumService.js';
 import configService from '../services/configService.js';
 import groupService from '../services/groupService.js';
-import { escapeHtml } from '../utils/textHelpers.js';
+import { escapeHtml, sanitizeButtonText } from '../utils/textHelpers.js';
 
 /**
  * Generate status text for the main menu - Clean Dashboard
@@ -121,9 +121,10 @@ export async function createMainMenu(userId = null) {
         hasAccount = true;
         const activeAccount = accounts.find(acc => acc.accountId === activeAccountId);
         if (activeAccount && activeAccount.firstName) {
-          accountButtonText = `👤 ${escapeHtml(activeAccount.firstName.substring(0, 15))}`;
+          // Use sanitizeButtonText instead of escapeHtml for button text (must be UTF-8)
+          accountButtonText = `👤 ${sanitizeButtonText(activeAccount.firstName.substring(0, 15))}`;
         } else if (activeAccount && activeAccount.phone) {
-          accountButtonText = `👤 ${escapeHtml(activeAccount.phone)}`;
+          accountButtonText = `👤 ${sanitizeButtonText(activeAccount.phone)}`;
         } else {
           accountButtonText = '👤 Account';
         }
@@ -194,10 +195,10 @@ export function createAccountSwitchKeyboard(accounts, currentAccountId) {
     const prefix = account.isActive ? '🟢' : '⚪';
     // Use first name if available, otherwise fallback to phone number
     const displayName = account.firstName || account.phone;
-    // Note: Button text doesn't need HTML escaping, but we'll escape it anyway for safety
+    // Sanitize button text to ensure valid UTF-8 encoding
     return [
       {
-        text: `${prefix} ${displayName}${account.isActive ? ' (Active)' : ''}`,
+        text: `${prefix} ${sanitizeButtonText(displayName)}${account.isActive ? ' (Active)' : ''}`,
         callback_data: `switch_account_${account.accountId}`
       },
       {
@@ -400,12 +401,14 @@ export function createMessagePoolListKeyboard(messages, page = 0, pageSize = 3) 
   pageMessages.forEach((msg, idx) => {
     // Extend title text to take maximum space (longer text = wider button)
     const displayText = msg.text.length > 60 ? msg.text.substring(0, 60) + '...' : msg.text;
+    // Sanitize button text to ensure valid UTF-8 encoding
+    const sanitizedText = sanitizeButtonText(displayText);
     const statusIcon = msg.is_active ? '✅' : '❌';
     const globalIndex = start + idx + 1;
     
     // Message title (extended) and small bin button (just emoji)
     buttons.push([
-      { text: `${statusIcon} ${globalIndex}. ${displayText}`, callback_data: `pool_toggle_${msg.id}` },
+      { text: `${statusIcon} ${globalIndex}. ${sanitizedText}`, callback_data: `pool_toggle_${msg.id}` },
       { text: '🗑️', callback_data: `pool_delete_${msg.id}` }
     ]);
   });

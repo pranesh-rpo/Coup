@@ -201,7 +201,7 @@ class AutoReplyIntervalService {
         return;
       }
 
-      const userId = accountQuery.rows[0].user_id;
+      const userId = accountQuery.rows[0]?.user_id;
       const client = await accountLinker.getClientAndConnect(userId, accountId);
       if (!client || !client.connected) {
         return;
@@ -216,7 +216,34 @@ class AutoReplyIntervalService {
       const now = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
 
       // Get dialogs (chats)
-      const dialogs = await client.getDialogs();
+      let dialogs = [];
+      try {
+        dialogs = await client.getDialogs();
+      } catch (dialogsError) {
+        // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+        const errorMessage = dialogsError.message || dialogsError.toString() || '';
+        const errorCode = dialogsError.code || dialogsError.errorCode || dialogsError.response?.error_code;
+        const isSessionRevoked = 
+          dialogsError.errorMessage === 'SESSION_REVOKED' || 
+          dialogsError.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+          (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+          errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+          errorMessage.includes('SESSION_REVOKED');
+        
+        if (isSessionRevoked) {
+          console.log(`[AUTO_REPLY_INTERVAL] Session revoked for account ${accountId} - marking for re-authentication`);
+          try {
+            await accountLinker.handleSessionRevoked(accountId);
+          } catch (revokeError) {
+            console.log(`[AUTO_REPLY_INTERVAL] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+          }
+          // Stop interval check for this account
+          this.stopIntervalCheck(accountId);
+          return;
+        }
+        // Re-throw if it's not a session error
+        throw dialogsError;
+      }
       const me = await client.getMe();
 
       for (const dialog of dialogs) {
@@ -347,6 +374,47 @@ class AutoReplyIntervalService {
       // Update last checked timestamps
       this.lastChecked.set(accountIdStr, lastCheck);
     } catch (error) {
+      // Check if user deleted their Telegram account
+      if (accountLinker.isUserDeletedError(error)) {
+        console.log(`[AUTO_REPLY_INTERVAL] User deleted their Telegram account for account ${accountId} - cleaning up all data`);
+        try {
+          const accountQuery = await db.query(
+            'SELECT user_id FROM accounts WHERE account_id = $1',
+            [accountId]
+          );
+          if (accountQuery.rows.length > 0) {
+            const deletedUserId = accountQuery.rows[0]?.user_id;
+            await accountLinker.cleanupUserData(deletedUserId);
+          }
+        } catch (cleanupError) {
+          console.log(`[AUTO_REPLY_INTERVAL] Error cleaning up user data: ${cleanupError.message}`);
+        }
+        this.stopIntervalCheck(accountId);
+        return;
+      }
+      
+      // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+      const errorMessage = error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || error.response?.error_code;
+      const isSessionRevoked = 
+        error.errorMessage === 'SESSION_REVOKED' || 
+        error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+        (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+        errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+        errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[AUTO_REPLY_INTERVAL] Session revoked for account ${accountId} - marking for re-authentication`);
+        try {
+          await accountLinker.handleSessionRevoked(accountId);
+        } catch (revokeError) {
+          console.log(`[AUTO_REPLY_INTERVAL] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+        }
+        // Stop interval check for this account
+        this.stopIntervalCheck(accountId);
+        return;
+      }
+      
       logError(`[AUTO_REPLY_INTERVAL] Error checking messages for account ${accountId}:`, error);
     }
   }

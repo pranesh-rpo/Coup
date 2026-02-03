@@ -127,7 +127,7 @@ class MessageService {
          WHERE account_id = $1 AND is_active = TRUE`,
         [accountId]
       );
-      return parseInt(result.rows[0].count) > 0;
+      return parseInt(result.rows[0]?.count) > 0;
     } catch (error) {
       logger.logError('MESSAGE', accountId, error, 'Failed to check if messages exist');
       return false;
@@ -229,7 +229,7 @@ class MessageService {
       );
 
       if (duplicateCheck.rows.length > 0) {
-        console.log(`[MESSAGE_POOL] Message already exists in pool (ID: ${duplicateCheck.rows[0].id})`);
+        console.log(`[MESSAGE_POOL] Message already exists in pool (ID: ${duplicateCheck.rows[0]?.id})`);
         return { success: false, error: 'This message is already in the pool', isDuplicate: true };
       }
 
@@ -278,8 +278,8 @@ class MessageService {
         [accountId, messageText, entitiesJson, nextOrder]
       );
 
-      logger.logChange('MESSAGE_POOL', accountId, `Message added to pool (ID: ${result.rows[0].id})`);
-      return { success: true, messageId: result.rows[0].id };
+      logger.logChange('MESSAGE_POOL', accountId, `Message added to pool (ID: ${result.rows[0]?.id})`);
+      return { success: true, messageId: result.rows[0]?.id };
     } catch (error) {
       logger.logError('MESSAGE_POOL', accountId, error, 'Failed to add message to pool');
       return { success: false, error: error.message };
@@ -500,7 +500,7 @@ class MessageService {
         return { success: false, error: 'Message not found' };
       }
 
-      const currentActive = currentResult.rows[0].is_active === 1;
+      const currentActive = currentResult.rows[0]?.is_active === 1;
       const newActive = !currentActive;
 
       await db.query(
@@ -528,7 +528,7 @@ class MessageService {
          WHERE account_id = $1 AND is_active = TRUE`,
         [accountId]
       );
-      return parseInt(result.rows[0].count) > 0;
+      return parseInt(result.rows[0]?.count) > 0;
     } catch (error) {
       logger.logError('MESSAGE_POOL', accountId, error, 'Failed to check message pool');
       return false;
@@ -598,8 +598,8 @@ class MessageService {
           [accountId]
         );
         
-        if (oldMessageQuery.rows.length > 0 && oldMessageQuery.rows[0].saved_message_id) {
-          const oldMessageId = oldMessageQuery.rows[0].saved_message_id;
+        if (oldMessageQuery.rows.length > 0 && oldMessageQuery.rows[0]?.saved_message_id) {
+          const oldMessageId = oldMessageQuery.rows[0]?.saved_message_id;
           try {
             await client.deleteMessages(savedMessagesEntity, [oldMessageId], { revoke: false });
             console.log(`[FORWARD_TO_SAVED] Deleted old message (ID: ${oldMessageId}) from Saved Messages`);
@@ -675,8 +675,8 @@ class MessageService {
           [accountId]
         );
         
-        if (oldMessageQuery.rows.length > 0 && oldMessageQuery.rows[0].saved_message_id) {
-          const oldMessageId = oldMessageQuery.rows[0].saved_message_id;
+        if (oldMessageQuery.rows.length > 0 && oldMessageQuery.rows[0]?.saved_message_id) {
+          const oldMessageId = oldMessageQuery.rows[0]?.saved_message_id;
           try {
             // Delete the old message from Saved Messages
             await client.deleteMessages(savedMessagesEntity, [oldMessageId], { revoke: false });

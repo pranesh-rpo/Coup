@@ -20,13 +20,14 @@ import { escapeHtml, stripHtmlTags } from '../utils/textHelpers.js';
 import { Api } from 'telegram/tl/index.js';
 import db from '../database/db.js';
 
-// Store reference to pending phone numbers set for setting pending state
-// This will be set by index.js
+// Store reference to pending phone numbers Map/Set for setting pending state
+// This will be set by index.js (currently a Map: userId -> { messageId })
 let pendingPhoneNumbersSet = null;
 
 /**
- * Set the pending phone numbers set reference (called from index.js)
+ * Set the pending phone numbers Map/Set reference (called from index.js)
  * This allows commandHandler to set pending state when redirecting to link account
+ * @param {Map|Set} pendingSet - Map or Set to track pending phone number states
  */
 export function setPendingPhoneNumbersReference(pendingSet) {
   pendingPhoneNumbersSet = pendingSet;
@@ -37,7 +38,13 @@ export function setPendingPhoneNumbersReference(pendingSet) {
  */
 function addPendingPhoneNumber(userId) {
   if (pendingPhoneNumbersSet) {
-    pendingPhoneNumbersSet.add(userId);
+    // pendingPhoneNumbersSet is actually a Map, not a Set
+    // Use .set() instead of .add() to work with Map
+    if (pendingPhoneNumbersSet instanceof Map) {
+      pendingPhoneNumbersSet.set(userId, {});
+    } else if (pendingPhoneNumbersSet instanceof Set) {
+      pendingPhoneNumbersSet.add(userId);
+    }
     // Set timeout to clear after 5 minutes
     setTimeout(() => {
       if (pendingPhoneNumbersSet.has(userId)) {
@@ -2533,10 +2540,15 @@ export async function handleLoggerBotButton(bot, callbackQuery) {
         chatId,
         callbackQuery.message.message_id,
         `📝 <b>Start Logger Bot</b>\n\n` +
-        `The logger bot sends you important logs about your account activity, including:\n\n` +
-        `• Broadcast status updates\n` +
-        `• Account activity notifications\n` +
-        `• Important system messages\n\n` +
+        `The logger bot sends you comprehensive logs about your account activity, including:\n\n` +
+        `📢 Broadcast status, cycle stats, daily cap warnings\n` +
+        `👥 Group refresh, add/remove events\n` +
+        `⚙️ Settings changes (interval, quiet hours, schedule)\n` +
+        `💬 Auto-reply activity (DM & groups)\n` +
+        `🔑 Account status, session issues\n` +
+        `📝 Message pool changes, message updates\n` +
+        `⭐ Premium status changes\n` +
+        `⚠️ Rate limits, errors, connection issues\n\n` +
         `To start the logger bot, click the button below and send /start to @${loggerBotUsername}:`,
         {
           parse_mode: 'HTML',

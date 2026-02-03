@@ -2287,6 +2287,18 @@ bot.on('callback_query', async (callbackQuery) => {
 
 // Error handling
 bot.on('polling_error', (error) => {
+  const errorMessage = error.message || error.toString() || '';
+  const errorCode = error.code || error.response?.error_code;
+  
+  // Check if it's a 409 Conflict (multiple bot instances polling)
+  // This is not a critical error - just means another instance is using the bot token
+  if (errorCode === 409 || errorMessage.includes('409') || errorMessage.includes('Conflict') || 
+      errorMessage.includes('terminated by other getUpdates request')) {
+    // Silently ignore - this is expected when multiple instances are running
+    // Don't log as error to avoid spam
+    return;
+  }
+  
   // Check if it's a flood wait error
   if (isFloodWaitError(error)) {
     const waitSeconds = extractWaitTime(error);
@@ -2472,11 +2484,22 @@ async function gracefulShutdown(signal) {
     
     // Close database connections
     console.log('[SHUTDOWN] Closing database connections...');
-    await Promise.race([
-      db.close(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('DB close timeout')), 5000))
-    ]);
-    console.log('[SHUTDOWN] Database closed');
+    let dbTimeoutId;
+    try {
+      await Promise.race([
+        db.close(),
+        new Promise((_, reject) => {
+          dbTimeoutId = setTimeout(() => reject(new Error('DB close timeout')), 5000);
+        })
+      ]);
+      // Clear timeout if db.close() completed before timeout
+      if (dbTimeoutId) clearTimeout(dbTimeoutId);
+      console.log('[SHUTDOWN] Database closed');
+    } catch (error) {
+      // Clear timeout if error occurred
+      if (dbTimeoutId) clearTimeout(dbTimeoutId);
+      console.log(`[SHUTDOWN] Database close completed (timeout or error): ${error.message}`);
+    }
     
     // Notify admins of shutdown
     try {

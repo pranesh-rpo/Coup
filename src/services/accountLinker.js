@@ -324,6 +324,149 @@ class AccountLinker {
     throw lastError;
   }
 
+  /**
+   * Clean up all account-related data when account is deleted
+   * This ensures all related data is properly removed
+   */
+  async cleanupAccountData(accountId) {
+    try {
+      const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
+      
+      // Stop any running broadcasts
+      const automationService = (await import('./automationService.js')).default;
+      const accountQuery = await db.query(
+        'SELECT user_id FROM accounts WHERE account_id = $1',
+        [accountIdNum]
+      );
+      
+      if (accountQuery.rows.length > 0) {
+        const userId = accountQuery.rows[0]?.user_id;
+        if (automationService.isBroadcasting(userId, accountIdNum)) {
+          await automationService.stopBroadcast(userId, accountIdNum);
+          console.log(`[CLEANUP] Stopped broadcast for account ${accountId} during cleanup`);
+        }
+      }
+      
+      // Stop auto-reply services
+      try {
+        const autoReplyPollingService = (await import('./autoReplyPollingService.js')).default;
+        autoReplyPollingService.stopPolling(accountIdNum);
+      } catch (e) {
+        // Ignore if service not initialized
+      }
+      
+      try {
+        const autoReplyIntervalService = (await import('./autoReplyIntervalService.js')).default;
+        autoReplyIntervalService.stopIntervalCheck(accountIdNum);
+      } catch (e) {
+        // Ignore if service not initialized
+      }
+      
+      // Disconnect client if still connected
+      const accountIdStr = accountIdNum.toString();
+      const account = this.linkedAccounts.get(accountIdStr);
+      if (account && account.client) {
+        try {
+          if (account.client.connected) {
+            await account.client.disconnect();
+            console.log(`[CLEANUP] Disconnected client for account ${accountId}`);
+          }
+        } catch (e) {
+          // Ignore disconnect errors
+        }
+      }
+      
+      // Remove from memory
+      this.linkedAccounts.delete(accountIdStr);
+      
+      // Remove from user accounts tracking
+      if (account) {
+        const userIdStr = account.userId.toString();
+        const userAccountIds = this.userAccounts.get(userIdStr);
+        if (userAccountIds) {
+          userAccountIds.delete(accountIdStr);
+          if (userAccountIds.size === 0) {
+            this.userAccounts.delete(userIdStr);
+          }
+        }
+      }
+      
+      console.log(`[CLEANUP] Cleaned up account ${accountId} data`);
+    } catch (error) {
+      logError(`[CLEANUP ERROR] Error cleaning up account ${accountId}:`, error);
+    }
+  }
+
+  /**
+   * Clean up all user data when user deletes their Telegram account
+   * This removes all accounts and related data for the user
+   */
+  async cleanupUserData(userId) {
+    try {
+      const userIdNum = typeof userId === 'string' ? parseInt(userId) : userId;
+      const userIdStr = userIdNum.toString();
+      
+      console.log(`[CLEANUP] Starting cleanup for user ${userId}`);
+      
+      // Get all accounts for this user
+      const accountsQuery = await db.query(
+        'SELECT account_id FROM accounts WHERE user_id = $1',
+        [userIdNum]
+      );
+      
+      // Clean up each account
+      for (const row of accountsQuery.rows) {
+        const accountId = row.account_id;
+        await this.cleanupAccountData(accountId);
+      }
+      
+      // Delete all accounts (CASCADE will handle related data)
+      await db.query('DELETE FROM accounts WHERE user_id = $1', [userIdNum]);
+      
+      // Delete user record (CASCADE will handle user_roles, premium_subscriptions, etc.)
+      await db.query('DELETE FROM users WHERE user_id = $1', [userIdNum]);
+      
+      // Clean up pending verifications
+      await db.query('DELETE FROM pending_verifications WHERE user_id = $1', [userIdNum]);
+      
+      // Remove from memory
+      this.userAccounts.delete(userIdStr);
+      
+      console.log(`[CLEANUP] Cleaned up all data for user ${userId}`);
+      logger.logChange('USER_DELETED', userId, `User ${userId} deleted their Telegram account - all data cleaned up`);
+      
+      // Notify admins
+      adminNotifier.notifyEvent('USER_DELETED', `User ${userId} deleted their Telegram account`, {
+        userId,
+        details: 'All user data and accounts have been cleaned up.',
+      }).catch(() => {});
+      
+      return { success: true };
+    } catch (error) {
+      logError(`[CLEANUP ERROR] Error cleaning up user ${userId}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Check if error indicates user deleted their Telegram account
+   */
+  isUserDeletedError(error) {
+    if (!error) return false;
+    
+    const errorMessage = error.message || error.toString() || '';
+    const errorCode = error.code || error.errorCode || error.response?.error_code;
+    const errorMsg = error.errorMessage || '';
+    
+    return (
+      errorMsg === 'USER_DEACTIVATED' ||
+      errorMessage.includes('USER_DEACTIVATED') ||
+      errorMessage.includes('user deactivated') ||
+      errorMessage.includes('user is deactivated') ||
+      (errorCode === 401 && errorMessage.includes('USER_DEACTIVATED'))
+    );
+  }
+
   async handleSessionRevoked(accountId) {
     try {
       const accountIdNum = typeof accountId === 'string' ? parseInt(accountId) : accountId;
@@ -385,38 +528,14 @@ class AccountLinker {
         return { success: true, action: 'protected_main_account', message: 'Main account is protected from session revocation handling' };
       }
       
-      if (account) {
-        // Disconnect the client
-        try {
-          if (account.client && account.client.connected) {
-            await account.client.disconnect();
-            console.log(`[ACCOUNT] Disconnected client for account ${accountId}`);
-          }
-        } catch (error) {
-          logError(`[ACCOUNT ERROR] Error disconnecting client:`, error);
-        }
-        
-        // Remove from memory
-        this.linkedAccounts.delete(accountIdStr);
-        console.log(`[ACCOUNT] Removed account ${accountId} from memory`);
-        
-        // Remove from user accounts tracking
-        const userIdStr = account.userId.toString();
-        const userAccountIds = this.userAccounts.get(userIdStr);
-        if (userAccountIds) {
-          userAccountIds.delete(accountIdStr);
-          // If user has no more accounts, remove the user entry
-          if (userAccountIds.size === 0) {
-            this.userAccounts.delete(userIdStr);
-          }
-        }
-      }
+      // Clean up account data (stop broadcasts, disconnect, remove from memory)
+      await this.cleanupAccountData(accountIdNum);
       
       // Instead of deleting the account, mark session as revoked and inactive
       // Use empty string instead of NULL to avoid NOT NULL constraint violation
       // This prevents accounts from being deleted unnecessarily
       const updateResult = await db.query(
-        'UPDATE accounts SET session_string = ?, is_active = 0 WHERE account_id = ?',
+        'UPDATE accounts SET session_string = ?, is_active = 0, is_broadcasting = 0 WHERE account_id = ?',
         ['', accountIdNum]
       );
       
@@ -772,9 +891,9 @@ class AccountLinker {
       
       if (existing.rows.length > 0) {
         // Update existing account
-        accountId = existing.rows[0].account_id;
+        accountId = existing.rows[0]?.account_id;
         // Convert SQLite INTEGER (0/1) to JavaScript boolean
-        isActive = existing.rows[0].is_active === 1 || existing.rows[0].is_active === true;
+        isActive = existing.rows[0]?.is_active === 1 || existing.rows[0]?.is_active === true;
         
         // CRITICAL: Validate sessionString again before UPDATE
         if (!sessionString || typeof sessionString !== 'string' || sessionString.trim().length === 0) {
@@ -802,7 +921,7 @@ class AccountLinker {
           'SELECT COUNT(*) as count FROM accounts WHERE user_id = $1',
           [userIdNum]
         );
-        const accountCount = parseInt(userAccounts.rows[0].count);
+        const accountCount = parseInt(userAccounts.rows[0]?.count) || 0;
         
         // Only set as active if this is the first account for the user
         // If other accounts exist, ensure they're deactivated first
@@ -959,32 +1078,11 @@ class AccountLinker {
         throw new Error(errorMsg);
       }
       
-      // Disconnect client if connected
-      if (account.client) {
-        try {
-          if (account.client.connected) {
-            await account.client.disconnect();
-            console.log(`[DELETE ACCOUNT] Disconnected client for account ${accountId}`);
-          }
-        } catch (e) {
-          logError(`[ACCOUNT ERROR] Error disconnecting client for account ${accountId}:`, e);
-        }
-      }
+      // Clean up account data (stop broadcasts, disconnect, remove from memory)
+      await this.cleanupAccountData(accountIdNum);
       
       // Delete from database (CASCADE will delete related data)
       await db.query('DELETE FROM accounts WHERE account_id = $1', [accountIdNum]);
-      
-      // Remove from memory
-      this.linkedAccounts.delete(accountIdStr);
-      
-      // Remove from user accounts tracking
-      if (this.userAccounts.has(userIdStr)) {
-        this.userAccounts.get(userIdStr).delete(accountIdStr);
-        // If user has no more accounts, remove the user entry
-        if (this.userAccounts.get(userIdStr).size === 0) {
-          this.userAccounts.delete(userIdStr);
-        }
-      }
       
       console.log(`[ACCOUNT] Deleted account ${accountId} for user ${userId}`);
       logger.logChange('DELETE_ACCOUNT', userId, `Account ${accountId} deleted from database`);

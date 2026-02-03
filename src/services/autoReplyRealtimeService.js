@@ -93,7 +93,7 @@ class AutoReplyRealtimeService {
         await this.disconnectAccount(accountId);
         return false;
       }
-      const userId = result.rows[0].user_id;
+      const userId = result.rows[0]?.user_id;
 
       // Check if already connected
       const existingAccount = this.connectedAccounts.get(accountIdStr);

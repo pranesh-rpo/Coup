@@ -26,7 +26,7 @@ class GroupService {
         'SELECT COUNT(*) as count FROM groups WHERE account_id = $1 AND is_active = TRUE',
         [accountIdNum]
       );
-      return parseInt(result.rows[0].count) || 0;
+      return parseInt(result.rows[0]?.count) || 0;
     } catch (error) {
       logError(`[GROUPS ERROR] Error getting active groups count for account ${accountId}:`, error);
       return 0;

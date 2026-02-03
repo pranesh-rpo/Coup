@@ -103,7 +103,7 @@ class AutoReplyPollingService {
         return;
       }
 
-      const userId = result.rows[0].user_id;
+      const userId = result.rows[0]?.user_id;
 
       // Connect briefly to check messages
       const client = await accountLinker.getClientAndConnect(userId, accountId);
@@ -136,7 +136,34 @@ class AutoReplyPollingService {
         }
 
         const me = await client.getMe();
-        const dialogs = await client.getDialogs({ limit: 50 }); // Check recent dialogs
+        let dialogs = [];
+        try {
+          dialogs = await client.getDialogs({ limit: 50 }); // Check recent dialogs
+        } catch (dialogsError) {
+          // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+          const errorMessage = dialogsError.message || dialogsError.toString() || '';
+          const errorCode = dialogsError.code || dialogsError.errorCode || dialogsError.response?.error_code;
+          const isSessionRevoked = 
+            dialogsError.errorMessage === 'SESSION_REVOKED' || 
+            dialogsError.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+            (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+            errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+            errorMessage.includes('SESSION_REVOKED');
+          
+          if (isSessionRevoked) {
+            console.log(`[AUTO_REPLY_POLL] Session revoked for account ${accountId} - marking for re-authentication`);
+            try {
+              await accountLinker.handleSessionRevoked(accountId);
+            } catch (revokeError) {
+              console.log(`[AUTO_REPLY_POLL] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+            }
+            // Stop polling for this account
+            this.stopPolling(accountId);
+            return;
+          }
+          // Re-throw if it's not a session error
+          throw dialogsError;
+        }
 
         // Initialize lastCheck with current time if not set (prevents processing old messages on first run)
         const now = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
@@ -247,6 +274,48 @@ class AutoReplyPollingService {
         }
       }
     } catch (error) {
+      // Check if user deleted their Telegram account
+      if (accountLinker.isUserDeletedError(error)) {
+        console.log(`[AUTO_REPLY_POLL] User deleted their Telegram account for account ${accountId} - cleaning up all data`);
+        try {
+          const db = (await import('../database/db.js')).default;
+          const accountQuery = await db.query(
+            'SELECT user_id FROM accounts WHERE account_id = $1',
+            [accountId]
+          );
+          if (accountQuery.rows.length > 0) {
+            const deletedUserId = accountQuery.rows[0]?.user_id;
+            await accountLinker.cleanupUserData(deletedUserId);
+          }
+        } catch (cleanupError) {
+          console.log(`[AUTO_REPLY_POLL] Error cleaning up user data: ${cleanupError.message}`);
+        }
+        this.stopPolling(accountId);
+        return;
+      }
+      
+      // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+      const errorMessage = error.message || error.toString() || '';
+      const errorCode = error.code || error.errorCode || error.response?.error_code;
+      const isSessionRevoked = 
+        error.errorMessage === 'SESSION_REVOKED' || 
+        error.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+        (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+        errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+        errorMessage.includes('SESSION_REVOKED');
+      
+      if (isSessionRevoked) {
+        console.log(`[AUTO_REPLY_POLL] Session revoked for account ${accountId} - marking for re-authentication`);
+        try {
+          await accountLinker.handleSessionRevoked(accountId);
+        } catch (revokeError) {
+          console.log(`[AUTO_REPLY_POLL] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+        }
+        // Stop polling for this account
+        this.stopPolling(accountId);
+        return;
+      }
+      
       console.error(`[AUTO_REPLY_POLL] ❌ Error in checkAndReply for account ${accountId}:`, error.message);
       logError(`[AUTO_REPLY_POLL] Error in checkAndReply for account ${accountId}:`, error);
       

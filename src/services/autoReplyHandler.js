@@ -33,6 +33,9 @@ class AutoReplyHandler {
     // Minimum delay between messages from same account (anti-detection)
     this.MIN_MESSAGE_INTERVAL = 3000; // 3 seconds minimum between messages
     
+    // Cleanup interval ID for periodic cleanup
+    this.cleanupIntervalId = null;
+    
     // Cleanup old entries periodically
     this.startCleanupInterval();
   }
@@ -41,9 +44,24 @@ class AutoReplyHandler {
    * Start periodic cleanup of old entries
    */
   startCleanupInterval() {
-    setInterval(() => {
+    // Clear existing interval if any
+    if (this.cleanupIntervalId) {
+      clearInterval(this.cleanupIntervalId);
+    }
+    
+    this.cleanupIntervalId = setInterval(() => {
       this.cleanupOldEntries();
     }, 60 * 60 * 1000); // Every hour
+  }
+
+  /**
+   * Stop cleanup interval
+   */
+  stopCleanupInterval() {
+    if (this.cleanupIntervalId) {
+      clearInterval(this.cleanupIntervalId);
+      this.cleanupIntervalId = null;
+    }
   }
 
   /**
@@ -435,11 +453,10 @@ class AutoReplyHandler {
 
       // Handle DM auto-reply
       if (isDM && settings.autoReplyDmEnabled && settings.autoReplyDmMessage) {
-        // TODO: Re-enable 30-minute cooldown per chat for production
-        // Check cooldown (DISABLED FOR TESTING - can be re-enabled later)
-        // if (this.hasRepliedToChatRecently(accountId, chatId)) {
-        //   return;
-        // }
+        // Check cooldown (30-minute cooldown per chat to prevent spam)
+        if (this.hasRepliedToChatRecently(accountId, chatId)) {
+          return;
+        }
 
         // Check client connection
         if (!client.connected) {
@@ -474,7 +491,7 @@ class AutoReplyHandler {
             // Double-check rate limiting right before sending
             if (!this.canSendMessage(accountId)) {
               const lastSent = this.lastMessageSent.get(accountId);
-              const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
+              const waitTime = Math.max(1000, this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent)); // Ensure minimum 1 second wait
               console.log(`[AUTO_REPLY] Rate limit hit: Rescheduling DM reply for account ${accountId} in ${Math.ceil(waitTime/1000)}s`);
               setTimeout(sendReply, waitTime);
               return;
@@ -489,7 +506,7 @@ class AutoReplyHandler {
               return;
             }
             
-            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0].user_id, accountId);
+            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0]?.user_id, accountId);
             if (!freshClient || !freshClient.connected) {
               console.error(`[AUTO_REPLY] Could not connect for DM auto-reply (account ${accountId})`);
               return;
@@ -517,8 +534,8 @@ class AutoReplyHandler {
             } catch (statusError) {
               // Ignore status errors
             }
-            // TODO: Re-enable chat marking for 30-minute cooldown (DISABLED FOR TESTING)
-            // this.markChatAsReplied(accountId, chatId);
+            // Mark chat as replied to enforce 30-minute cooldown
+            this.markChatAsReplied(accountId, chatId);
             console.log(`[AUTO_REPLY] ✅ DM auto-reply sent for account ${accountId}`);
             
             // Log to logger bot
@@ -528,7 +545,7 @@ class AutoReplyHandler {
               const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
               
               if (accountResult.rows && accountResult.rows.length > 0) {
-                const userId = accountResult.rows[0].user_id;
+                const userId = accountResult.rows[0]?.user_id;
                 const chatName = chat.firstName || chat.username || chat.id || 'Unknown';
                 loggerBotService.logAutoReply(userId, accountId, message, settings.autoReplyDmMessage, {
                   name: chatName,
@@ -643,7 +660,7 @@ class AutoReplyHandler {
               return;
             }
             
-            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0].user_id, accountId);
+            const freshClient = await accountLinker.getClientAndConnect(accountResult.rows[0]?.user_id, accountId);
             if (!freshClient || !freshClient.connected) {
               console.error(`[AUTO_REPLY] Could not connect for group auto-reply (account ${accountId})`);
               return;
@@ -683,7 +700,7 @@ class AutoReplyHandler {
               const accountResult = await db.query('SELECT user_id FROM accounts WHERE account_id = ?', [accountId]);
               
               if (accountResult.rows && accountResult.rows.length > 0) {
-                const userId = accountResult.rows[0].user_id;
+                const userId = accountResult.rows[0]?.user_id;
                 const chatName = chat.title || chat.username || chat.id || 'Unknown';
                 loggerBotService.logAutoReply(userId, accountId, message, settings.autoReplyGroupsMessage, {
                   name: chatName,

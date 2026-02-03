@@ -1690,6 +1690,45 @@ class AutomationService {
         }
         console.log(`[BROADCAST] Retrieved ${dialogs.length} total dialogs for account ${accountId}`);
       } catch (dialogsError) {
+        // Check if user deleted their Telegram account
+        if (accountLinker.isUserDeletedError(dialogsError)) {
+          console.log(`[BROADCAST] User deleted their Telegram account for account ${accountId} - cleaning up all data`);
+          try {
+            // Get user ID from account
+            const accountQuery = await db.query(
+              'SELECT user_id FROM accounts WHERE account_id = $1',
+              [accountId]
+            );
+            if (accountQuery.rows.length > 0) {
+              const deletedUserId = accountQuery.rows[0]?.user_id;
+              await accountLinker.cleanupUserData(deletedUserId);
+            }
+          } catch (cleanupError) {
+            console.log(`[BROADCAST] Error cleaning up user data: ${cleanupError.message}`);
+          }
+          await this.stopBroadcast(userId, accountId);
+          return;
+        }
+        
+        // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+        const errorMessage = dialogsError.message || dialogsError.toString() || '';
+        const errorCode = dialogsError.code || dialogsError.errorCode || dialogsError.response?.error_code;
+        const isSessionRevoked = 
+          dialogsError.errorMessage === 'SESSION_REVOKED' || 
+          dialogsError.errorMessage === 'AUTH_KEY_UNREGISTERED' ||
+          (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+          errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+          errorMessage.includes('SESSION_REVOKED');
+        
+        if (isSessionRevoked) {
+          console.log(`[BROADCAST] Session revoked for account ${accountId} - marking for re-authentication`);
+          try {
+            await accountLinker.handleSessionRevoked(accountId);
+          } catch (revokeError) {
+            console.log(`[BROADCAST] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+          }
+        }
+        
         logError(`[BROADCAST ERROR] Failed to get dialogs for account ${accountId}:`, dialogsError);
         console.log(`[BROADCAST] Error getting dialogs: ${dialogsError.message}, stopping broadcast`);
         await this.stopBroadcast(userId, accountId);
@@ -1993,16 +2032,16 @@ class AutomationService {
               console.log(`[BROADCAST] Group "${groupName}": ⚠️ No message in Saved Messages, using fallback message`);
             }
             
-            // Log entities at start of group processing
+            // Log entities at start of group processing (only log if entities found or debug needed)
             if (entitiesToUse && entitiesToUse.length > 0) {
               console.log(`[BROADCAST] Group "${groupName}": Starting with ${entitiesToUse.length} entities`);
             } else {
-              console.log(`[BROADCAST] Group "${groupName}": ⚠️ No entities available, checking broadcast data...`);
               // Fallback: try to get from broadcast data
               if (broadcast.messageEntities && broadcast.messageEntities.length > 0) {
                 entitiesToUse = broadcast.messageEntities;
                 console.log(`[BROADCAST] Group "${groupName}": Using ${entitiesToUse.length} entities from broadcast data`);
               }
+              // Removed verbose "No entities available" log - this is normal for plain text messages
             }
             
             // OPTIMIZATION: Use cached settings instead of fetching from database again
@@ -2084,7 +2123,10 @@ class AutomationService {
               mentionCount = 5;
             }
             
-            console.log(`[BROADCAST] Auto-mention check for group ${group.name}: enabled=${autoMention}, count=${mentionCount}`);
+            // Only log auto-mention status if enabled (reduce log verbosity)
+            if (autoMention) {
+              console.log(`[BROADCAST] Auto-mention check for group ${group.name}: enabled=${autoMention}, count=${mentionCount}`);
+            }
             
             let messageToSend = messageToUse;
             let entities = [];
@@ -2209,25 +2251,36 @@ class AutomationService {
                   excludeUserId
                 );
                 
+                let timeoutId;
                 const timeoutPromise = new Promise((_, reject) => {
-                  setTimeout(() => reject(new Error('Mention fetch timeout (3s)')), 3000);
+                  timeoutId = setTimeout(() => reject(new Error('Mention fetch timeout (3s)')), 3000);
                 });
                 
-                const mentionResult = await Promise.race([mentionPromise, timeoutPromise]);
-                messageToSend = mentionResult.message;
-                // Merge mention entities with existing entities (premium emojis)
-                const mentionEntities = mentionResult.entities || [];
-                entities = [...entities, ...mentionEntities]; // Preserve premium emoji entities
-                console.log(`[BROADCAST] Added ${mentionEntities.length} mentions to message for group ${group.name} (total entities: ${entities.length})`);
-              } catch (error) {
-                console.log(`[BROADCAST] Failed to add mentions (timeout or error), sending without mentions: ${error.message}`);
-                // Continue with original message if mention fails or times out
-                // Keep existing entities (premium emojis) even if mentions fail
+                try {
+                  const mentionResult = await Promise.race([mentionPromise, timeoutPromise]);
+                  // Clear timeout if promise resolved before timeout
+                  if (timeoutId) clearTimeout(timeoutId);
+                  messageToSend = mentionResult.message;
+                  // Merge mention entities with existing entities (premium emojis)
+                  const mentionEntities = mentionResult.entities || [];
+                  entities = [...entities, ...mentionEntities]; // Preserve premium emoji entities
+                  console.log(`[BROADCAST] Added ${mentionEntities.length} mentions to message for group ${group.name} (total entities: ${entities.length})`);
+                } catch (error) {
+                  // Clear timeout if error occurred
+                  if (timeoutId) clearTimeout(timeoutId);
+                  console.log(`[BROADCAST] Failed to add mentions (timeout or error), sending without mentions: ${error.message}`);
+                  // Continue with original message if mention fails or times out
+                  // Keep existing entities (premium emojis) even if mentions fail
+                  messageToSend = message;
+                  // Don't clear entities - they may contain premium emojis
+                }
+              } catch (outerError) {
+                // Handle any other errors in the mention process
+                console.log(`[BROADCAST] Error in mention process: ${outerError.message}`);
                 messageToSend = message;
-                // Don't clear entities - they may contain premium emojis
               }
             } else {
-              console.log(`[BROADCAST] Auto-mention is DISABLED for group ${group.name}`);
+              // Removed verbose "Auto-mention is DISABLED" log - only log when enabled
             }
             
             // Send message with entities (mentions or premium emojis)
@@ -2671,6 +2724,27 @@ class AutomationService {
             continue;
           }
           
+          // Check if user deleted their Telegram account
+          if (accountLinker.isUserDeletedError(error)) {
+            console.log(`[BROADCAST] User deleted their Telegram account for account ${accountId} - cleaning up all data`);
+            try {
+              // Get user ID from account
+              const accountQuery = await db.query(
+                'SELECT user_id FROM accounts WHERE account_id = $1',
+                [accountId]
+              );
+              if (accountQuery.rows.length > 0) {
+                const deletedUserId = accountQuery.rows[0]?.user_id;
+                await accountLinker.cleanupUserData(deletedUserId);
+              }
+            } catch (cleanupError) {
+              console.log(`[BROADCAST] Error cleaning up user data: ${cleanupError.message}`);
+            }
+            // Stop broadcast for this account
+            await this.stopBroadcast(userId, accountId);
+            break;
+          }
+          
           // Check if it's a SESSION_REVOKED error
           if (error.errorMessage === 'SESSION_REVOKED' || (error.code === 401 && error.message && error.message.includes('SESSION_REVOKED'))) {
             logError(`[BROADCAST ERROR] Session revoked for account ${accountId} during broadcast`);
@@ -2975,13 +3049,20 @@ class AutomationService {
                 // Try to add mentions if enabled (but don't fail if it doesn't work)
                 if (autoMention) {
                   try {
-                    const mentionResult = await Promise.race([
-                      mentionService.addMentionsToMessage(client, group.entity, message, mentionCount, cachedExcludeUserId),
-                      new Promise((_, reject) => setTimeout(() => reject(new Error('Mention timeout')), 2000))
-                    ]);
+                    let timeoutId;
+                    const mentionPromise = mentionService.addMentionsToMessage(client, group.entity, message, mentionCount, cachedExcludeUserId);
+                    const timeoutPromise = new Promise((_, reject) => {
+                      timeoutId = setTimeout(() => reject(new Error('Mention timeout')), 2000);
+                    });
+                    
+                    const mentionResult = await Promise.race([mentionPromise, timeoutPromise]);
+                    // Clear timeout if promise resolved before timeout
+                    if (timeoutId) clearTimeout(timeoutId);
                     messageToSend = mentionResult.message;
                     entities = mentionResult.entities || [];
                   } catch (mentionError) {
+                    // Clear timeout if error occurred
+                    if (timeoutId) clearTimeout(timeoutId);
                     // Continue without mentions if mention fails
                     messageToSend = message;
                     entities = [];

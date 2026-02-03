@@ -76,9 +76,9 @@ class BackupService {
         return { success: false, error: 'Backup not found' };
       }
       
-      const backupData = typeof result.rows[0].backup_data === 'string' 
-        ? JSON.parse(result.rows[0].backup_data) 
-        : result.rows[0].backup_data;
+      const backupData = typeof result.rows[0]?.backup_data === 'string' 
+        ? JSON.parse(result.rows[0]?.backup_data || '{}') 
+        : result.rows[0]?.backup_data;
       
       // Restore settings
       if (backupData.settings) {

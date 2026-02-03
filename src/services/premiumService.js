@@ -301,10 +301,10 @@ class PremiumService {
       ]);
 
       return {
-        active: parseInt(active.rows[0].count) || 0,
-        expired: parseInt(expired.rows[0].count) || 0,
-        cancelled: parseInt(cancelled.rows[0].count) || 0,
-        totalRevenue: parseFloat(totalRevenue.rows[0].total) || 0
+        active: parseInt(active.rows[0]?.count) || 0,
+        expired: parseInt(expired.rows[0]?.count) || 0,
+        cancelled: parseInt(cancelled.rows[0]?.count) || 0,
+        totalRevenue: parseFloat(totalRevenue.rows[0]?.total) || 0
       };
     } catch (error) {
       logger.logError('PREMIUM', null, error, 'Failed to get statistics');

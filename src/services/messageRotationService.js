@@ -57,7 +57,7 @@ class MessageRotationService {
         return { success: false, error: 'Rotation pool not found' };
       }
 
-      const poolData = JSON.parse(result.rows[0].template_text);
+      const poolData = JSON.parse(result.rows[0]?.template_text || '{}');
       const currentIndex = poolData.currentIndex || 0;
       const message = poolData.messages[currentIndex];
 

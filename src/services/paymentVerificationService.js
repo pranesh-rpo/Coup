@@ -286,7 +286,7 @@ class PaymentVerificationService {
         [userId, transactionId]
       );
 
-      const count = parseInt(result.rows[0].count) || 0;
+      const count = parseInt(result.rows[0]?.count) || 0;
       return {
         isDuplicate: count > 0,
         count

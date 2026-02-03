@@ -339,6 +339,17 @@ function registerAdminCommands(bot) {
       `/groups - List groups by account\n` +
       `/links - Collect all group links (as text file)\n` +
       `/database - Database statistics\n\n` +
+      `<b>⭐ Premium Management:</b>\n` +
+      `/premium_stats - Premium statistics\n` +
+      `/premium_list - List active premium\n` +
+      `/premium_expiring - Expiring subscriptions\n` +
+      `/premium_user &lt;id&gt; - Check user premium\n` +
+      `/premium_add &lt;id&gt; - Add premium\n` +
+      `/premium_revoke &lt;id&gt; - Revoke premium\n` +
+      `/premium_cancel &lt;id&gt; - Cancel premium\n` +
+      `/payment_pending - Pending payments\n` +
+      `/payment_verify &lt;id&gt; - Verify payment\n` +
+      `/payment_reject &lt;id&gt; [reason] - Reject payment\n\n` +
       `<b>👁️ Monitoring:</b>\n` +
       `/logs - View recent logs\n` +
       `/logs_error - View error logs only\n` +
@@ -391,11 +402,11 @@ function registerAdminCommands(bot) {
       const messageCount = await db.query('SELECT COUNT(*) as count FROM messages');
 
       const statsMessage = `📊 <b>Bot Statistics</b>\n\n` +
-        `👥 Total Users: ${userCount.rows[0].count}\n` +
-        `🔑 Total Accounts: ${accountCount.rows[0].count}\n` +
+        `👥 Total Users: ${userCount.rows[0]?.count || 0}\n` +
+        `🔑 Total Accounts: ${accountCount.rows[0]?.count || 0}\n` +
         `📢 Active Broadcasts: ${activeBroadcasts}\n` +
-        `👥 Active Groups: ${groupCount.rows[0].count}\n` +
-        `📝 Total Messages: ${messageCount.rows[0].count}`;
+        `👥 Active Groups: ${groupCount.rows[0]?.count || 0}\n` +
+        `📝 Total Messages: ${messageCount.rows[0]?.count || 0}`;
 
       await bot.sendMessage(msg.chat.id, statsMessage, { parse_mode: 'HTML' });
     } catch (error) {
@@ -419,9 +430,9 @@ function registerAdminCommands(bot) {
 
       let message = `👥 <b>Recent Users</b> (Last 20)\n\n`;
       users.rows.forEach((user, i) => {
-        message += `${i + 1}. <b>${user.first_name || 'Unknown'}</b>\n`;
+        const username = user.username ? `@${user.username}` : 'No username';
+        message += `${i + 1}. <b>${user.first_name || 'Unknown'}</b> (${username})\n`;
         message += `   ID: <code>${user.user_id}</code>\n`;
-        message += `   Username: @${user.username || 'N/A'}\n`;
         message += `   Verified: ${user.is_verified ? '✅' : '❌'}\n`;
         message += `   Joined: ${new Date(user.joined_at).toLocaleString()}\n\n`;
       });
@@ -447,14 +458,22 @@ function registerAdminCommands(bot) {
       );
 
       let message = `🔑 <b>Recent Accounts</b> (Last 20)\n\n`;
-      accounts.rows.forEach((account, i) => {
+      for (let i = 0; i < accounts.rows.length; i++) {
+        const account = accounts.rows[i];
+        // Get user info for display
+        const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [account.user_id]);
+        const userInfo = userResult.rows[0];
+        const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+        const firstName = userInfo?.first_name || 'Unknown';
+        
         message += `${i + 1}. <b>${account.phone}</b>\n`;
         message += `   Account ID: <code>${account.account_id}</code>\n`;
+        message += `   User: <b>${firstName}</b> (${username})\n`;
         message += `   User ID: <code>${account.user_id}</code>\n`;
         message += `   Active: ${account.is_active ? '✅' : '❌'}\n`;
         message += `   Broadcasting: ${account.is_broadcasting ? '📢' : '⏸️'}\n`;
         message += `   Created: ${new Date(account.created_at).toLocaleString()}\n\n`;
-      });
+      }
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
@@ -480,12 +499,20 @@ function registerAdminCommands(bot) {
       }
 
       let message = `📢 <b>Active Broadcasts</b>\n\n`;
-      activeBroadcasts.forEach(([userId, broadcast], i) => {
-        message += `${i + 1}. User ID: <code>${userId}</code>\n`;
+      for (let i = 0; i < activeBroadcasts.length; i++) {
+        const [userId, broadcast] = activeBroadcasts[i];
+        // Get user info for display
+        const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [userId]);
+        const userInfo = userResult.rows[0];
+        const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+        const firstName = userInfo?.first_name || 'Unknown';
+        
+        message += `${i + 1}. <b>${firstName}</b> (${username})\n`;
+        message += `   User ID: <code>${userId}</code>\n`;
         message += `   Account ID: <code>${broadcast.accountId}</code>\n`;
         message += `   Messages Sent: ${broadcast.messageCount || 0}\n`;
         message += `   Running: ${broadcast.isRunning ? '✅' : '❌'}\n\n`;
-      });
+      }
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
@@ -599,7 +626,7 @@ function registerAdminCommands(bot) {
       message += `Verified: ${userData.is_verified ? '✅' : '❌'}\n`;
       message += `Joined: ${new Date(userData.joined_at).toLocaleString()}\n\n`;
       message += `Accounts: ${accounts.rows.length}\n`;
-      message += `Log Entries: ${logs.rows[0].count}`;
+      message += `Log Entries: ${logs.rows[0]?.count || 0}`;
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
@@ -623,9 +650,20 @@ function registerAdminCommands(bot) {
       const broadcastingAccountIds = automationService.getBroadcastingAccountIds(userId);
       
       if (broadcastingAccountIds.length === 0) {
-        await bot.sendMessage(msg.chat.id, `❌ No active broadcasts found for user ${userId}`);
+        // Get user info for display
+        const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [userId]);
+        const userInfo = userResult.rows[0];
+        const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+        const firstName = userInfo?.first_name || 'Unknown';
+        await bot.sendMessage(msg.chat.id, `❌ No active broadcasts found for user <b>${firstName}</b> (${username}) - <code>${userId}</code>`, { parse_mode: 'HTML' });
         return;
       }
+      
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [userId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+      const firstName = userInfo?.first_name || 'Unknown';
       
       let stoppedCount = 0;
       for (const accountId of broadcastingAccountIds) {
@@ -635,7 +673,7 @@ function registerAdminCommands(bot) {
         }
       }
       
-      await bot.sendMessage(msg.chat.id, `✅ Stopped ${stoppedCount} broadcast(s) for user ${userId}`);
+      await bot.sendMessage(msg.chat.id, `✅ Stopped ${stoppedCount} broadcast(s) for user <b>${firstName}</b> (${username}) - <code>${userId}</code>`, { parse_mode: 'HTML' });
       logger.logChange('ADMIN', msg.from.id, `Stopped ${stoppedCount} broadcast(s) for user ${userId}`);
     } catch (error) {
       // SECURITY: Sanitize error message to prevent information leakage
@@ -695,19 +733,27 @@ function registerAdminCommands(bot) {
       }
 
       const accountData = account.rows[0];
+      
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [accountData.user_id]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+      const firstName = userInfo?.first_name || 'Unknown';
+      
       const groups = await db.query('SELECT COUNT(*) as count FROM groups WHERE account_id = $1 AND is_active = TRUE', [accountId]);
       const logs = await db.query('SELECT COUNT(*) as count FROM logs WHERE account_id = $1', [accountId]);
       const isBroadcasting = automationService.isBroadcasting(accountData.user_id, accountId);
 
       let message = `🔑 <b>Account Details</b>\n\n`;
       message += `Account ID: <code>${accountData.account_id}</code>\n`;
+      message += `User: <b>${firstName}</b> (${username})\n`;
       message += `User ID: <code>${accountData.user_id}</code>\n`;
       message += `Phone: ${accountData.phone || 'N/A'}\n`;
       message += `Active: ${accountData.is_active ? '✅' : '❌'}\n`;
       message += `Broadcasting: ${isBroadcasting ? '📢 Yes' : '⏸️ No'}\n`;
       message += `Created: ${new Date(accountData.created_at).toLocaleString()}\n\n`;
-      message += `Active Groups: ${groups.rows[0].count}\n`;
-      message += `Log Entries: ${logs.rows[0].count}`;
+      message += `Active Groups: ${groups.rows[0]?.count || 0}\n`;
+      message += `Log Entries: ${logs.rows[0]?.count || 0}`;
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
@@ -740,7 +786,7 @@ function registerAdminCommands(bot) {
       });
 
       const totalGroups = await db.query('SELECT COUNT(*) as count FROM groups WHERE is_active = TRUE');
-      message += `\n📊 Total Active Groups: ${totalGroups.rows[0].count}`;
+      message += `\n📊 Total Active Groups: ${totalGroups.rows[0]?.count || 0}`;
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
     } catch (error) {
@@ -774,7 +820,7 @@ function registerAdminCommands(bot) {
           // Use parameterized query (though table names can't be parameterized in PostgreSQL)
           // We rely on whitelist validation above
           const result = await db.query(`SELECT COUNT(*) as count FROM ${table}`);
-          stats[table] = result.rows[0].count;
+          stats[table] = result.rows[0]?.count || 0;
         } catch (error) {
           stats[table] = 'Error';
         }
@@ -1267,30 +1313,41 @@ function registerAdminCommands(bot) {
         `/groups - List all groups\n` +
         `/links - Collect all group links (as text file)\n` +
         `/database - Database statistics\n\n` +
+        `<b>⭐ Premium Management:</b>\n` +
+        `/premium_stats - Premium subscription statistics\n` +
+        `/premium_list - List all active premium subscriptions\n` +
+        `/premium_expiring - List subscriptions expiring soon\n` +
+        `/premium_user &lt;user_id&gt; - Check user's premium status\n` +
+        `/premium_add &lt;user_id&gt; - Add premium subscription\n` +
+        `/premium_revoke &lt;user_id&gt; - Revoke premium subscription\n` +
+        `/premium_cancel &lt;user_id&gt; - Cancel premium subscription\n` +
+        `/payment_pending - View pending payment submissions\n` +
+        `/payment_verify &lt;id&gt; - Verify payment submission\n` +
+        `/payment_reject &lt;id&gt; [reason] - Reject payment submission\n\n` +
         `<b>👁️ Monitoring:</b>\n` +
         `/logs - View recent logs (last 10)\n` +
         `/logs_error - View error logs only\n` +
         `/logs_success - View success logs only\n` +
         `/errors - View recent errors (last 10)\n` +
-      `/user &lt;id&gt; - Get user details\n` +
-      `/account &lt;id&gt; - Get account details\n\n` +
-      `<b>🤖 Auto-Reply:</b>\n` +
-      `/autoreply - Show auto-reply status for all accounts\n` +
-      `/autoreply_refresh - Restart auto-reply service\n` +
-      `/autoreply_stats - Detailed auto-reply statistics\n` +
-      `/autoreply_logs - View recent auto-reply activity\n` +
-      `/test_autoreply &lt;account_id&gt; - Test auto-reply for account\n\n` +
-      `<b>🔧 Account Operations:</b>\n` +
-      `/account_reconnect &lt;account_id&gt; - Force reconnect stuck account\n` +
-      `/ban_user &lt;user_id&gt; - Ban user from bot\n` +
-      `/unban_user &lt;user_id&gt; - Unban user\n` +
-      `/message_user &lt;user_id&gt; &lt;msg&gt; - Send direct message to user\n` +
-      `/cleanup - Clean old logs and optimize database\n\n` +
-      `<b>🎮 Control:</b>\n` +
-      `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
-      `/stop_all_broadcasts - Stop all active broadcasts\n` +
-      `/notify &lt;message&gt; - Send notification to all admins\n` +
-      `/abroadcast &lt;message&gt; - Broadcast to all users\n` +
+        `/user &lt;id&gt; - Get user details\n` +
+        `/account &lt;id&gt; - Get account details\n\n` +
+        `<b>🤖 Auto-Reply:</b>\n` +
+        `/autoreply - Show auto-reply status for all accounts\n` +
+        `/autoreply_refresh - Restart auto-reply service\n` +
+        `/autoreply_stats - Detailed auto-reply statistics\n` +
+        `/autoreply_logs - View recent auto-reply activity\n` +
+        `/test_autoreply &lt;account_id&gt; - Test auto-reply for account\n\n` +
+        `<b>🔧 Account Operations:</b>\n` +
+        `/account_reconnect &lt;account_id&gt; - Force reconnect stuck account\n` +
+        `/ban_user &lt;user_id&gt; - Ban user from bot\n` +
+        `/unban_user &lt;user_id&gt; - Unban user\n` +
+        `/message_user &lt;user_id&gt; &lt;msg&gt; - Send direct message to user\n` +
+        `/cleanup - Clean old logs and optimize database\n\n` +
+        `<b>🎮 Control:</b>\n` +
+        `/stop_broadcast &lt;user_id&gt; - Stop user's broadcast\n` +
+        `/stop_all_broadcasts - Stop all active broadcasts\n` +
+        `/notify &lt;message&gt; - Send notification to all admins\n` +
+        `/abroadcast &lt;message&gt; - Broadcast to all users\n` +
         `/abroadcast_last - Resend last broadcast\n\n` +
         `<b>⚙️ System:</b>\n` +
         `/status - Bot health status\n` +
@@ -1480,10 +1537,10 @@ function registerAdminCommands(bot) {
       let message = `📊 <b>Auto-Reply Statistics</b>\n\n`;
       
       message += `🔢 <b>Accounts:</b>\n`;
-      message += `• Total accounts: ${totalAccounts.rows[0].count}\n`;
-      message += `• DM auto-reply enabled: ${dmEnabled.rows[0].count}\n`;
-      message += `• Group auto-reply enabled: ${groupsEnabled.rows[0].count}\n`;
-      message += `• Both enabled: ${bothEnabled.rows[0].count}\n\n`;
+      message += `• Total accounts: ${totalAccounts.rows[0]?.count || 0}\n`;
+      message += `• DM auto-reply enabled: ${dmEnabled.rows[0]?.count || 0}\n`;
+      message += `• Group auto-reply enabled: ${groupsEnabled.rows[0]?.count || 0}\n`;
+      message += `• Both enabled: ${bothEnabled.rows[0]?.count || 0}\n\n`;
       
       message += `⚙️ <b>Service Status:</b>\n`;
       message += `• Active polling: ${activePolling} account(s)\n`;
@@ -1523,8 +1580,8 @@ function registerAdminCommands(bot) {
       // Get recent auto-reply logs from database
       const logs = await db.query(
         `SELECT * FROM logs 
-         WHERE action LIKE '%AUTO_REPLY%' OR action LIKE '%auto_reply%'
-         ORDER BY created_at DESC 
+         WHERE message LIKE '%AUTO_REPLY%' OR message LIKE '%auto_reply%' OR message LIKE '%Auto-Reply%'
+         ORDER BY timestamp DESC 
          LIMIT 20`
       );
 
@@ -1536,14 +1593,13 @@ function registerAdminCommands(bot) {
       let message = `📋 <b>Recent Auto-Reply Logs</b> (Last ${logs.rows.length})\n\n`;
 
       for (const log of logs.rows) {
-        const date = new Date(log.created_at);
+        const date = new Date(log.timestamp || log.created_at || Date.now());
         const time = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
         const status = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : 'ℹ️';
         
-        message += `${status} <b>${time}</b> - ${log.action}\n`;
-        if (log.details) {
-          message += `   ${log.details.substring(0, 60)}${log.details.length > 60 ? '...' : ''}\n`;
-        }
+        message += `${status} <b>${time}</b>\n`;
+        const logMessage = log.message || log.action || 'No message';
+        message += `   ${logMessage.substring(0, 60)}${logMessage.length > 60 ? '...' : ''}\n`;
         message += `\n`;
       }
 
@@ -1582,8 +1638,8 @@ function registerAdminCommands(bot) {
         return;
       }
 
-      const userId = accountResult.rows[0].user_id;
-      const phone = accountResult.rows[0].phone;
+      const userId = accountResult.rows[0]?.user_id;
+      const phone = accountResult.rows[0]?.phone;
 
       // Disconnect if connected
       try {
@@ -1712,7 +1768,7 @@ function registerAdminCommands(bot) {
       const expectedPolling = await db.query(
         'SELECT COUNT(*) as count FROM accounts WHERE auto_reply_dm_enabled = 1 OR auto_reply_groups_enabled = 1'
       );
-      const autoReplyStatus = pollingCount === expectedPolling.rows[0].count ? '✅ Healthy' : '⚠️ Mismatch';
+      const autoReplyStatus = pollingCount === (expectedPolling.rows[0]?.count || 0) ? '✅ Healthy' : '⚠️ Mismatch';
 
       // Broadcast service check
       const activeBroadcasts = automationService.activeBroadcasts?.size || 0;
@@ -1745,7 +1801,7 @@ function registerAdminCommands(bot) {
       
       message += `<b>🤖 Auto-Reply Service</b>\n`;
       message += `Status: ${autoReplyStatus}\n`;
-      message += `Active polling: ${pollingCount}/${expectedPolling.rows[0].count}\n\n`;
+      message += `Active polling: ${pollingCount}/${expectedPolling.rows[0]?.count || 0}\n\n`;
       
       message += `<b>📢 Broadcast Service</b>\n`;
       message += `Status: ${broadcastStatus}\n`;
@@ -1753,7 +1809,7 @@ function registerAdminCommands(bot) {
       
       message += `<b>🔑 Accounts</b>\n`;
       message += `Status: ${accountStatus}\n`;
-      message += `Total accounts: ${totalAccounts.rows[0].count}\n`;
+      message += `Total accounts: ${totalAccounts.rows[0]?.count || 0}\n`;
       message += `Linked accounts: ${linkedAccounts}\n\n`;
       
       message += `<b>💾 Memory</b>\n`;
@@ -1807,7 +1863,7 @@ function registerAdminCommands(bot) {
         const logsResult = await db.query(
           `DELETE FROM logs WHERE created_at < datetime('now', '-30 days')`
         );
-        const logsDeleted = logsResult.changes || 0;
+        const logsDeleted = logsResult.rowCount || 0;
         totalCleaned += logsDeleted;
         cleanupSummary += `📋 Logs: ${logsDeleted} old entries removed\n`;
       } catch (e) {
@@ -1823,7 +1879,7 @@ function registerAdminCommands(bot) {
              SELECT id FROM broadcasts WHERE status = 'completed'
            )`
         );
-        const broadcastsDeleted = broadcastsResult.changes || 0;
+        const broadcastsDeleted = broadcastsResult.rowCount || 0;
         totalCleaned += broadcastsDeleted;
         cleanupSummary += `📢 Broadcast messages: ${broadcastsDeleted} old entries removed\n`;
       } catch (e) {
@@ -1836,7 +1892,7 @@ function registerAdminCommands(bot) {
           `DELETE FROM sessions 
            WHERE account_id NOT IN (SELECT account_id FROM accounts)`
         );
-        const sessionsDeleted = sessionsResult.changes || 0;
+        const sessionsDeleted = sessionsResult.rowCount || 0;
         totalCleaned += sessionsDeleted;
         cleanupSummary += `🔐 Orphaned sessions: ${sessionsDeleted} removed\n`;
       } catch (e) {
@@ -1848,7 +1904,7 @@ function registerAdminCommands(bot) {
         const otpResult = await db.query(
           `DELETE FROM otp_codes WHERE created_at < datetime('now', '-1 day')`
         );
-        const otpDeleted = otpResult.changes || 0;
+        const otpDeleted = otpResult.rowCount || 0;
         totalCleaned += otpDeleted;
         cleanupSummary += `🔢 Expired OTPs: ${otpDeleted} removed\n`;
       } catch (e) {
@@ -1957,16 +2013,23 @@ function registerAdminCommands(bot) {
         return;
       }
 
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [userId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+      const firstName = userInfo?.first_name || 'Unknown';
+      
       // Remove from banned users
       const result = await db.query('DELETE FROM banned_users WHERE user_id = $1', [userId]);
       
-      if (result.changes === 0) {
-        await bot.sendMessage(msg.chat.id, `ℹ️ User ${userId} was not banned`);
+      if (!result.rowCount || result.rowCount === 0) {
+        await bot.sendMessage(msg.chat.id, `ℹ️ User <b>${firstName}</b> (${username}) - <code>${userId}</code> was not banned`, { parse_mode: 'HTML' });
         return;
       }
 
       const message = `✅ <b>User Unbanned</b>\n\n` +
-        `👤 User ID: <code>${userId}</code>\n\n` +
+        `👤 User: <b>${firstName}</b> (${username})\n` +
+        `🆔 User ID: <code>${userId}</code>\n\n` +
         `User can now use the bot again`;
 
       await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
@@ -2009,6 +2072,12 @@ function registerAdminCommands(bot) {
         return;
       }
 
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [userId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+      const firstName = userInfo?.first_name || 'Unknown';
+
       if (!mainBot) {
         await bot.sendMessage(msg.chat.id, '❌ Main bot not available');
         return;
@@ -2017,7 +2086,7 @@ function registerAdminCommands(bot) {
       // Send message to user
       await mainBot.sendMessage(userId, `📨 <b>Message from Admin:</b>\n\n${message}`, { parse_mode: 'HTML' });
 
-      await bot.sendMessage(msg.chat.id, `✅ Message sent to user ${userId}`, { parse_mode: 'HTML' });
+      await bot.sendMessage(msg.chat.id, `✅ Message sent to user <b>${firstName}</b> (${username}) - <code>${userId}</code>`, { parse_mode: 'HTML' });
       logger.logChange('ADMIN', adminUserId, `Sent message to user ${userId}`);
     } catch (error) {
       console.error('[ADMIN BOT] Error in /message_user:', error);
@@ -2163,13 +2232,20 @@ function registerAdminCommands(bot) {
         return;
       }
 
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [targetUserId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username ? `@${userInfo.username}` : 'N/A';
+      const firstName = userInfo?.first_name || 'Unknown';
+      
       const subscription = await premiumService.getSubscription(targetUserId);
       const isPremium = await premiumService.isPremium(targetUserId);
 
       let message = `╔═══════════════════════════╗
 ║  👤 <b>USER PREMIUM STATUS</b>  ║
-║  <b>ID: ${targetUserId}</b>        ║
 ╚═══════════════════════════╝\n\n`;
+      message += `👤 <b>User:</b> ${firstName} (${username})\n`;
+      message += `🆔 <b>User ID:</b> <code>${targetUserId}</code>\n\n`;
       
       if (isPremium && subscription) {
         const expiresAt = new Date(subscription.expires_at);
@@ -2262,6 +2338,108 @@ function registerAdminCommands(bot) {
     } catch (error) {
       const safeErrorMessage = sanitizeErrorMessage(error, false);
       await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /premium_revoke <user_id> command - Revoke premium subscription
+  bot.onText(/\/premium_revoke (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const targetUserId = validateUserId(match[1]);
+      if (!targetUserId) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID format');
+        return;
+      }
+
+      // Get user info for display
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [targetUserId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username || 'N/A';
+      const firstName = userInfo?.first_name || 'N/A';
+
+      // Cancel the subscription
+      const result = await premiumService.cancelSubscription(targetUserId);
+
+      if (result.success) {
+        const message = `╔═══════════════════════════╗
+║  🚫 <b>PREMIUM REVOKED</b>      ║
+╚═══════════════════════════╝
+
+👤 <b>User:</b> ${firstName} (@${username})
+🆔 <b>User ID:</b> <code>${targetUserId}</code>
+
+✅ Premium subscription has been cancelled.
+
+<i>User will lose premium access immediately.</i>`;
+        
+        await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+        logger.logChange('ADMIN', adminUserId, `Revoked premium for user ${targetUserId} (@${username})`);
+      } else {
+        await bot.sendMessage(
+          msg.chat.id, 
+          `❌ <b>Failed to Revoke Premium</b>\n\n<code>${result.error || 'Unknown error'}</code>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+    } catch (error) {
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+      logger.logError('ADMIN', adminUserId, error, 'Failed to revoke premium');
+    }
+  });
+
+  // /premium_cancel <user_id> command - Alias for revoke
+  bot.onText(/\/premium_cancel (.+)/, async (msg, match) => {
+    const adminUserId = validateUserId(msg.from?.id);
+    if (!adminUserId || !isAdmin(adminUserId)) {
+      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      const targetUserId = validateUserId(match[1]);
+      if (!targetUserId) {
+        await bot.sendMessage(msg.chat.id, '❌ Invalid user ID format');
+        return;
+      }
+
+      const userResult = await db.query('SELECT username, first_name FROM users WHERE user_id = $1', [targetUserId]);
+      const userInfo = userResult.rows[0];
+      const username = userInfo?.username || 'N/A';
+      const firstName = userInfo?.first_name || 'N/A';
+
+      const result = await premiumService.cancelSubscription(targetUserId);
+
+      if (result.success) {
+        const message = `╔═══════════════════════════╗
+║  🚫 <b>PREMIUM CANCELLED</b>    ║
+╚═══════════════════════════╝
+
+👤 <b>User:</b> ${firstName} (@${username})
+🆔 <b>User ID:</b> <code>${targetUserId}</code>
+
+✅ Premium subscription has been cancelled.
+
+<i>User will lose premium access immediately.</i>`;
+        
+        await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
+        logger.logChange('ADMIN', adminUserId, `Cancelled premium for user ${targetUserId} (@${username})`);
+      } else {
+        await bot.sendMessage(
+          msg.chat.id, 
+          `❌ <b>Failed to Cancel Premium</b>\n\n<code>${result.error || 'Unknown error'}</code>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+    } catch (error) {
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+      logger.logError('ADMIN', adminUserId, error, 'Failed to cancel premium');
     }
   });
 
@@ -2423,7 +2601,34 @@ function registerAdminCommands(bot) {
             }
 
             // Get dialogs for this account
-            const dialogs = await client.getDialogs();
+            let dialogs = [];
+            try {
+              dialogs = await client.getDialogs();
+            } catch (dialogsError) {
+              // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+              const errorMessage = dialogsError.message || dialogsError.toString() || '';
+              const errorCode = dialogsError.code || dialogsError.errorCode || dialogsError.response?.error_code;
+              const errorMsg = dialogsError.errorMessage || '';
+              const isSessionRevoked = 
+                errorMsg === 'SESSION_REVOKED' || 
+                errorMsg === 'AUTH_KEY_UNREGISTERED' ||
+                (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+                errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+                errorMessage.includes('SESSION_REVOKED');
+              
+              if (isSessionRevoked) {
+                console.log(`[LINKS] Session revoked for account ${accountId} (detected in getDialogs) - marking for re-authentication`);
+                try {
+                  await accountLinker.handleSessionRevoked(accountId);
+                } catch (revokeError) {
+                  console.log(`[LINKS] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+                }
+                // Skip this account and continue to next
+                continue;
+              }
+              // Re-throw if it's not a session error
+              throw dialogsError;
+            }
             const groups = dialogs.filter(dialog => (dialog.isGroup || dialog.isChannel));
 
             // Collect links from this account's groups (silent mode to reduce logs)
@@ -2439,6 +2644,35 @@ function registerAdminCommands(bot) {
               await client.disconnect();
             }
           } catch (accountError) {
+            // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
+            const errorMessage = accountError.message || accountError.toString() || '';
+            const errorCode = accountError.code || accountError.errorCode || accountError.response?.error_code;
+            const errorMsg = accountError.errorMessage || '';
+            const isSessionRevoked = 
+              errorMsg === 'SESSION_REVOKED' || 
+              errorMsg === 'AUTH_KEY_UNREGISTERED' ||
+              (errorCode === 401 && (errorMessage.includes('SESSION_REVOKED') || errorMessage.includes('AUTH_KEY_UNREGISTERED'))) ||
+              errorMessage.includes('AUTH_KEY_UNREGISTERED') ||
+              errorMessage.includes('SESSION_REVOKED');
+            
+            if (isSessionRevoked) {
+              console.log(`[LINKS] Session revoked for account ${accountId} (detected in outer catch) - marking for re-authentication`);
+              try {
+                await accountLinker.handleSessionRevoked(accountId);
+              } catch (revokeError) {
+                console.log(`[LINKS] Error handling session revocation for account ${accountId}: ${revokeError.message}`);
+              }
+              // Skip logging and continue to next account
+              if (client && client.connected) {
+                try {
+                  await client.disconnect();
+                } catch (disconnectError) {
+                  // Ignore disconnect errors
+                }
+              }
+              continue;
+            }
+            
             logger.logError('LINKS', accountId, accountError, `Error processing account ${accountId}`);
             if (client && client.connected) {
               try {

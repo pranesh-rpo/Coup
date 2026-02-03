@@ -77,7 +77,7 @@ class ScheduledMessageProcessor {
             continue;
           }
 
-          const userId = accountQuery.rows[0].user_id;
+          const userId = accountQuery.rows[0]?.user_id;
 
           // Check if account is linked and active
           if (!accountLinker.isLinked(userId)) {

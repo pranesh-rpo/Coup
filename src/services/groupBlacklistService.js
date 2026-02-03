@@ -269,7 +269,7 @@ class GroupBlacklistService {
         return { success: false, error: 'Group not found' };
       }
       
-      const groupTitle = groupResult.rows[0].group_title;
+      const groupTitle = groupResult.rows[0]?.group_title;
       
       // Check if already blacklisted
       const existing = await db.query(

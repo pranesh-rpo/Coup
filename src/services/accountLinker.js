@@ -928,6 +928,11 @@ class AccountLinker {
         }
       }
       
+      // CRITICAL: Prevent main account from being saved (check BEFORE any DB writes)
+      if (config.mainAccountPhone && normalizedPhone === config.mainAccountPhone.trim()) {
+        throw new Error(`Cannot link main account (${normalizedPhone}). This account is used to create the bot and APIs and should not be used for broadcasting.`);
+      }
+
       // Check if account already exists for this user and phone
       const existing = await db.query(
         'SELECT account_id, is_active FROM accounts WHERE user_id = $1 AND phone = $2',
@@ -1039,15 +1044,10 @@ class AccountLinker {
         }
       }
       
-      // CRITICAL: Prevent main account from being saved
-      if (config.mainAccountPhone && normalizedPhone === config.mainAccountPhone.trim()) {
-        throw new Error(`Cannot link main account (${normalizedPhone}). This account is used to create the bot and APIs and should not be used for broadcasting.`);
-      }
-      
       // Use provided client or create new one
       let accountClient = client;
       if (!accountClient) {
-        const stringSession = new StringSession(sessionString);
+        const stringSession = new StringSession(validSessionString);
         accountClient = new TelegramClient(stringSession, config.apiId, config.apiHash, {
           connectionRetries: 3, // Reduced from 5 to prevent excessive retries
           timeout: 10000,
@@ -1083,7 +1083,7 @@ class AccountLinker {
         userId: userIdNum,
         phone: normalizedPhone,
         firstName: firstName || null,
-        sessionString,
+        sessionString: validSessionString,
         client: accountClient,
         isActive,
         createdAt: Date.now(), // Track creation time for cleanup

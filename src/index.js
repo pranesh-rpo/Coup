@@ -1649,10 +1649,10 @@ bot.on('message', async (msg) => {
           chat_id: chatId,
           message_id: pendingData.statusMsgId,
           parse_mode: 'HTML',
-          ...createMainMenu()
+          ...(await createMainMenu())
         }).catch(() => {});
       } else {
-        await bot.sendMessage(chatId, errorMsg, { parse_mode: 'HTML', ...createMainMenu() });
+        await bot.sendMessage(chatId, errorMsg, { parse_mode: 'HTML', ...(await createMainMenu()) });
       }
     }
   } else if (pendingPasswords.has(userId) || accountLinker.isPasswordRequired(userId) || accountLinker.isWebLoginPasswordRequired(userId)) {
@@ -1666,7 +1666,7 @@ bot.on('message', async (msg) => {
       await bot.sendMessage(
         chatId,
         '⏰ <b>Authentication Session Expired</b>\n\nYour password authentication session has timed out for security reasons.\n\n📝 <b>What to do:</b>\n• Click "🔗 Link Account" to start over\n• You\'ll go through the verification process again\n• Have your password ready when prompted',
-        { parse_mode: 'HTML', ...createMainMenu() }
+        { parse_mode: 'HTML', ...(await createMainMenu()) }
       ).catch(() => {});
       return; // Exit early, don't process password
     }
@@ -1689,10 +1689,10 @@ bot.on('message', async (msg) => {
       if (pendingData?.messageId) {
         await bot.editMessageText(
           '🔐 <b>Password Required</b>\n\nPlease enter your 2FA password to continue.\n\n📝 <b>What to do:</b>\n• Enter your account password\n• Make sure it\'s correct\n• If you need to start over, click "🔗 Link Account"',
-          { chat_id: chatId, message_id: pendingData.messageId, parse_mode: 'HTML', ...createMainMenu() }
+          { chat_id: chatId, message_id: pendingData.messageId, parse_mode: 'HTML', ...(await createMainMenu()) }
         ).catch(() => {});
       } else {
-        await bot.sendMessage(chatId, '🔐 <b>Password Required</b>\n\nPlease enter your 2FA password to continue.\n\n📝 <b>What to do:</b>\n• Enter your account password\n• Make sure it\'s correct\n• If you need to start over, click "🔗 Link Account"', { parse_mode: 'HTML', ...createMainMenu() });
+        await bot.sendMessage(chatId, '🔐 <b>Password Required</b>\n\nPlease enter your 2FA password to continue.\n\n📝 <b>What to do:</b>\n• Enter your account password\n• Make sure it\'s correct\n• If you need to start over, click "🔗 Link Account"', { parse_mode: 'HTML', ...(await createMainMenu()) });
       }
       // Don't remove pending state for invalid input, allow retry
     }

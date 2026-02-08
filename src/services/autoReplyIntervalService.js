@@ -13,6 +13,7 @@ class AutoReplyIntervalService {
     this.intervals = new Map(); // accountId -> intervalId
     this.lastChecked = new Map(); // accountId -> { dm: timestamp, groups: timestamp }
     this.processedMessages = new Map(); // accountId -> Set<"chatId_messageId">
+    this.processingAccounts = new Set(); // prevent concurrent processing
     this.isRunning = false;
   }
 
@@ -201,6 +202,13 @@ class AutoReplyIntervalService {
    * Check for new messages and send auto-replies
    */
   async checkAndReply(accountId) {
+    // Prevent concurrent processing for same account
+    const accountIdStr = accountId.toString();
+    if (this.processingAccounts.has(accountIdStr)) {
+      return;
+    }
+    this.processingAccounts.add(accountIdStr);
+
     try {
       // Get account info from database
       const accountQuery = await db.query(
@@ -230,7 +238,7 @@ class AutoReplyIntervalService {
       // Get dialogs (chats)
       let dialogs = [];
       try {
-        dialogs = await client.getDialogs();
+        dialogs = await client.getDialogs({ limit: 50 });
       } catch (dialogsError) {
         // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
         const errorMessage = dialogsError.message || dialogsError.toString() || '';
@@ -312,7 +320,9 @@ class AutoReplyIntervalService {
           }
 
           // Check if message is newer than last check
-          const messageDate = lastMessage.date ? Math.floor(lastMessage.date.getTime() / 1000) : 0;
+          const messageDate = lastMessage.date
+            ? (typeof lastMessage.date === 'number' ? lastMessage.date : Math.floor(lastMessage.date.getTime() / 1000))
+            : 0;
           const checkKey = isDM ? 'dm' : 'groups';
           const lastCheckTime = lastCheck[checkKey] || 0;
 
@@ -428,6 +438,8 @@ class AutoReplyIntervalService {
       }
       
       logError(`[AUTO_REPLY_INTERVAL] Error checking messages for account ${accountId}:`, error);
+    } finally {
+      this.processingAccounts.delete(accountIdStr);
     }
   }
 

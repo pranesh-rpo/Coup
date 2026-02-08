@@ -589,7 +589,7 @@ export async function handleLoginCancel(bot, callbackQuery) {
   await bot.sendMessage(
     chatId,
     await generateStatusText(userId),
-    { parse_mode: 'HTML', ...createMainMenu() }
+    { parse_mode: 'HTML', ...(await createMainMenu(userId)) }
   );
 }
 
@@ -1773,10 +1773,13 @@ export async function handleSetStartMessageButton(bot, callbackQuery) {
     if (result.success) {
       // Update with saved_message_id
       await db.query(
-        `UPDATE messages 
+        `UPDATE messages
          SET saved_message_id = $1
-         WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
-         ORDER BY updated_at DESC LIMIT 1`,
+         WHERE id = (
+           SELECT id FROM messages
+           WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
+           ORDER BY updated_at DESC LIMIT 1
+         )`,
         [savedMessageId, accountId]
       );
 
@@ -3539,9 +3542,6 @@ export async function handleTemplateSync(bot, callbackQuery) {
   const chatId = callbackQuery.message.chat.id;
   const username = callbackQuery.from.username || 'Unknown';
 
-  // Answer callback immediately
-  await safeAnswerCallback(bot, callbackQuery.id);
-
   const accountId = accountLinker.getActiveAccountId(userId);
   if (!accountId) {
     await safeAnswerCallback(bot, callbackQuery.id, {
@@ -3550,6 +3550,9 @@ export async function handleTemplateSync(bot, callbackQuery) {
     });
     return;
   }
+
+  // Answer callback immediately
+  await safeAnswerCallback(bot, callbackQuery.id);
 
   // Optimistically update UI immediately
   await safeEditMessage(
@@ -3930,9 +3933,6 @@ export async function handleRefreshGroups(bot, callbackQuery) {
   const userId = callbackQuery.from.id;
   const chatId = callbackQuery.message.chat.id;
 
-  // Answer callback immediately
-  await safeAnswerCallback(bot, callbackQuery.id);
-
   if (!accountLinker.isLinked(userId)) {
     await safeAnswerCallback(bot, callbackQuery.id, {
       text: 'Please link your account first!',
@@ -3940,6 +3940,9 @@ export async function handleRefreshGroups(bot, callbackQuery) {
     });
     return;
   }
+
+  // Answer callback immediately
+  await safeAnswerCallback(bot, callbackQuery.id);
 
   // Optimistically update UI immediately
   await safeEditMessage(
@@ -4243,18 +4246,22 @@ export async function handleDeleteAccount(bot, callbackQuery, accountId) {
 
       // Get account phone before deletion
       const accountPhone = accountToDelete?.phone || 'N/A';
-      
+
+      // Check if this is the active account BEFORE deletion
+      const activeAccountId = accountLinker.getActiveAccountId(userId);
+      const isActiveAccount = activeAccountId === accountId;
+
       // Delete the account
       await accountLinker.deleteLinkedAccount(accountId);
-      
+
       console.log(`[DELETE ACCOUNT] User ${userId} deleted account ${accountId} (${accountDisplayName})`);
       logger.logChange('ACCOUNT_DELETED', userId, `Successfully deleted account ${accountId} (${accountDisplayName})`);
-      
+
       // Log to logger bot
       loggerBotService.logAccountDeleted(userId, accountId, accountPhone).catch(() => {
         // Silently fail - logger bot may not be started or user may have blocked it
       });
-      
+
       // Notify admins
       adminNotifier.notifyUserAction('ACCOUNT_DELETED', userId, {
         username: username || null,
@@ -4263,10 +4270,6 @@ export async function handleDeleteAccount(bot, callbackQuery, accountId) {
       }).catch(err => {
         console.log(`[SILENT_FAIL] Admin notification failed: ${err.message}`);
       });
-
-      // Check if this was the active account
-      const activeAccountId = accountLinker.getActiveAccountId(userId);
-      const isActiveAccount = activeAccountId === accountId;
 
       // If deleted account was active, switch to another account
       if (isActiveAccount) {
@@ -4411,7 +4414,7 @@ export async function handleApplyTags(bot, callbackQuery) {
           chatId,
           callbackQuery.message.message_id,
           `❌ <b>Failed to Apply Tags</b>\n\n` +
-          `<b>Error:</b> ${result.error}\n\n` +
+          `<b>Error:</b> ${escapeHtml(result.error || 'Unknown error')}`,
           {
             parse_mode: 'HTML',
             reply_markup: {
@@ -5097,10 +5100,13 @@ export async function handleCheckSavedMessages(bot, callbackQuery, saveAsMessage
       if (result.success) {
         // Update with saved_message_id
         await db.query(
-          `UPDATE messages 
+          `UPDATE messages
            SET saved_message_id = $1
-           WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
-           ORDER BY updated_at DESC LIMIT 1`,
+           WHERE id = (
+             SELECT id FROM messages
+             WHERE account_id = $2 AND is_active = TRUE AND variant = 'A'
+             ORDER BY updated_at DESC LIMIT 1
+           )`,
           [savedMessageId, accountId]
         );
 
@@ -5132,10 +5138,13 @@ export async function handleCheckSavedMessages(bot, callbackQuery, saveAsMessage
     } else {
       // Just update existing message with saved_message_id (for forward mode)
       await db.query(
-        `UPDATE messages 
+        `UPDATE messages
          SET saved_message_id = $1, message_text = $2, message_entities = $3
-         WHERE account_id = $4 AND is_active = TRUE 
-         ORDER BY updated_at DESC LIMIT 1`,
+         WHERE id = (
+           SELECT id FROM messages
+           WHERE account_id = $4 AND is_active = TRUE
+           ORDER BY updated_at DESC LIMIT 1
+         )`,
         [
           savedMessageId,
           messageText,

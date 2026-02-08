@@ -228,7 +228,9 @@ class AutoReplyPollingService {
             const messageKey = `${accountId}_${chatId}_${messageId}`;
 
             // Check message timestamp
-            const messageDate = lastMessage.date ? Math.floor(lastMessage.date.getTime() / 1000) : 0;
+            const messageDate = lastMessage.date
+              ? (typeof lastMessage.date === 'number' ? lastMessage.date : Math.floor(lastMessage.date.getTime() / 1000))
+              : 0;
             const checkKey = isDM ? 'dm' : 'groups';
             const lastCheckTime = lastCheck[checkKey] || now;
 
@@ -349,11 +351,6 @@ class AutoReplyPollingService {
       }
     } finally {
       this.processingAccounts.delete(accountId);
-      
-      // Reset error count on successful check
-      if (this.consecutiveErrors.has(accountId)) {
-        this.consecutiveErrors.delete(accountId);
-      }
     }
   }
 

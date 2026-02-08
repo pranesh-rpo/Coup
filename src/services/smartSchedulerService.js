@@ -15,12 +15,12 @@ class SmartSchedulerService {
     try {
       // Get statistics for different hours
       const result = await db.query(
-        `SELECT 
-           EXTRACT(HOUR FROM timestamp) as hour,
+        `SELECT
+           CAST(strftime('%H', timestamp) AS INTEGER) as hour,
            COUNT(*) as total_sent,
            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count
          FROM logs
-         WHERE account_id = ? 
+         WHERE account_id = ?
            AND log_type = 'broadcast'
            AND timestamp >= datetime('now', '-${days} days')
          GROUP BY hour

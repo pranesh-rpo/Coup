@@ -271,22 +271,29 @@ class GroupBlacklistService {
       
       const groupTitle = groupResult.rows[0]?.group_title;
       
-      // Check if already blacklisted
+      // Check if already blacklisted (only check active entries)
       const existing = await db.query(
-        'SELECT id FROM group_filters WHERE account_id = $1 AND group_id = $2 AND filter_type = $3',
+        'SELECT id, is_active FROM group_filters WHERE account_id = $1 AND group_id = $2 AND filter_type = $3',
         [accountIdNum, groupIdNum, 'blacklist']
       );
-      
+
       if (existing.rows.length > 0) {
-        return { success: false, error: 'Group already blacklisted' };
+        if (existing.rows[0].is_active) {
+          return { success: false, error: 'Group already blacklisted' };
+        }
+        // Re-activate previously soft-deleted blacklist entry
+        await db.query(
+          'UPDATE group_filters SET is_active = 1 WHERE id = $1',
+          [existing.rows[0].id]
+        );
+      } else {
+        // Add new blacklist entry
+        await db.query(
+          `INSERT INTO group_filters (account_id, filter_type, group_id, is_active)
+           VALUES ($1, 'blacklist', $2, 1)`,
+          [accountIdNum, groupIdNum]
+        );
       }
-      
-      // Add to blacklist
-      await db.query(
-        `INSERT INTO group_filters (account_id, filter_type, group_id, is_active)
-         VALUES ($1, 'blacklist', $2, 1)`,
-        [accountIdNum, groupIdNum]
-      );
       
       logger.logChange('BLACKLIST', accountId, `Added group "${groupTitle}" to blacklist`);
       return { success: true, groupTitle };

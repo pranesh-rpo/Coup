@@ -269,7 +269,8 @@ class MessageService {
         `SELECT COALESCE(MAX(display_order), -1) as max_order FROM message_pool WHERE account_id = $1`,
         [accountId]
       );
-      const nextOrder = (maxOrderResult.rows[0]?.max_order || -1) + 1;
+      const maxOrder = maxOrderResult.rows[0]?.max_order;
+      const nextOrder = (maxOrder !== null && maxOrder !== undefined && maxOrder !== -1) ? maxOrder + 1 : 0;
 
       const result = await db.query(
         `INSERT INTO message_pool (account_id, message_text, message_entities, display_order, is_active, created_at, updated_at)
@@ -380,16 +381,18 @@ class MessageService {
    * @param {number} lastIndex - Last used index
    * @returns {Promise<{text: string, entities: Array|null, nextIndex: number}|null>}
    */
-  async getNextFromPool(accountId, lastIndex = 0) {
+  async getNextFromPool(accountId, currentIndex = 0) {
     try {
       const pool = await this.getMessagePool(accountId, false); // Only get active messages
       if (pool.length === 0) {
         return null;
       }
-      const nextIndex = (lastIndex + 1) % pool.length;
+      // currentIndex is the index to use NOW; nextIndex is what to store for next call
+      const safeIndex = currentIndex % pool.length;
+      const nextIndex = (safeIndex + 1) % pool.length;
       const selected = {
-        text: pool[nextIndex].text,
-        entities: pool[nextIndex].entities,
+        text: pool[safeIndex].text,
+        entities: pool[safeIndex].entities,
         nextIndex: nextIndex
       };
       

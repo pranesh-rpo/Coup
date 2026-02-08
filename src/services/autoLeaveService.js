@@ -15,16 +15,13 @@ class AutoLeaveService {
    */
   async checkAndLeaveInactive(accountId, daysInactive = 30) {
     try {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - daysInactive);
-
       const result = await db.query(
-        `SELECT group_id, group_title, last_message_sent 
-         FROM groups 
-         WHERE account_id = $1 
+        `SELECT group_id, group_title, last_message_sent
+         FROM groups
+         WHERE account_id = $1
            AND is_active = TRUE
-           AND (last_message_sent IS NULL OR last_message_sent < $2)`,
-        [accountId, cutoffDate]
+           AND (last_message_sent IS NULL OR last_message_sent < datetime('now', $2))`,
+        [accountId, `-${daysInactive} days`]
       );
 
       const inactiveGroups = result.rows;
@@ -37,7 +34,7 @@ class AutoLeaveService {
           const userId = await this.getUserIdFromAccountId(accountId);
           if (!userId) continue;
 
-          const client = await accountLinker.getClient(userId, accountId);
+          const client = await accountLinker.getClientAndConnect(userId, accountId);
           if (!client) continue;
 
           // Check if this is an updates channel

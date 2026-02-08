@@ -1149,8 +1149,18 @@ class AutomationService {
               } else {
                 console.log(`[BROADCAST] Cycle: ⚠️ Pool is empty or all messages inactive (rotate mode)`);
               }
+            } else if (poolMode === 'sequential') {
+              // Sequential mode: per-group message selection happens in sendSingleMessageToAllGroups
+              // But we need a placeholder message to prevent fallback from skipping the send
+              const poolMessage = await messageService.getMessageByIndex(broadcast.accountId, 0);
+              if (poolMessage) {
+                messageToSend = poolMessage.text || null;
+                storedEntities = poolMessage.entities || null;
+                console.log(`[BROADCAST] Cycle: Sequential mode - placeholder message set, per-group selection in sendSingleMessageToAllGroups`);
+              } else {
+                console.log(`[BROADCAST] Cycle: ⚠️ Pool is empty (sequential mode)`);
+              }
             }
-            // Sequential mode is handled per-group in sendSingleMessageToAllGroups, so we don't need to handle it here
           } else {
             console.log(`[BROADCAST] Cycle: Message pool disabled, using regular message`);
           }
@@ -1425,13 +1435,21 @@ class AutomationService {
   /**
    * Stop all active broadcasts (e.g., on shutdown)
    */
-  stopAllBroadcasts() {
+  async stopAllBroadcasts() {
     console.log(`[BROADCAST] Stopping all ${this.activeBroadcasts.size} active broadcasts...`);
-    for (const [userId, broadcast] of this.activeBroadcasts.entries()) {
+    for (const [key, broadcast] of this.activeBroadcasts.entries()) {
       if (broadcast.timeouts) {
         broadcast.timeouts.forEach(t => clearTimeout(t));
       }
       broadcast.isRunning = false;
+      // Reset DB flag so accounts don't stay stuck as "broadcasting"
+      if (broadcast.accountId) {
+        try {
+          await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [broadcast.accountId]);
+        } catch (dbError) {
+          // Ignore - shutting down
+        }
+      }
     }
     this.activeBroadcasts.clear();
   }
@@ -2133,7 +2151,7 @@ class AutomationService {
 
             // Check if message pool is active (random/rotate modes already set message & entities in the caller)
             const poolSettings = broadcast.cachedSettings || await configService.getAccountSettings(accountId);
-            const isPoolActive = poolSettings?.useMessagePool && messageEntities && messageEntities.length > 0;
+            const isPoolActive = poolSettings?.useMessagePool || false;
 
             // Only override with Saved Messages when message pool is NOT providing the message
             // Pool messages already have correct text and entities from the database

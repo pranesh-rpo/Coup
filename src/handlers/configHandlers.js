@@ -574,7 +574,7 @@ export async function handleDailyCapInput(bot, msg, accountId, cap) {
     await bot.sendMessage(
       chatId,
       `✅ Daily counter display cap set to <b>${cap}</b> messages/day\n\n⚠️ <i>Note: Daily cap enforcement has been removed. This is for display purposes only.</i>\n\nThe counter resets at midnight IST.`,
-      { parse_mode: 'HTML', ...createMainMenu() }
+      { parse_mode: 'HTML', ...(await createMainMenu()) }
     );
   } else {
     await bot.sendMessage(

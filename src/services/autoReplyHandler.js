@@ -131,6 +131,14 @@ class AutoReplyHandler {
   }
 
   /**
+   * Unmark a message as processed (used when rescheduling due to rate limit)
+   */
+  unmarkProcessedMessage(accountId, chatId, messageId) {
+    const key = this.getKey(accountId, chatId, messageId);
+    this.processedMessages.delete(key);
+  }
+
+  /**
    * Check if we've already replied to this chat recently (30-minute cooldown)
    */
   hasRepliedToChatRecently(accountId, chatId) {
@@ -473,6 +481,8 @@ class AutoReplyHandler {
           const lastSent = this.lastMessageSent.get(accountId);
           const waitTime = this.MIN_MESSAGE_INTERVAL - (Date.now() - lastSent);
           console.log(`[AUTO_REPLY] Rate limit: Waiting ${Math.ceil(waitTime/1000)}s before sending DM reply for account ${accountId}`);
+          // Unmark so the rescheduled call can process it
+          this.unmarkProcessedMessage(accountId, chatId, messageId);
           // Schedule for later when rate limit allows
           setTimeout(() => {
             this.processMessage(message, accountId, client, immediate);
@@ -620,6 +630,8 @@ class AutoReplyHandler {
                              isMentioned ? 'mention (tagged/pinged)' : 
                              'reply to account message';
           console.log(`[AUTO_REPLY] Rate limit: Waiting ${Math.ceil(waitTime/1000)}s before sending group reply for account ${accountId} (${triggerType})`);
+          // Unmark so the rescheduled call can process it
+          this.unmarkProcessedMessage(accountId, chatId, messageId);
           // Schedule for later when rate limit allows
           setTimeout(() => {
             this.processMessage(message, accountId, client, immediate);
@@ -797,19 +809,20 @@ class AutoReplyHandler {
 
     try {
       const clientId = client._selfId || 'unknown';
-      const handlers = client.listEventHandlers(NewMessage);
-      
-      for (const handler of handlers) {
+      const handlers = client.listEventHandlers();
+
+      for (const [callback, event] of handlers) {
         try {
-          client.removeEventHandler(handler);
+          client.removeEventHandler(callback, event);
         } catch (e) {
           // Ignore individual handler removal errors
         }
       }
 
       // Clean up registered handlers map
+      const clientIdStr = clientId.toString();
       for (const [key, _] of this.registeredHandlers.entries()) {
-        if (key.includes(clientId.toString())) {
+        if (key.startsWith(clientIdStr + '_')) {
           this.registeredHandlers.delete(key);
         }
       }

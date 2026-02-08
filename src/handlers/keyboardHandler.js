@@ -105,7 +105,7 @@ export async function createMainMenu(userId = null) {
 
   // Dynamic broadcast button
   const broadcastButton = isBroadcasting
-    ? [{ text: '⏹️ STOP BROADCAST', callback_data: 'btn_start_broadcast' }]
+    ? [{ text: '⏹️ STOP BROADCAST', callback_data: 'btn_stop_broadcast' }]
     : [{ text: '▶️ START BROADCAST', callback_data: 'btn_start_broadcast' }];
 
   // Get account info

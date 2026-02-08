@@ -39,7 +39,7 @@ class MessageQueueService {
         params.push(accountId);
       }
       
-      query += ` AND (scheduled_for IS NULL OR scheduled_for <= NOW())
+      query += ` AND (scheduled_for IS NULL OR scheduled_for <= datetime('now'))
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1`;
       
@@ -105,11 +105,11 @@ class MessageQueueService {
   async getQueueStatus(accountId) {
     try {
       const result = await db.query(
-        `SELECT 
-           COUNT(*) FILTER (WHERE status = 'pending') as pending,
-           COUNT(*) FILTER (WHERE status = 'processing') as processing,
-           COUNT(*) FILTER (WHERE status = 'sent') as sent,
-           COUNT(*) FILTER (WHERE status = 'failed') as failed
+        `SELECT
+           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+           SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing,
+           SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
+           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
          FROM message_queue
          WHERE account_id = $1`,
         [accountId]

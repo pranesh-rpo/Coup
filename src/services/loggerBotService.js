@@ -56,9 +56,35 @@ class LoggerBotService {
         // Ignore errors - webhook might not exist
       }
 
-      // Start polling
-      await this.bot.startPolling();
-      console.log('[LOGGER_BOT] ✅ Logger bot initialized and polling started');
+      // Start polling with retry logic for 409 conflicts (common in Coolify redeployments)
+      const MAX_CONFLICT_RETRIES = 5;
+      const CONFLICT_RETRY_DELAY = 5000; // 5 seconds between retries
+      let pollingStarted = false;
+
+      for (let attempt = 1; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+        try {
+          await this.bot.startPolling();
+          console.log('[LOGGER_BOT] ✅ Logger bot initialized and polling started');
+          pollingStarted = true;
+          break;
+        } catch (error) {
+          const errorMessage = error.message || '';
+          if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
+            if (attempt < MAX_CONFLICT_RETRIES) {
+              console.warn(`[LOGGER_BOT] ⚠️ 409 Conflict (attempt ${attempt}/${MAX_CONFLICT_RETRIES}): Old instance still polling. Retrying in ${CONFLICT_RETRY_DELAY / 1000}s...`);
+              await new Promise(resolve => setTimeout(resolve, CONFLICT_RETRY_DELAY));
+              try { await this.bot.deleteWebHook({ drop_pending_updates: false }); } catch (_) {}
+            } else {
+              console.error('[LOGGER_BOT] ❌ 409 Conflict persists after all retries.');
+              throw error;
+            }
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      if (!pollingStarted) return;
 
       // Set up handlers
       this.setupHandlers();
@@ -451,11 +477,10 @@ class LoggerBotService {
       const errorCode = error.code || error.response?.error_code;
       
       // Check if it's a 409 Conflict (multiple bot instances polling)
-      // This is not a critical error - just means another instance is using the bot token
-      if (errorCode === 409 || errorMessage.includes('409') || errorMessage.includes('Conflict') || 
+      if (errorCode === 409 || errorMessage.includes('409') || errorMessage.includes('Conflict') ||
           errorMessage.includes('terminated by other getUpdates request')) {
-        // Silently ignore - this is expected when multiple instances are running
-        // Don't log as error to avoid spam
+        console.error('[LOGGER_BOT] ⚠️ 409 Conflict: Another instance is polling with the same logger bot token.');
+        console.error('[LOGGER_BOT] This usually means another process is running or the previous instance did not shut down cleanly.');
         return;
       }
       

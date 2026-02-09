@@ -609,21 +609,39 @@ const bot = new TelegramBot(config.botToken, {
     }
   }
   
-  // Start polling
-  try {
-    await bot.startPolling();
-    console.log('✅ Polling started');
-  } catch (error) {
-    // Check if it's a floodwait error during polling start
-    if (isFloodWaitError(error)) {
-      const waitSeconds = extractWaitTime(error);
-      console.error(`[FLOOD_WAIT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s before retry...`);
-      await waitForFloodError(error, 1);
-      // Retry starting polling
+  // Start polling with retry logic for 409 conflicts (common in Coolify redeployments)
+  const MAX_CONFLICT_RETRIES = 5;
+  const CONFLICT_RETRY_DELAY = 5000; // 5 seconds between retries
+
+  for (let attempt = 1; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
+    try {
       await bot.startPolling();
-      console.log('✅ Polling started (after retry)');
-    } else {
-      throw error; // Re-throw non-floodwait errors
+      console.log('✅ Main bot polling started');
+      break;
+    } catch (error) {
+      const errorMessage = error.message || '';
+
+      // Check for 409 Conflict error - old instance still polling (common during Coolify redeployments)
+      if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
+        if (attempt < MAX_CONFLICT_RETRIES) {
+          console.warn(`[MAIN BOT] ⚠️ 409 Conflict (attempt ${attempt}/${MAX_CONFLICT_RETRIES}): Old instance still polling. Retrying in ${CONFLICT_RETRY_DELAY / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, CONFLICT_RETRY_DELAY));
+          // Delete webhook again before retry
+          try { await bot.deleteWebHook({ drop_pending_updates: false }); } catch (_) {}
+        } else {
+          console.error('[MAIN BOT] ❌ 409 Conflict persists after all retries. Old instance may still be running.');
+          logger.logError('MAIN_BOT', null, error, 'Main bot polling conflict - all retries exhausted');
+        }
+      } else if (isFloodWaitError(error)) {
+        const waitSeconds = extractWaitTime(error);
+        console.error(`[FLOOD_WAIT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s before retry...`);
+        await waitForFloodError(error, 1);
+        await bot.startPolling();
+        console.log('✅ Main bot polling started (after flood wait retry)');
+        break;
+      } else {
+        throw error;
+      }
     }
   }
 })();
@@ -2346,11 +2364,10 @@ bot.on('polling_error', (error) => {
   const errorName = error.name || '';
   
   // Check if it's a 409 Conflict (multiple bot instances polling)
-  // This is not a critical error - just means another instance is using the bot token
-  if (errorCode === 409 || errorMessage.includes('409') || errorMessage.includes('Conflict') || 
+  if (errorCode === 409 || errorMessage.includes('409') || errorMessage.includes('Conflict') ||
       errorMessage.includes('terminated by other getUpdates request')) {
-    // Silently ignore - this is expected when multiple instances are running
-    // Don't log as error to avoid spam
+    console.error('[MAIN BOT] ⚠️ 409 Conflict: Another instance is polling with the same bot token.');
+    console.error('[MAIN BOT] This usually means another process is running or the previous instance did not shut down cleanly.');
     return;
   }
   
@@ -2521,13 +2538,25 @@ async function gracefulShutdown(signal) {
   }, 10000); // 10 second timeout for forced shutdown
   
   try {
-    // Stop polling
-    console.log('[SHUTDOWN] Stopping polling...');
+    // Stop main bot polling
+    console.log('[SHUTDOWN] Stopping main bot polling...');
     try {
       await bot.stopPolling({ drop_pending_updates: true });
-      console.log('[SHUTDOWN] Polling stopped');
+      console.log('[SHUTDOWN] Main bot polling stopped');
     } catch (error) {
-      console.error('[SHUTDOWN] Error stopping polling:', error.message);
+      console.error('[SHUTDOWN] Error stopping main bot polling:', error.message);
+    }
+
+    // Stop admin bot polling
+    console.log('[SHUTDOWN] Stopping admin bot polling...');
+    try {
+      const adminBot = getAdminBot();
+      if (adminBot) {
+        adminBot.stopPolling();
+        console.log('[SHUTDOWN] Admin bot polling stopped');
+      }
+    } catch (error) {
+      console.error('[SHUTDOWN] Error stopping admin bot polling:', error.message);
     }
     
     // Stop automation services gracefully

@@ -259,7 +259,7 @@ export function initializeAdminBot(mainBotInstance = null) {
     // Register admin commands
     registerAdminCommands(adminBot);
     
-    // Delete webhook and start polling (similar to main bot)
+    // Delete webhook and start polling with retry logic for 409 conflicts
     (async () => {
       try {
         // Delete any existing webhook before starting polling
@@ -268,39 +268,50 @@ export function initializeAdminBot(mainBotInstance = null) {
           { maxRetries: 3, bufferSeconds: 1, throwOnFailure: false }
         );
         console.log('[ADMIN BOT] ✅ Deleted any existing webhook');
-        
+
         // Wait a moment before starting polling
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Start polling
-        await adminBot.startPolling();
-        console.log('[ADMIN BOT] ✅ Polling started');
-        pollingRetryCount = 0; // Reset retry count on successful start
-      } catch (error) {
-        const errorMessage = error.message || '';
-        
-        // Check for 409 Conflict error
-        if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
-          console.error('[ADMIN BOT] ⚠️ 409 Conflict when starting polling:');
-          console.error('[ADMIN BOT]   Another instance is already polling this bot token');
-          console.error('[ADMIN BOT]   Please check for other running instances or webhooks');
-          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict on startup');
-        } else if (isFloodWaitError(error)) {
-          const waitSeconds = extractWaitTime(error);
-          console.warn(`[ADMIN BOT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s...`);
-          await waitForFloodError(error, 1);
-          // Retry starting polling
+
+        // Start polling with retry logic for 409 conflicts (common in Coolify redeployments)
+        const MAX_CONFLICT_RETRIES = 5;
+        const CONFLICT_RETRY_DELAY = 5000; // 5 seconds between retries
+
+        for (let attempt = 1; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
           try {
             await adminBot.startPolling();
-            console.log('[ADMIN BOT] ✅ Polling started (after flood wait retry)');
-          } catch (retryError) {
-            console.error('[ADMIN BOT] Failed to start polling after retry:', retryError);
-            logger.logError('ADMIN_BOT', null, retryError, 'Admin bot polling start failed after retry');
+            console.log('[ADMIN BOT] ✅ Polling started');
+            pollingRetryCount = 0;
+            break;
+          } catch (error) {
+            const errorMessage = error.message || '';
+
+            if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
+              if (attempt < MAX_CONFLICT_RETRIES) {
+                console.warn(`[ADMIN BOT] ⚠️ 409 Conflict (attempt ${attempt}/${MAX_CONFLICT_RETRIES}): Old instance still polling. Retrying in ${CONFLICT_RETRY_DELAY / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, CONFLICT_RETRY_DELAY));
+                try { await adminBot.deleteWebHook({ drop_pending_updates: false }); } catch (_) {}
+              } else {
+                console.error('[ADMIN BOT] ❌ 409 Conflict persists after all retries. Old instance may still be running.');
+                logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - all retries exhausted');
+              }
+            } else if (isFloodWaitError(error)) {
+              const waitSeconds = extractWaitTime(error);
+              console.warn(`[ADMIN BOT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s...`);
+              await waitForFloodError(error, 1);
+              await adminBot.startPolling();
+              console.log('[ADMIN BOT] ✅ Polling started (after flood wait retry)');
+              pollingRetryCount = 0;
+              break;
+            } else {
+              console.error('[ADMIN BOT] Failed to start polling:', error);
+              logger.logError('ADMIN_BOT', null, error, 'Admin bot polling start failed');
+              break;
+            }
           }
-        } else {
-          console.error('[ADMIN BOT] Failed to start polling:', error);
-          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling start failed');
         }
+      } catch (error) {
+        console.error('[ADMIN BOT] Failed during webhook deletion:', error);
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot webhook deletion failed');
       }
     })();
     

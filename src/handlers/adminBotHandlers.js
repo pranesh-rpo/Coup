@@ -2833,19 +2833,19 @@ function registerAdminCommands(bot) {
       const parentDir = path.dirname(dataDir);
       const dataDirName = path.basename(dataDir);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const zipFileName = `data_backup_${timestamp}.zip`;
-      const zipFilePath = path.join(parentDir, zipFileName);
+      const archiveFileName = `data_backup_${timestamp}.tar.gz`;
+      const archiveFilePath = path.join(parentDir, archiveFileName);
 
-      // Zip the entire data folder
-      execSync(`cd "${parentDir}" && zip -r "${zipFilePath}" "${dataDirName}"`);
+      // Create tar.gz of the entire data folder
+      execSync(`cd "${parentDir}" && tar -czf "${archiveFilePath}" "${dataDirName}"`);
 
-      // Send the zip file
-      await bot.sendDocument(chatId, zipFilePath, {
+      // Send the archive file
+      await bot.sendDocument(chatId, archiveFilePath, {
         caption: `🗄️ Data Backup\n📅 ${new Date().toLocaleString()}\n📁 Folder: ${dataDirName}/`
       });
 
-      // Clean up zip file after sending
-      fs.unlinkSync(zipFilePath);
+      // Clean up archive file after sending
+      fs.unlinkSync(archiveFilePath);
 
       logger.logChange('ADMIN_EXTRACT', adminUserId, 'Database exported and sent as zip');
     } catch (error) {

@@ -382,6 +382,7 @@ function registerAdminCommands(bot) {
       `/status - Bot health status\n` +
       `/health_check - Comprehensive health check\n` +
       `/uptime - Bot uptime information\n` +
+      `/extract - Download database as zip\n` +
       `/test - Test admin bot connection\n\n` +
       `<b>❓ Help:</b>\n` +
       `/help - Show detailed help\n` +
@@ -2786,6 +2787,60 @@ function registerAdminCommands(bot) {
       logger.logError('LINKS', adminUserId, error, 'Error collecting group links');
       const safeErrorMessage = sanitizeErrorMessage(error, false);
       await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
+    }
+  });
+
+  // /extract command - Send database as zip file
+  bot.onText(/\/extract/, async (msg) => {
+    if (msg.chat.type !== 'private') return;
+    const chatId = msg.chat.id;
+    const adminUserId = msg.from.id;
+
+    if (!isAdmin(adminUserId)) {
+      await bot.sendMessage(chatId, '❌ Unauthorized');
+      return;
+    }
+
+    try {
+      if (!adminCommandRateLimiter.checkRateLimit(adminUserId, 20, 60000)) {
+        await bot.sendMessage(chatId, '⚠️ Rate limit exceeded. Please wait.');
+        return;
+      }
+
+      await bot.sendMessage(chatId, '📦 Preparing data folder export...');
+
+      const { execSync } = await import('child_process');
+
+      // Resolve the data folder path
+      const dbPath = path.resolve(config.dbPath || './data/bot.db');
+      const dataDir = path.dirname(dbPath);
+      if (!fs.existsSync(dataDir)) {
+        await bot.sendMessage(chatId, '❌ Data folder not found.');
+        return;
+      }
+
+      const parentDir = path.dirname(dataDir);
+      const dataDirName = path.basename(dataDir);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const zipFileName = `data_backup_${timestamp}.zip`;
+      const zipFilePath = path.join(parentDir, zipFileName);
+
+      // Zip the entire data folder
+      execSync(`cd "${parentDir}" && zip -r "${zipFilePath}" "${dataDirName}"`);
+
+      // Send the zip file
+      await bot.sendDocument(chatId, zipFilePath, {
+        caption: `🗄️ Data Backup\n📅 ${new Date().toLocaleString()}\n📁 Folder: ${dataDirName}/`
+      });
+
+      // Clean up zip file after sending
+      fs.unlinkSync(zipFilePath);
+
+      logger.logChange('ADMIN_EXTRACT', adminUserId, 'Database exported and sent as zip');
+    } catch (error) {
+      logger.logError('EXTRACT', adminUserId, error, 'Error extracting database');
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(chatId, `❌ Error: ${safeErrorMessage}`);
     }
   });
 

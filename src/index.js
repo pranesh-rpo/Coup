@@ -1615,8 +1615,12 @@ bot.on('message', async (msg) => {
     // Add + prefix if missing
     if (phoneNumber && !phoneNumber.startsWith('+')) {
       if (/^\d/.test(phoneNumber)) {
-        phoneNumber = '+' + phoneNumber;
+        // Strip leading zeros (domestic dialing prefix) before adding +
+        phoneNumber = '+' + phoneNumber.replace(/^0+/, '');
       }
+    } else if (phoneNumber && phoneNumber.startsWith('+')) {
+      // Strip leading zeros after + (e.g., +0919876543210 -> +919876543210)
+      phoneNumber = '+' + phoneNumber.slice(1).replace(/^0+/, '');
     }
     
     // Delete user's phone number input message for privacy

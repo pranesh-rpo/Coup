@@ -1202,15 +1202,18 @@ class AccountLinker {
       
       // Remove all characters except + and digits
       normalizedPhone = normalizedPhone.replace(/[^\d+]/g, '');
-      
+
       // Ensure it starts with +
       if (!normalizedPhone.startsWith('+')) {
-        // If it doesn't start with +, add it
-        normalizedPhone = '+' + normalizedPhone;
+        // Strip leading zeros (domestic dialing prefix) before adding +
+        normalizedPhone = '+' + normalizedPhone.replace(/^0+/, '');
       }
-      
+
       // Remove any duplicate + signs (should only be at the start)
       normalizedPhone = normalizedPhone.replace(/^\+{2,}/, '+');
+
+      // Strip leading zeros after + (e.g., +0919876543210 -> +919876543210)
+      normalizedPhone = '+' + normalizedPhone.slice(1).replace(/^0+/, '');
       
       // Validate phone format (E.164: + followed by 1-15 digits, first digit after + should be 1-9)
       const phoneRegex = /^\+[1-9]\d{1,14}$/;

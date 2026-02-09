@@ -5,6 +5,7 @@
 
 import accountLinker from './accountLinker.js';
 import configService from './configService.js';
+import { config } from '../config.js';
 import db from '../database/db.js';
 import { logError } from '../utils/logger.js';
 
@@ -123,6 +124,43 @@ class AutoReplyIntervalService {
       this.lastChecked.delete(accountIdStr);
       console.log(`[AUTO_REPLY_INTERVAL] Stopped interval check for account ${accountId}`);
     }
+  }
+
+  /**
+   * Check if a chat is one of the configured updates channels
+   */
+  async isUpdatesChannel(chat, client) {
+    const updatesChannels = config.getUpdatesChannels();
+    if (updatesChannels.length === 0) return false;
+
+    try {
+      const chatUsername = (chat.username || '').toLowerCase();
+      const chatTitle = (chat.title || '').toLowerCase();
+      const chatId = chat.id ? chat.id.toString() : null;
+
+      for (const channelConfig of updatesChannels) {
+        const cleanName = channelConfig.replace('@', '').trim().toLowerCase();
+
+        if ((chatUsername && chatUsername === cleanName) || (chatTitle && chatTitle === cleanName)) {
+          return true;
+        }
+
+        if (client && chatId) {
+          try {
+            const entity = await client.getEntity(channelConfig);
+            if (entity && entity.id && entity.id.toString() === chatId) {
+              return true;
+            }
+          } catch (e) {
+            // Ignore resolution errors
+          }
+        }
+      }
+    } catch (error) {
+      // If check fails, don't block
+    }
+
+    return false;
   }
 
   /**
@@ -295,6 +333,9 @@ class AutoReplyIntervalService {
 
           // Skip if message is not text
           if (!lastMessage.text || lastMessage.text.trim().length === 0) continue;
+
+          // Skip messages from updates channels - auto-reply should not work there
+          if (await this.isUpdatesChannel(chat, client)) continue;
 
           // CRITICAL: Skip Saved Messages (user's own chat with themselves)
           if (isDM) {

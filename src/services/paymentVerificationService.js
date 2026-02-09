@@ -19,7 +19,7 @@ class PaymentVerificationService {
     try {
       const transactionId = paymentData.transactionId?.trim() || paymentData.orderId?.trim();
       const orderId = paymentData.orderId || null;
-      const amount = parseFloat(paymentData.amount) || 30.0;
+      const amount = parseFloat(paymentData.amount) || 119.0;
       const currency = paymentData.currency || 'INR';
       const paymentMethod = paymentData.paymentMethod || 'manual';
       const paymentGateway = null; // Only manual payments supported
@@ -144,8 +144,8 @@ class PaymentVerificationService {
         reasons.push('Valid format');
       }
 
-      // +20 points: Amount matches expected (₹30)
-      if (Math.abs(submission.amount - 30.0) < 0.01) {
+      // +20 points: Amount matches expected (₹119)
+      if (Math.abs(submission.amount - 119.0) < 0.01) {
         score += 20;
         reasons.push('Amount matches');
       }
@@ -185,7 +185,7 @@ class PaymentVerificationService {
         reasons.push('Invalid format');
       }
 
-      if (Math.abs(submission.amount - 30.0) >= 0.01) {
+      if (Math.abs(submission.amount - 119.0) >= 0.01) {
         score -= 15;
         reasons.push('Amount mismatch');
       }

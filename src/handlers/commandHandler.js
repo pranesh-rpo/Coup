@@ -4543,7 +4543,7 @@ export async function handlePremium(bot, callbackQuery) {
       const message = `<b>⭐ PREMIUM</b>
 ━━━━━━━━━━━━━━━━━━━━━
 
-<b>₹30/month</b>
+<b>₹119/month</b>
 
 <b>Benefits:</b>
 • No tag verification

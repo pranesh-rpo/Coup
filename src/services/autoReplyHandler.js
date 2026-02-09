@@ -6,6 +6,7 @@
 
 import { NewMessage } from 'telegram/events/index.js';
 import configService from './configService.js';
+import { config } from '../config.js';
 import { logError } from '../utils/logger.js';
 
 class AutoReplyHandler {
@@ -234,6 +235,45 @@ class AutoReplyHandler {
   }
 
   /**
+   * Check if a chat is one of the configured updates channels
+   */
+  async isUpdatesChannel(chat, client) {
+    const updatesChannels = config.getUpdatesChannels();
+    if (updatesChannels.length === 0) return false;
+
+    try {
+      const chatUsername = (chat.username || '').toLowerCase();
+      const chatTitle = (chat.title || '').toLowerCase();
+      const chatId = chat.id ? chat.id.toString() : null;
+
+      for (const channelConfig of updatesChannels) {
+        const cleanName = channelConfig.replace('@', '').trim().toLowerCase();
+
+        // Check by username or title
+        if ((chatUsername && chatUsername === cleanName) || (chatTitle && chatTitle === cleanName)) {
+          return true;
+        }
+
+        // Check by entity ID resolution
+        if (client && chatId) {
+          try {
+            const entity = await client.getEntity(channelConfig);
+            if (entity && entity.id && entity.id.toString() === chatId) {
+              return true;
+            }
+          } catch (e) {
+            // Ignore resolution errors
+          }
+        }
+      }
+    } catch (error) {
+      // If check fails, don't block auto-reply
+    }
+
+    return false;
+  }
+
+  /**
    * Check if message mentions the account (tags/pings)
    */
   async isAccountMentioned(message, meId, meUsername) {
@@ -435,6 +475,11 @@ class AutoReplyHandler {
 
       // Skip if message is empty or not text
       if (!message.text || message.text.trim().length === 0) {
+        return;
+      }
+
+      // Skip messages from updates channels - auto-reply should not work there
+      if (await this.isUpdatesChannel(chat, client)) {
         return;
       }
 

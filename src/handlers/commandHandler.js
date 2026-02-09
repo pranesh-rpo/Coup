@@ -1986,8 +1986,9 @@ export async function handleStartBroadcast(bot, msg) {
       }
     );
   } else {
-    const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
-    
+    const errorText = result.error || getUserFriendlyErrorMessage();
+    const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${escapeHtml(errorText)}`;
+
     await bot.sendMessage(
       chatId,
       errorMessage,
@@ -2047,9 +2048,43 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
     }
   }
 
+  // Check if message is set before starting (only when not already broadcasting and not in forward mode)
+  if (!automationService.isBroadcasting(userId, accountId)) {
+    try {
+      const settings = await configService.getAccountSettings(accountId);
+      const useForwardMode = settings?.forwardMode || false;
+      const useMessagePool = settings?.useMessagePool || false;
+
+      if (!useForwardMode) {
+        let hasMessage = false;
+
+        if (useMessagePool) {
+          const pool = await messageService.getMessagePool(accountId, true).catch(() => []);
+          hasMessage = pool && pool.length > 0;
+        }
+
+        if (!hasMessage) {
+          const activeMsg = await messageService.getActiveMessage(accountId);
+          hasMessage = activeMsg && (typeof activeMsg === 'string' ? activeMsg.trim().length > 0 : !!activeMsg.text?.trim());
+        }
+
+        if (!hasMessage) {
+          await safeAnswerCallback(bot, callbackQuery.id, {
+            text: '❌ No message set! Please set a broadcast message first.',
+            show_alert: true
+          });
+          return;
+        }
+      }
+    } catch (checkError) {
+      // Don't block broadcast start if check fails, let automationService handle it
+      console.warn(`[BROADCAST] Message pre-check failed: ${checkError.message}`);
+    }
+  }
+
   // Answer callback immediately for better UX
   await safeAnswerCallback(bot, callbackQuery.id);
-  
+
   // Toggle behavior: if broadcasting for this account, stop it; if not, start it
   if (automationService.isBroadcasting(userId, accountId)) {
     // Optimistically update UI immediately
@@ -2215,8 +2250,9 @@ export async function handleStartBroadcastButton(bot, callbackQuery) {
           }
         );
       } else {
-        const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${getUserFriendlyErrorMessage()}\n\n`;
-        
+        const errorText = result.error || getUserFriendlyErrorMessage();
+        const errorMessage = `❌ <b>Failed to Start Broadcast</b>\n\n${escapeHtml(errorText)}`;
+
         await safeEditMessage(
           bot,
           chatId,

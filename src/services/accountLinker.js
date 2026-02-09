@@ -1353,6 +1353,25 @@ class AccountLinker {
       const errorMsg = error.errorMessage || error.message || '';
       const errorCode = error.code || error.errorCode || '';
       
+      // Check for PHONE_PASSWORD_FLOOD (too many failed 2FA attempts - Telegram blocks auth.SendCode)
+      if (errorMsg.includes('PHONE_PASSWORD_FLOOD')) {
+        const waitSeconds = 3600; // Telegram typically blocks for ~1 hour
+        const waitMinutes = 60;
+
+        const cooldownUntil = Date.now() + (waitSeconds * 1000);
+        this.rateLimitCooldowns.set(userId, {
+          cooldownUntil: cooldownUntil,
+          waitSeconds: waitSeconds
+        });
+
+        logError(`[LINK ERROR] PHONE_PASSWORD_FLOOD for user ${userId}. Too many failed 2FA attempts. Cooldown until ${new Date(cooldownUntil).toISOString()}`);
+
+        return {
+          success: false,
+          error: 'Too many failed password attempts on this number. Telegram has temporarily blocked login. Please wait about 1 hour before trying again.'
+        };
+      }
+
       // Check for flood wait errors
       if (isFloodWaitError(error)) {
         const waitSeconds = extractWaitTime(error) || 60;

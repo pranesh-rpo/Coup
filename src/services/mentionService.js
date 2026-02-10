@@ -7,6 +7,13 @@ import db from '../database/db.js';
 import { logError } from '../utils/logger.js';
 
 class MentionService {
+  constructor() {
+    // Cache participants per group to avoid redundant getParticipants/getMessages API calls
+    // Key: groupId string, Value: { users: [], timestamp: number }
+    this.participantCache = new Map();
+    this.CACHE_TTL = 60 * 60 * 1000; // 1 hour cache
+  }
+
   /**
    * Get recent message senders from a group
    * @param {Object} client - Telegram client
@@ -493,6 +500,17 @@ class MentionService {
       
       // Add a 5-second timeout to the entire process to prevent hanging
       const mentionPromise = (async () => {
+        // Check cache first to avoid redundant API calls
+        const groupId = groupEntity.id?.toString() || groupEntity.id?.value?.toString() || 'unknown';
+        const cached = this.participantCache.get(groupId);
+        if (cached && (Date.now() - cached.timestamp) < this.CACHE_TTL) {
+          let activeUsers = cached.users.filter(u => !excludeUserId || u.userId !== excludeUserId).slice(0, mentionCount);
+          if (activeUsers.length > 0) {
+            console.log(`[MENTION] Using cached users for group ${groupId}: ${activeUsers.length} users`);
+            return this._buildMentionMessage(messageText, activeUsers, mentionCount);
+          }
+        }
+
         // Get recent message senders (excluding the account itself)
         let activeUsers = await this.getMostActiveUsers(client, groupEntity, mentionCount, excludeUserId);
         
@@ -517,7 +535,12 @@ class MentionService {
         
         // Limit to requested count
         activeUsers = activeUsers.slice(0, mentionCount);
-        
+
+        // Cache the fetched users for this group
+        if (activeUsers.length > 0) {
+          this.participantCache.set(groupId, { users: activeUsers, timestamp: Date.now() });
+        }
+
         if (activeUsers.length === 0) {
           console.log(`[MENTION] No users to mention, sending message without mentions`);
           return { message: messageText, entities: [] };
@@ -545,6 +568,18 @@ class MentionService {
       // Return original message if mention fails or times out
       return { message: messageText, entities: [] };
     }
+  }
+
+  /**
+   * Build mention message from cached users
+   */
+  _buildMentionMessage(messageText, users, mentionCount) {
+    const limitedUsers = users.slice(0, mentionCount);
+    if (limitedUsers.length === 0) {
+      return { message: messageText, entities: [] };
+    }
+    const { message, entities } = this.createMentionEntities(limitedUsers, messageText);
+    return { message, entities };
   }
 }
 

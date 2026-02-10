@@ -212,25 +212,15 @@ class AutoReplyHandler {
   /**
    * Check if message sender is a bot
    */
-  async isSenderBot(message, client) {
+  isSenderBot(message) {
     try {
+      // Use message.sender.bot directly - avoid getEntity API call
       if (message.sender && message.sender.bot === true) {
         return true;
       }
-      
-      if (message.fromId && message.fromId.className === 'PeerUser') {
-        try {
-          const sender = await client.getEntity(message.fromId.userId);
-          return sender && sender.bot === true;
-        } catch (e) {
-          // If we can't get the entity, assume it's not a bot
-          return false;
-        }
-      }
-      
       return false;
     } catch (error) {
-      return false; // Assume not a bot on error
+      return false;
     }
   }
 
@@ -254,17 +244,6 @@ class AutoReplyHandler {
           return true;
         }
 
-        // Check by entity ID resolution
-        if (client && chatId) {
-          try {
-            const entity = await client.getEntity(channelConfig);
-            if (entity && entity.id && entity.id.toString() === chatId) {
-              return true;
-            }
-          } catch (e) {
-            // Ignore resolution errors
-          }
-        }
       }
     } catch (error) {
       // If check fails, don't block auto-reply
@@ -469,7 +448,7 @@ class AutoReplyHandler {
       }
 
       // Skip if message is from a bot
-      if (await this.isSenderBot(message, client)) {
+      if (this.isSenderBot(message)) {
         return;
       }
 

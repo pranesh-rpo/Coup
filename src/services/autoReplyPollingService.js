@@ -209,7 +209,7 @@ class AutoReplyPollingService {
             if (this.isMessageFromSelf(lastMessage, me.id)) continue;
 
             // Skip if message is from a bot
-            if (await this.isSenderBot(lastMessage, client)) continue;
+            if (this.isSenderBot(lastMessage)) continue;
 
             // Skip if message is empty or not text
             if (!lastMessage.text || lastMessage.text.trim().length === 0) continue;
@@ -403,18 +403,11 @@ class AutoReplyPollingService {
   /**
    * Check if message sender is a bot
    */
-  async isSenderBot(message, client) {
+  isSenderBot(message) {
     try {
+      // Use message.sender.bot directly - avoid getEntity API call
       if (message.sender && message.sender.bot === true) {
         return true;
-      }
-      if (message.fromId && message.fromId.className === 'PeerUser') {
-        try {
-          const sender = await client.getEntity(message.fromId.userId);
-          return sender && sender.bot === true;
-        } catch (e) {
-          return false;
-        }
       }
       return false;
     } catch (error) {

@@ -762,37 +762,9 @@ class AutomationService {
             console.log(`[BROADCAST] Start: Using regular message:`, messageData ? 'found' : 'null');
           }
           
-          // If no saved_message_id found, try to get last message from Saved Messages automatically
-          if (messageData && typeof messageData === 'object' && !messageData.saved_message_id) {
-            try {
-              const accountLinker = (await import('./accountLinker.js')).default;
-              const client = await accountLinker.ensureConnected(accountId);
-              if (client) {
-                const me = await client.getMe();
-                let savedMessagesEntity;
-                try {
-                  savedMessagesEntity = await client.getEntity(me);
-                } catch (error) {
-                  const dialogs = await client.getDialogs();
-                  const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
-                  if (savedDialog) {
-                    savedMessagesEntity = savedDialog.entity;
-                  }
-                }
-                
-                if (savedMessagesEntity) {
-                  const messages = await client.getMessages(savedMessagesEntity, { limit: 1 });
-                  if (messages && messages.length > 0) {
-                    messageData.saved_message_id = messages[0].id;
-                    console.log(`[BROADCAST] Auto-detected last message from Saved Messages (ID: ${messageData.saved_message_id})`);
-                  }
-                }
-              }
-            } catch (autoCheckError) {
-              console.log(`[BROADCAST] Could not auto-check Saved Messages: ${autoCheckError.message}`);
-            }
-          }
-          
+          // saved_message_id auto-detection is handled in sendSingleMessageToAllGroups
+          // to avoid duplicate API calls at startup that can trigger Telegram rate limits
+
           // Handle both old (string) and new (object) formats for backward compatibility
           if (messageData === null) {
             broadcastMessage = null;
@@ -1911,37 +1883,21 @@ class AutomationService {
 
       // Resolve updates channels to exclude them from broadcast
       const updatesChannels = config.getUpdatesChannels();
-      const updatesChannelIds = new Set();
       const updatesChannelUsernames = new Set();
       
       if (updatesChannels.length > 0) {
-        console.log(`[BROADCAST] Resolving ${updatesChannels.length} updates channels to exclude from broadcast...`);
         for (const channelConfig of updatesChannels) {
           try {
-            // Add username if available
+            // Filter by username only - avoid extra API calls (getEntity) that contribute to rate limiting
             const cleanName = channelConfig.replace('@', '').trim().toLowerCase();
             if (cleanName) {
               updatesChannelUsernames.add(cleanName);
-            }
-            
-            // Resolve ID if possible (to catch groups without usernames or renamed ones)
-            // We only try this if client is connected
-            if (client) {
-              try {
-                const entity = await client.getEntity(channelConfig);
-                if (entity && entity.id) {
-                  updatesChannelIds.add(entity.id.toString());
-                }
-              } catch (e) {
-                // Ignore resolution errors (might not be in channel or invalid name)
-                // Only log if verbose logging is needed, otherwise keep it clean
-              }
             }
           } catch (err) {
             console.log(`[BROADCAST] Error processing updates channel config ${channelConfig}: ${err.message}`);
           }
         }
-        console.log(`[BROADCAST] Excluded updates channels: ${updatesChannelUsernames.size} usernames, ${updatesChannelIds.size} IDs`);
+        console.log(`[BROADCAST] Excluded ${updatesChannelUsernames.size} updates channels by username`);
       }
       
       // Filter only groups (exclude channels and private chats)
@@ -1984,11 +1940,6 @@ class AutomationService {
 
         // Check if this is an updates channel (exclude from broadcast)
         const dialogUsername = (dialog.entity?.username || '').toLowerCase();
-        
-        if (updatesChannelIds.has(groupId.toString())) {
-          console.log(`[BROADCAST] 🚫 Skipping updates channel (by ID): "${groupName}"`);
-          continue;
-        }
         
         if (dialogUsername && updatesChannelUsernames.has(dialogUsername)) {
           console.log(`[BROADCAST] 🚫 Skipping updates channel (by username): "${groupName}" (@${dialogUsername})`);
@@ -2274,23 +2225,9 @@ class AutomationService {
             
             // Check if we should forward from Saved Messages (if we have saved_message_id with premium emojis)
             // This is the proper way to preserve premium emojis - forward the message that already has emoji documents
-            if (savedMessageIdToUse && entitiesToUse && entitiesToUse.some(e => e.type === 'custom_emoji' && e.custom_emoji_id)) {
+            if (savedMessageIdToUse && savedMessagesEntity && entitiesToUse && entitiesToUse.some(e => e.type === 'custom_emoji' && e.custom_emoji_id)) {
               try {
-                // Get Saved Messages entity
-                const me = await client.getMe();
-                let savedMessagesEntity;
-                try {
-                  savedMessagesEntity = await client.getEntity(me);
-                } catch (error) {
-                  const dialogs = await client.getDialogs();
-                  const savedDialog = dialogs.find(d => d.isUser && d.name === 'Saved Messages');
-                  if (savedDialog) {
-                    savedMessagesEntity = savedDialog.entity;
-                  } else {
-                    throw new Error('Saved Messages not found');
-                  }
-                }
-                
+                // Reuse savedMessagesEntity already fetched at cycle start (avoid redundant API calls)
                 console.log(`[BROADCAST] Group "${groupName}": Forwarding message ${savedMessageIdToUse} from Saved Messages to preserve premium emojis`);
                 
                 // Forward the message from Saved Messages (preserves premium emojis)

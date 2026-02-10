@@ -145,16 +145,6 @@ class AutoReplyIntervalService {
           return true;
         }
 
-        if (client && chatId) {
-          try {
-            const entity = await client.getEntity(channelConfig);
-            if (entity && entity.id && entity.id.toString() === chatId) {
-              return true;
-            }
-          } catch (e) {
-            // Ignore resolution errors
-          }
-        }
       }
     } catch (error) {
       // If check fails, don't block
@@ -166,39 +156,14 @@ class AutoReplyIntervalService {
   /**
    * Check if message sender is a bot
    */
-  async isSenderBot(message, client) {
+  isSenderBot(message) {
     try {
-      // Try to get the sender entity
-      if (message.sender) {
-        return message.sender.bot === true;
+      // Use message.sender.bot directly - avoid getEntity API call
+      if (message.sender && message.sender.bot === true) {
+        return true;
       }
-      
-      // Try to get sender from fromId
-      if (message.fromId) {
-        let senderId = null;
-        if (message.fromId.className === 'PeerUser') {
-          senderId = message.fromId.userId;
-        } else if (message.fromId && typeof message.fromId === 'object' && message.fromId.userId) {
-          senderId = message.fromId.userId;
-        }
-        
-        if (senderId !== null && senderId !== undefined) {
-          try {
-            const senderIdNum = typeof senderId === 'bigint' ? Number(senderId) : senderId;
-            const sender = await client.getEntity(senderIdNum);
-            if (sender && sender.bot === true) {
-              return true;
-            }
-          } catch (e) {
-            // If we can't get the entity, assume it's not a bot
-            return false;
-          }
-        }
-      }
-      
       return false;
     } catch (error) {
-      // If we can't determine, assume it's not a bot (to avoid blocking legitimate users)
       return false;
     }
   }
@@ -326,7 +291,7 @@ class AutoReplyIntervalService {
           if (this.isMessageFromSelf(lastMessage, me.id)) continue;
 
           // Skip if message is from a bot
-          const isBot = await this.isSenderBot(lastMessage, client);
+          const isBot = this.isSenderBot(lastMessage);
           if (isBot) {
             continue;
           }

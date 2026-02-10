@@ -54,22 +54,13 @@ class GroupService {
       const excludedChannelIds = new Set();
       const excludedUsernames = new Set();
       
-      // Fetch all updates channel entities in parallel (one-time cost)
+      // Filter updates channels by username only - avoid getEntity API calls
       if (updatesChannels.length > 0) {
-        const entityPromises = updatesChannels.map(async (channelConfig) => {
+        for (const channelConfig of updatesChannels) {
           const username = channelConfig.replace('@', '').toLowerCase();
           excludedUsernames.add(username);
-          try {
-            const entity = await client.getEntity(channelConfig);
-            if (entity && entity.id) {
-              excludedChannelIds.add(entity.id.toString());
-            }
-          } catch (e) {
-            // Skip if can't resolve
-          }
-        });
-        await Promise.all(entityPromises);
-        console.log(`[GROUPS] Excluding ${excludedChannelIds.size} updates channels by ID`);
+        }
+        console.log(`[GROUPS] Excluding ${excludedUsernames.size} updates channels by username`);
       }
 
       // Enhanced error handling for getDialogs

@@ -1503,10 +1503,36 @@ class AutomationService {
       }
     }
     
-    if (cleanedCount > 0) {
-      console.log(`[CLEANUP] Cleaned up ${cleanedCount} old anti-freeze tracking entries`);
+    // Also clean up other unbounded Maps for accounts no longer broadcasting
+    const activeBroadcastAccountIds = new Set();
+    for (const [key] of this.activeBroadcasts.entries()) {
+      const parts = key.split('_');
+      if (parts.length >= 2) activeBroadcastAccountIds.add(parts[parts.length - 1]);
     }
-    
+
+    for (const [accountId] of this.circuitBreakers.entries()) {
+      if (!activeBroadcastAccountIds.has(accountId.toString())) {
+        this.circuitBreakers.delete(accountId);
+        cleanedCount++;
+      }
+    }
+    for (const [accountId] of this.banRiskTracking.entries()) {
+      if (!activeBroadcastAccountIds.has(accountId.toString())) {
+        this.banRiskTracking.delete(accountId);
+        cleanedCount++;
+      }
+    }
+    for (const [accountId] of this.globalRateLimitTracking.entries()) {
+      if (!activeBroadcastAccountIds.has(accountId.toString())) {
+        this.globalRateLimitTracking.delete(accountId);
+        cleanedCount++;
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(`[CLEANUP] Cleaned up ${cleanedCount} old tracking entries (anti-freeze, circuit breakers, ban risk, rate limits)`);
+    }
+
     // Log current memory usage
     const memUsage = process.memoryUsage();
     const memUsageMB = {
@@ -3737,8 +3763,10 @@ class AutomationService {
           failed++;
         }
 
-        // Small delay between restores to avoid overwhelming the system
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Stagger restores to avoid connection spike on boot (5-10 seconds random)
+        // Short delays (500ms) cause all accounts to reconnect simultaneously which triggers Telegram's anti-abuse
+        const staggerDelay = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
+        await new Promise(resolve => setTimeout(resolve, staggerDelay));
       }
 
       console.log(`[BROADCAST_RESTORE] Completed: ${restored} restored, ${failed} failed`);

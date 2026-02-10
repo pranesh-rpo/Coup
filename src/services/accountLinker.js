@@ -709,6 +709,11 @@ class AccountLinker {
             retryDelay: 5000,
             autoReconnect: false, // CRITICAL: Disable autoReconnect to prevent excessive reconnections
             useWSS: false,
+            deviceModel: 'Desktop',
+            systemVersion: 'Windows 10',
+            appVersion: '4.16.8',
+            langCode: 'en',
+            systemLangCode: 'en',
           });
           
           // Setup error handlers to prevent crashes from MTProto errors
@@ -1054,6 +1059,11 @@ class AccountLinker {
           retryDelay: 5000, // Increased from 3000 to 5000 for safety
           autoReconnect: false, // CRITICAL: Disable autoReconnect to prevent excessive reconnections
           useWSS: false,
+          deviceModel: 'Desktop',
+          systemVersion: 'Windows 10',
+          appVersion: '4.16.8',
+          langCode: 'en',
+          systemLangCode: 'en',
         });
         
         // Setup error handlers to prevent crashes from MTProto errors
@@ -1281,6 +1291,11 @@ class AccountLinker {
         retryDelay: 5000, // Increased from 3000
         autoReconnect: false, // CRITICAL: Disable autoReconnect
         useWSS: false,
+        deviceModel: 'Desktop',
+        systemVersion: 'Windows 10',
+        appVersion: '4.16.8',
+        langCode: 'en',
+        systemLangCode: 'en',
       });
 
       // Setup error handlers to prevent crashes from MTProto errors
@@ -2176,6 +2191,11 @@ class AccountLinker {
         retryDelay: 5000, // Increased from 3000
         autoReconnect: false, // CRITICAL: Disable autoReconnect for web login
         useWSS: false,
+        deviceModel: 'Desktop',
+        systemVersion: 'Windows 10',
+        appVersion: '4.16.8',
+        langCode: 'en',
+        systemLangCode: 'en',
       });
 
       // Setup error handlers

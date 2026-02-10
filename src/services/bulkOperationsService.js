@@ -44,13 +44,13 @@ class BulkOperationsService {
       let assigned = 0;
       for (const groupId of groupIds) {
         try {
-          await db.query(
+          const result = await db.query(
             `INSERT INTO group_category_assignments (account_id, group_id, category_id)
              VALUES ($1, $2, $3)
              ON CONFLICT (account_id, group_id, category_id) DO NOTHING`,
             [accountId, groupId, categoryId]
           );
-          assigned++;
+          if (result.rowCount > 0) assigned++;
         } catch (error) {
           logger.logError('BULK', accountId, error, `Failed to assign group ${groupId}`);
         }
@@ -76,10 +76,17 @@ class BulkOperationsService {
       let added = 0;
       for (const groupId of groupIds) {
         try {
+          // Check for existing entry to prevent duplicates (no UNIQUE constraint on this table)
+          const existing = await db.query(
+            `SELECT id FROM group_filters WHERE account_id = $1 AND filter_type = $2 AND group_id = $3`,
+            [accountId, filterType, groupId]
+          );
+          if (existing.rows && existing.rows.length > 0) {
+            continue; // Already exists, skip
+          }
           await db.query(
             `INSERT INTO group_filters (account_id, filter_type, group_id, is_active)
-             VALUES ($1, $2, $3, TRUE)
-             ON CONFLICT DO NOTHING`,
+             VALUES ($1, $2, $3, TRUE)`,
             [accountId, filterType, groupId]
           );
           added++;

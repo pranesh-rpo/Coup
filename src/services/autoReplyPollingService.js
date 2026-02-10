@@ -27,9 +27,11 @@ class AutoReplyPollingService {
     // Stop existing polling if any
     this.stopPolling(accountId);
 
-    // Use randomized polling interval (3-5 seconds) to avoid predictable patterns
+    // Use randomized polling interval (30-60 seconds) to avoid detection patterns
+    // IMPORTANT: 3-5s polling creates ~600+ reconnections/hour which triggers Telegram's anti-abuse
+    // 30-60s reduces this to ~60-120/hour which is much safer for account health
     const getRandomPollInterval = () => {
-      return Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000; // 3-5 seconds
+      return Math.floor(Math.random() * (60000 - 30000 + 1)) + 30000; // 30-60 seconds
     };
 
     const scheduleNext = () => {
@@ -45,7 +47,7 @@ class AutoReplyPollingService {
 
     // Start the polling loop
     scheduleNext();
-    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (randomized interval: 3-5s)`);
+    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (randomized interval: 30-60s)`);
 
     // Check immediately on start (with a small delay to avoid instant connection)
     setTimeout(async () => {
@@ -63,7 +65,7 @@ class AutoReplyPollingService {
       clearTimeout(timeoutId);
       this.pollingIntervals.delete(accountIdStr);
       this.lastCheckTimes.delete(accountIdStr);
-      this.processingAccounts.delete(accountId);
+      this.processingAccounts.delete(accountIdStr);
       // Don't delete error count - we want to track it for recovery
       console.log(`[AUTO_REPLY_POLL] Stopped polling for account ${accountId}`);
     }
@@ -72,25 +74,29 @@ class AutoReplyPollingService {
   /**
    * Stop all polling (e.g., on shutdown)
    */
-  stopAll() {
+  stopAllImmediate() {
     console.log(`[AUTO_REPLY_POLL] Stopping all ${this.pollingIntervals.size} polling intervals...`);
     for (const [accountId, timeoutId] of this.pollingIntervals.entries()) {
       clearTimeout(timeoutId);
     }
     this.pollingIntervals.clear();
     this.processingAccounts.clear();
+    this.lastCheckTimes.clear();
+    this.consecutiveErrors.clear();
   }
 
   /**
    * Check for new messages and send auto-replies
    */
   async checkAndReply(accountId) {
+    const accountIdStr = accountId.toString();
+
     // Prevent concurrent processing
-    if (this.processingAccounts.has(accountId)) {
+    if (this.processingAccounts.has(accountIdStr)) {
       return;
     }
 
-    this.processingAccounts.add(accountId);
+    this.processingAccounts.add(accountIdStr);
 
     try {
       const settings = await configService.getAccountSettings(accountId);
@@ -116,6 +122,10 @@ class AutoReplyPollingService {
       }
 
       const userId = result.rows[0]?.user_id;
+      if (!userId) {
+        this.stopPolling(accountId);
+        return;
+      }
 
       // Connect briefly to check messages
       const client = await accountLinker.getClientAndConnect(userId, accountId);
@@ -126,22 +136,17 @@ class AutoReplyPollingService {
       }
       
       // Reset error count on successful connection
-      if (this.consecutiveErrors.has(accountId)) {
-        this.consecutiveErrors.delete(accountId);
+      if (this.consecutiveErrors.has(accountIdStr)) {
+        this.consecutiveErrors.delete(accountIdStr);
       }
 
       try {
-        // CRITICAL: Set account to offline status to prevent showing as "online"
-        // Set multiple times to ensure it sticks (some clients may override it)
+        // Set account to offline status to prevent showing as "online"
         try {
           const { Api } = await import('telegram/tl/index.js');
           await client.invoke(new Api.account.UpdateStatus({ offline: true }));
-          // Set again after a brief delay to ensure it persists
-          await new Promise(resolve => setTimeout(resolve, 100));
-          await client.invoke(new Api.account.UpdateStatus({ offline: true }));
         } catch (statusError) {
           // Silently ignore - some accounts may not support this
-          // Only log if it's an unexpected error
           if (!statusError.message?.includes('AUTH_KEY') && !statusError.message?.includes('not connected')) {
             console.log(`[AUTO_REPLY_POLL] Could not set offline status for account ${accountId}: ${statusError.message}`);
           }
@@ -150,7 +155,7 @@ class AutoReplyPollingService {
         const me = await client.getMe();
         let dialogs = [];
         try {
-          dialogs = await client.getDialogs({ limit: 50 }); // Check recent dialogs
+          dialogs = await client.getDialogs({ limit: 15 }); // Check recent dialogs (reduced from 50 to minimize API load)
         } catch (dialogsError) {
           // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
           const errorMessage = dialogsError.message || dialogsError.toString() || '';
@@ -259,8 +264,8 @@ class AutoReplyPollingService {
         console.log(`[AUTO_REPLY_POLL] ✅ Check complete for account ${accountId} (updated lastCheck: DM=${lastCheck.dm}, Groups=${lastCheck.groups})`);
 
         // Reset error count on successful check
-        if (this.consecutiveErrors.has(accountId)) {
-          this.consecutiveErrors.delete(accountId);
+        if (this.consecutiveErrors.has(accountIdStr)) {
+          this.consecutiveErrors.delete(accountIdStr);
         }
 
         // Disconnect after checking (to avoid staying online)
@@ -271,18 +276,18 @@ class AutoReplyPollingService {
         logError(`[AUTO_REPLY_POLL] Error checking messages for account ${accountId}:`, error);
         
         // Track consecutive errors
-        const errorCount = (this.consecutiveErrors.get(accountId) || 0) + 1;
-        this.consecutiveErrors.set(accountId, errorCount);
-        
+        const errorCount = (this.consecutiveErrors.get(accountIdStr) || 0) + 1;
+        this.consecutiveErrors.set(accountIdStr, errorCount);
+
         // If too many consecutive errors, stop polling temporarily
         if (errorCount >= this.MAX_CONSECUTIVE_ERRORS) {
           console.error(`[AUTO_REPLY_POLL] ⚠️ Account ${accountId} has ${errorCount} consecutive errors, stopping polling temporarily`);
           this.stopPolling(accountId);
-          
+
           // Restart after error reset time
           setTimeout(async () => {
             console.log(`[AUTO_REPLY_POLL] 🔄 Restarting polling for account ${accountId} after error recovery...`);
-            this.consecutiveErrors.delete(accountId);
+            this.consecutiveErrors.delete(accountIdStr);
             await this.startPolling(accountId);
           }, this.ERROR_RESET_TIME);
         }
@@ -332,25 +337,25 @@ class AutoReplyPollingService {
       
       console.error(`[AUTO_REPLY_POLL] ❌ Error in checkAndReply for account ${accountId}:`, error.message);
       logError(`[AUTO_REPLY_POLL] Error in checkAndReply for account ${accountId}:`, error);
-      
+
       // Track consecutive errors
-      const errorCount = (this.consecutiveErrors.get(accountId) || 0) + 1;
-      this.consecutiveErrors.set(accountId, errorCount);
-      
+      const errorCount = (this.consecutiveErrors.get(accountIdStr) || 0) + 1;
+      this.consecutiveErrors.set(accountIdStr, errorCount);
+
       // If too many consecutive errors, stop polling temporarily
       if (errorCount >= this.MAX_CONSECUTIVE_ERRORS) {
         console.error(`[AUTO_REPLY_POLL] ⚠️ Account ${accountId} has ${errorCount} consecutive errors, stopping polling temporarily`);
         this.stopPolling(accountId);
-        
+
         // Restart after error recovery time
         setTimeout(async () => {
           console.log(`[AUTO_REPLY_POLL] 🔄 Restarting polling for account ${accountId} after error recovery...`);
-          this.consecutiveErrors.delete(accountId);
+          this.consecutiveErrors.delete(accountIdStr);
           await this.startPolling(accountId);
         }, this.ERROR_RESET_TIME);
       }
     } finally {
-      this.processingAccounts.delete(accountId);
+      this.processingAccounts.delete(accountIdStr);
     }
   }
 
@@ -428,10 +433,15 @@ class AutoReplyPollingService {
          WHERE (auto_reply_dm_enabled = 1 OR auto_reply_groups_enabled = 1)`
       );
 
-      console.log(`[AUTO_REPLY_POLL] Starting polling for ${result.rows.length} accounts...`);
-      
-      for (const row of result.rows) {
-        await this.startPolling(row.account_id);
+      console.log(`[AUTO_REPLY_POLL] Starting polling for ${result.rows.length} accounts (staggered)...`);
+
+      for (let i = 0; i < result.rows.length; i++) {
+        await this.startPolling(result.rows[i].account_id);
+        // Stagger polling starts by 3-8 seconds to avoid all accounts connecting at once
+        if (i < result.rows.length - 1) {
+          const staggerDelay = Math.floor(Math.random() * (8000 - 3000 + 1)) + 3000;
+          await new Promise(resolve => setTimeout(resolve, staggerDelay));
+        }
       }
     } catch (error) {
       logError('[AUTO_REPLY_POLL] Error starting all polling:', error);

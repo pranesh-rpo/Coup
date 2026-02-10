@@ -21,9 +21,10 @@ import { fileURLToPath } from 'url';
 let adminBot = null;
 let mainBot = null; // Reference to main bot for sending messages to users
 let lastAdminBroadcast = null; // Store last broadcast message
+const pendingReplaceDb = new Map(); // Track admins awaiting tar file for /replacedb
 let pollingRetryCount = 0;
 let pollingRetryTimeout = null;
-const MAX_POLLING_RETRIES = 5;
+const MAX_POLLING_RETRIES = 10;
 const BASE_RETRY_DELAY = 10000; // 10 seconds base delay
 
 /**
@@ -71,12 +72,11 @@ async function restartPolling() {
     } catch (restartError) {
       const errorMessage = restartError.message || '';
       
-      // Check for 409 Conflict error
+      // Check for 409 Conflict error - retry with longer delay (old instance will eventually die)
       if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
-        console.error('[ADMIN BOT] ⚠️ 409 Conflict when restarting polling - stopping retry attempts');
-        console.error('[ADMIN BOT] Another instance is already polling this bot token');
-        pollingRetryTimeout = null;
-        pollingRetryCount = MAX_POLLING_RETRIES + 1; // Prevent further retries
+        console.warn(`[ADMIN BOT] ⚠️ 409 Conflict when restarting polling (attempt ${pollingRetryCount}/${MAX_POLLING_RETRIES}) - old instance may still be running, retrying...`);
+        const conflictRetryDelay = 15000; // 15 seconds between conflict retries
+        pollingRetryTimeout = setTimeout(restartPolling, conflictRetryDelay);
         return;
       }
       
@@ -161,24 +161,27 @@ export function initializeAdminBot(mainBotInstance = null) {
         console.error('[ADMIN BOT] Polling error:', error);
       }
       
-      // Handle 409 Conflict error - another instance is polling
+      // Handle 409 Conflict error - another instance is polling (common during redeployments)
       if (isConflictError) {
-        console.error('[ADMIN BOT] ⚠️ 409 Conflict: Another bot instance is polling. Stopping polling to avoid conflicts.');
-        console.error('[ADMIN BOT] This usually means:');
-        console.error('[ADMIN BOT]   1. Another process is using the same admin bot token');
-        console.error('[ADMIN BOT]   2. A webhook is set for this bot');
-        console.error('[ADMIN BOT]   3. The bot was restarted without properly stopping polling');
-        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - another instance is polling');
-        
-        // Stop polling to avoid conflicts
+        console.warn('[ADMIN BOT] ⚠️ 409 Conflict: Another bot instance is polling. Will retry after old instance dies.');
+
+        // Stop current polling to avoid rapid conflict loops
         try {
           adminBot.stopPolling();
           console.log('[ADMIN BOT] Polling stopped due to conflict');
         } catch (stopError) {
           console.error('[ADMIN BOT] Error stopping polling:', stopError);
         }
-        
-        // Don't retry on conflict errors - manual intervention needed
+
+        // Retry after delay - old instance will eventually stop during redeployment
+        if (pollingRetryCount < MAX_POLLING_RETRIES && !pollingRetryTimeout) {
+          const conflictRetryDelay = 15000; // 15 seconds - give old instance time to die
+          console.log(`[ADMIN BOT] Will retry polling in ${conflictRetryDelay / 1000}s (attempt ${pollingRetryCount + 1}/${MAX_POLLING_RETRIES})`);
+          pollingRetryTimeout = setTimeout(restartPolling, conflictRetryDelay);
+        } else if (pollingRetryCount >= MAX_POLLING_RETRIES) {
+          console.error('[ADMIN BOT] ❌ 409 Conflict persists after max retries. Manual restart may be needed.');
+          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - all retries exhausted');
+        }
         return;
       }
       
@@ -394,6 +397,7 @@ function registerAdminCommands(bot) {
       `/health_check - Comprehensive health check\n` +
       `/uptime - Bot uptime information\n` +
       `/extract - Download database as zip\n` +
+      `/replacedb - Replace data folder with tar file\n` +
       `/test - Test admin bot connection\n\n` +
       `<b>❓ Help:</b>\n` +
       `/help - Show detailed help\n` +
@@ -544,7 +548,7 @@ function registerAdminCommands(bot) {
   });
 
   // /logs command
-  bot.onText(/\/logs/, async (msg) => {
+  bot.onText(/\/logs$/, async (msg) => {
     if (msg.chat.type !== 'private') return;
     if (!isAdmin(msg.from.id)) {
       await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
@@ -1033,7 +1037,7 @@ function registerAdminCommands(bot) {
   });
 
   // /abroadcast command - Broadcast message to all users
-  bot.onText(/\/abroadcast(?:\s+(.+))?/, async (msg, match) => {
+  bot.onText(/\/abroadcast(?:\s+(.+))?$/, async (msg, match) => {
     if (msg.chat.type !== 'private') return;
     console.log(`[ADMIN_BROADCAST] Command received from user ${msg.from.id}`);
     console.log(`[ADMIN_BROADCAST] Message text: ${msg.text}`);
@@ -1418,7 +1422,7 @@ function registerAdminCommands(bot) {
   });
 
   // Add a simple test command
-  bot.onText(/\/test/, async (msg) => {
+  bot.onText(/\/test$/, async (msg) => {
     console.log(`[ADMIN BOT] /test command received from ${msg.from.id}`);
     try {
       await bot.sendMessage(msg.chat.id, `✅ Admin bot is working! Your ID: ${msg.from.id}\nIs Admin: ${isAdmin(msg.from.id)}`);
@@ -2345,7 +2349,7 @@ function registerAdminCommands(bot) {
       }
 
       const result = await premiumService.createSubscription(targetUserId, {
-        amount: 30.0,
+        amount: 119.0,
         currency: 'INR',
         paymentMethod: 'admin_manual',
         paymentReference: `Admin: ${adminUserId}`
@@ -2801,8 +2805,172 @@ function registerAdminCommands(bot) {
     }
   });
 
+  // /replacedb command - Replace data folder with uploaded tar file
+  bot.onText(/\/replacedb$/, async (msg) => {
+    if (msg.chat.type !== 'private') return;
+    const chatId = msg.chat.id;
+    const adminUserId = msg.from.id;
+
+    if (!isAdmin(adminUserId)) {
+      await bot.sendMessage(chatId, '❌ Unauthorized');
+      return;
+    }
+
+    // Set pending state - waiting for tar file
+    pendingReplaceDb.set(adminUserId, { timestamp: Date.now() });
+
+    // Auto-expire after 5 minutes
+    setTimeout(() => {
+      if (pendingReplaceDb.has(adminUserId)) {
+        pendingReplaceDb.delete(adminUserId);
+      }
+    }, 5 * 60 * 1000);
+
+    await bot.sendMessage(chatId,
+      '📦 <b>Replace Data Folder</b>\n\n' +
+      '⚠️ <b>WARNING:</b> This will replace the entire data folder!\n\n' +
+      'Please send the <code>.tar.gz</code> file now.\n\n' +
+      '<i>The file should be a tar.gz archive of the data folder (same format as /extract output).</i>\n\n' +
+      'Send /cancel to abort.',
+      { parse_mode: 'HTML' }
+    );
+  });
+
+  // Handle cancel for /replacedb
+  bot.onText(/\/cancel$/, async (msg) => {
+    if (msg.chat.type !== 'private') return;
+    const adminUserId = msg.from.id;
+    if (pendingReplaceDb.has(adminUserId)) {
+      pendingReplaceDb.delete(adminUserId);
+      await bot.sendMessage(msg.chat.id, '✅ Replace DB operation cancelled.');
+    }
+  });
+
+  // Handle document uploads for /replacedb
+  bot.on('document', async (msg) => {
+    if (msg.chat.type !== 'private') return;
+    const adminUserId = msg.from.id;
+    const chatId = msg.chat.id;
+
+    // Only process if admin is in replacedb flow
+    if (!pendingReplaceDb.has(adminUserId)) return;
+    if (!isAdmin(adminUserId)) return;
+
+    pendingReplaceDb.delete(adminUserId);
+
+    const doc = msg.document;
+    const fileName = doc.file_name || '';
+
+    if (!fileName.endsWith('.tar.gz') && !fileName.endsWith('.tgz')) {
+      await bot.sendMessage(chatId, '❌ Invalid file. Please send a <code>.tar.gz</code> file.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    try {
+      await bot.sendMessage(chatId, '⏳ Downloading and extracting...');
+
+      const { execSync } = await import('child_process');
+
+      // Resolve the data folder path
+      const dbPath = path.resolve(config.dbPath || './data/bot.db');
+      const dataDir = path.dirname(dbPath);
+      const parentDir = path.dirname(dataDir);
+      const dataDirName = path.basename(dataDir);
+
+      // Download the file
+      const filePath = await bot.downloadFile(doc.file_id, parentDir);
+
+      // Create backup of current data folder before replacing
+      const backupName = `${dataDirName}_backup_${Date.now()}`;
+      const backupPath = path.join(parentDir, backupName);
+
+      if (fs.existsSync(dataDir)) {
+        fs.renameSync(dataDir, backupPath);
+        console.log(`[ADMIN BOT] Backed up current data folder to ${backupName}`);
+      }
+
+      try {
+        // Extract the tar file
+        execSync(`cd "${parentDir}" && tar --no-absolute-names -xzf "${filePath}"`);
+
+        // Verify the data folder exists after extraction
+        if (!fs.existsSync(dataDir)) {
+          // The tar might have a different root folder name - find it
+          const extracted = fs.readdirSync(parentDir).filter(f => {
+            const fullPath = path.join(parentDir, f);
+            return fs.statSync(fullPath).isDirectory() &&
+                   f !== backupName &&
+                   f !== dataDirName &&
+                   fs.existsSync(path.join(fullPath, 'bot.db'));
+          });
+
+          if (extracted.length > 0) {
+            // Rename the extracted folder to the correct data dir name
+            fs.renameSync(path.join(parentDir, extracted[0]), dataDir);
+            console.log(`[ADMIN BOT] Renamed extracted folder "${extracted[0]}" to "${dataDirName}"`);
+          } else {
+            throw new Error('Extracted archive does not contain a valid data folder with bot.db');
+          }
+        }
+
+        // Clean up downloaded tar file and its parent directory (created by bot.downloadFile)
+        try {
+          fs.unlinkSync(filePath);
+          const downloadSubDir = path.dirname(filePath);
+          if (downloadSubDir !== parentDir && fs.existsSync(downloadSubDir)) {
+            fs.rmdirSync(downloadSubDir);
+          }
+        } catch (_) {}
+
+        // Remove old backup after successful restore
+        try {
+          execSync(`rm -rf "${backupPath}"`);
+          console.log(`[ADMIN BOT] Removed old backup ${backupName}`);
+        } catch (_) {}
+
+        logger.logChange('ADMIN_REPLACEDB', adminUserId, 'Data folder replaced successfully');
+
+        await bot.sendMessage(chatId,
+          '✅ <b>Data folder replaced successfully!</b>\n\n' +
+          '⚠️ <b>Important:</b> You should restart the bot for changes to take effect.\n\n' +
+          'Use your deployment platform to restart the service.',
+          { parse_mode: 'HTML' }
+        );
+      } catch (extractError) {
+        // Restore backup on failure
+        console.error('[ADMIN BOT] Extract failed, restoring backup:', extractError.message);
+
+        // Remove failed extraction
+        if (fs.existsSync(dataDir)) {
+          execSync(`rm -rf "${dataDir}"`);
+        }
+
+        // Restore backup
+        if (fs.existsSync(backupPath)) {
+          fs.renameSync(backupPath, dataDir);
+          console.log('[ADMIN BOT] Restored backup after failed extraction');
+        }
+
+        // Clean up downloaded file and its parent directory
+        try {
+          fs.unlinkSync(filePath);
+          const downloadSubDir = path.dirname(filePath);
+          if (downloadSubDir !== parentDir && fs.existsSync(downloadSubDir)) {
+            fs.rmdirSync(downloadSubDir);
+          }
+        } catch (_) {}
+
+        throw extractError;
+      }
+    } catch (error) {
+      logger.logError('REPLACEDB', adminUserId, error, 'Error replacing data folder');
+      const safeErrorMessage = sanitizeErrorMessage(error, false);
+      await bot.sendMessage(chatId, `❌ <b>Replace failed:</b> ${safeErrorMessage}\n\nThe original data folder has been restored.`, { parse_mode: 'HTML' });
+    }
+  });
+
   // /extract command - Send database as zip file
-  bot.onText(/\/extract/, async (msg) => {
+  bot.onText(/\/extract$/, async (msg) => {
     if (msg.chat.type !== 'private') return;
     const chatId = msg.chat.id;
     const adminUserId = msg.from.id;
@@ -2813,7 +2981,8 @@ function registerAdminCommands(bot) {
     }
 
     try {
-      if (!adminCommandRateLimiter.checkRateLimit(adminUserId, 20, 60000)) {
+      const rateLimit = adminCommandRateLimiter.checkRateLimit(adminUserId, 20, 60000);
+      if (!rateLimit.allowed) {
         await bot.sendMessage(chatId, '⚠️ Rate limit exceeded. Please wait.');
         return;
       }

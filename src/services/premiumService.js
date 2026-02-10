@@ -93,7 +93,7 @@ class PremiumService {
    */
   async createSubscription(userId, paymentData = {}) {
     try {
-      const amount = paymentData.amount || 30.0;
+      const amount = paymentData.amount || 119.0;
       const currency = paymentData.currency || 'INR';
       const paymentMethod = paymentData.paymentMethod || 'manual';
       const paymentReference = paymentData.paymentReference || null;

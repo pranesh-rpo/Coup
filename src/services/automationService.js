@@ -123,6 +123,10 @@ class AutomationService {
     // CRITICAL: Users who have blocked the bot (for admin broadcasts)
     // userId -> { blocked: true, lastChecked }
     this.blockedUsers = new Map();
+
+    // Sending lock to prevent concurrent sends on the same account
+    // accountId -> boolean (true = currently sending)
+    this.sendingLocks = new Map();
   }
   
   /**
@@ -584,16 +588,16 @@ class AutomationService {
       const settings = await configService.getAccountSettings(accountId);
       const intervalMinutes = settings?.manualInterval;
     
-      // Default to 11 minutes if not set (matches UI default)
-      const defaultIntervalMinutes = 11;
-      const minIntervalMinutes = 11;
-      
+      // Default to 25 minutes if not set, minimum allowed is 13
+      const defaultIntervalMinutes = 25;
+      const minIntervalMinutes = 13;
+
       let finalIntervalMinutes;
       if (intervalMinutes === null || intervalMinutes === undefined) {
         finalIntervalMinutes = defaultIntervalMinutes;
         console.log(`[BROADCAST] Using default interval: ${defaultIntervalMinutes} minutes`);
       } else {
-        // Ensure minimum 11 minutes
+        // Ensure minimum 13 minutes
         finalIntervalMinutes = Math.max(minIntervalMinutes, intervalMinutes);
         if (intervalMinutes < minIntervalMinutes) {
           console.log(`[BROADCAST] Interval ${intervalMinutes} minutes is below minimum (${minIntervalMinutes} min), using ${minIntervalMinutes} minutes`);
@@ -606,8 +610,8 @@ class AutomationService {
       return intervalMs;
     } catch (error) {
       logError(`[BROADCAST] Error getting custom interval:`, error);
-      // Return default 11 minutes on error (matches UI default)
-      return 11 * 60 * 1000;
+      // Return default 25 minutes on error
+      return 25 * 60 * 1000;
     }
   }
 
@@ -1687,7 +1691,14 @@ class AutomationService {
       console.log(`[BROADCAST] Broadcast not running for account ${accountId} (user ${userId}), skipping send`);
       return;
     }
-    
+
+    // Prevent concurrent sends on the same account (race condition protection)
+    if (this.sendingLocks.get(accountId)) {
+      console.log(`[SEND_LOCK] Account ${accountId} is already sending, skipping this cycle to prevent duplicate API calls`);
+      return;
+    }
+    this.sendingLocks.set(accountId, true);
+
     // Log entities being passed to send function
     if (messageEntities && messageEntities.length > 0) {
       console.log(`[BROADCAST] Received ${messageEntities.length} entities to send (from parameter)`);
@@ -1718,6 +1729,7 @@ class AutomationService {
     
     if (!shouldBypassSchedule && !isWithinSchedule) {
       console.log(`[BROADCAST] Current time is outside schedule window for account ${accountId}, skipping send`);
+      this.sendingLocks.delete(accountId);
       return; // Skip this send, but keep broadcast running for next scheduled time
     } else if (shouldBypassSchedule) {
       console.log(`[BROADCAST] Bypassing schedule check (manually started broadcast or initial message) for account ${accountId}`);
@@ -1726,12 +1738,14 @@ class AutomationService {
     // Check quiet hours (always enforced, even for manually started broadcasts)
     if (isWithinQuietHours) {
       console.log(`[BROADCAST] Current time is within quiet hours for account ${accountId}, skipping send`);
+      this.sendingLocks.delete(accountId);
       return; // Skip this send, but keep broadcast running for next scheduled time
     }
 
     // Verify account still exists and is linked
     if (!accountLinker.isLinked(userId)) {
       console.log(`[BROADCAST] Account no longer linked for user ${userId}, stopping broadcast for account ${accountId}`);
+      this.sendingLocks.delete(accountId);
       await this.stopBroadcast(userId, accountId);
       return;
     }
@@ -1756,6 +1770,7 @@ class AutomationService {
     const currentBroadcast = this.activeBroadcasts.get(broadcastKey);
     if (!currentBroadcast || !currentBroadcast.isRunning) {
       console.log(`[BROADCAST] Broadcast not found or stopped for account ${accountId}, aborting send`);
+      this.sendingLocks.delete(accountId);
       return;
     }
 
@@ -3166,6 +3181,15 @@ class AutomationService {
             continue; // Skip this group
           }
           
+          // Check for slowmode errors - skip group, don't treat as account rate limit
+          const isSlowmodeError = errorMessage.includes('slowmode') || errorMessage.includes('slow mode') || errorMessage.includes('SLOWMODE_WAIT');
+          if (isSlowmodeError) {
+            console.log(`[SLOWMODE] Group "${errorGroupName}" has slowmode enabled, skipping (not a rate limit)`);
+            errorCount++;
+            failedGroups.push({ name: errorGroupName, reason: 'Slowmode enabled', id: errorGroupId });
+            continue;
+          }
+
           // Check if it's a flood wait error - RETRY instead of skipping
           if (isFloodWaitError(error)) {
             rateLimited = true;
@@ -3205,8 +3229,8 @@ class AutomationService {
                 delayMs = (extractedFromMsg + 2) * 1000;
                 console.log(`[FLOOD_WAIT] ⚠️ Extracted wait time from error message: ${extractedFromMsg}s. Waiting ${extractedFromMsg + 2}s before RETRYING...`);
               } else {
-                // Conservative fallback: 60 seconds if we truly can't extract wait time
-                delayMs = 60000;
+                // Conservative fallback: 5 minutes if we truly can't extract wait time
+                delayMs = 300000;
                 console.log(`[FLOOD_WAIT] ⚠️ Rate limit detected but couldn't extract wait time. Using conservative fallback: ${delayMs / 1000}s before RETRYING...`);
                 console.log(`[FLOOD_WAIT] Error details for debugging - message: "${error.message || 'N/A'}", errorMessage: "${error.errorMessage || 'N/A'}", code: "${error.code || 'N/A'}", response: ${JSON.stringify(error.response || {}).substring(0, 200)}`);
               }
@@ -3247,6 +3271,9 @@ class AutomationService {
                 this.recordMessageSent(accountId);
                 this.recordGroupMessageSent(accountId, errorGroupId);
                 loggingService.logBroadcast(accountId, `Retried and sent to group: ${errorGroupName} (after flood wait)`, 'success');
+                // Add delay after flood wait recovery before next group
+                const postRetryDelay = await this.getRandomDelay(accountId);
+                await new Promise(resolve => setTimeout(resolve, postRetryDelay));
                 continue; // Successfully retried, move to next group
               } else if (message && message.trim().length > 0) {
                 // OPTIMIZATION: Use cached settings instead of fetching from database
@@ -3332,10 +3359,13 @@ class AutomationService {
                 this.recordMessageSent(accountId);
                 this.recordGroupMessageSent(accountId, errorGroupId);
                 loggingService.logBroadcast(accountId, `Retried and sent to group: ${errorGroupName} (after flood wait)`, 'success');
-                
+
                 // Record analytics for success
                 analyticsService.recordGroupAnalytics(accountId, errorGroupId, errorGroupName, true).catch(() => {});
-                
+
+                // Add delay after flood wait recovery before next group
+                const postRetryDelay2 = await this.getRandomDelay(accountId);
+                await new Promise(resolve => setTimeout(resolve, postRetryDelay2));
                 continue; // Successfully retried, move to next group
               } else {
                 console.log(`[FLOOD_WAIT] No message available for retry`);
@@ -3391,8 +3421,8 @@ class AutomationService {
             
             // Retry recoverable errors once
             if ((isTimeout || isNetworkError || isConnectionError) && i < groupsToSend.length - 1) {
-              console.log(`[BROADCAST] ⚠️ Recoverable error (${isTimeout ? 'timeout' : isNetworkError ? 'network' : 'connection'}) for group "${errorGroupName}", retrying after 3s...`);
-              await new Promise((resolve) => setTimeout(resolve, 3000));
+              console.log(`[BROADCAST] ⚠️ Recoverable error (${isTimeout ? 'timeout' : isNetworkError ? 'network' : 'connection'}) for group "${errorGroupName}", retrying after 10s...`);
+              await new Promise((resolve) => setTimeout(resolve, 10000));
               
               try {
                 // Validate group entity
@@ -3572,6 +3602,9 @@ class AutomationService {
       logError(`[BROADCAST ERROR] Error in sendSingleMessageToAllGroups for user ${userId}:`, error);
       loggingService.logError(accountId, `Error in sendSingleMessageToAllGroups: ${error.message}`, userId);
     } finally {
+      // Release sending lock
+      this.sendingLocks.delete(accountId);
+
       // Disconnect client after sending messages (accounts only active while sending)
       if (client && client.connected) {
         try {

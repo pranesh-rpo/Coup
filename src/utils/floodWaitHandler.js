@@ -92,8 +92,7 @@ export function isFloodWaitError(error) {
     errorMessage.includes('too many requests') ||
     errorMessage.includes('wait of') ||
     errorMessage.includes('retry after') ||
-    errorMessage.includes('slowmode') ||
-    errorMessage.includes('slow mode') ||
+    // Note: slowmode is excluded - it's a per-group chat restriction, not an account rate limit
     // Error descriptions
     errorDescription.includes('flood') ||
     errorDescription.includes('rate limit') ||

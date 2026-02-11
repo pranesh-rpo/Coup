@@ -1411,7 +1411,7 @@ class AccountLinker {
 
         return {
           success: false,
-          error: 'Too many failed password attempts on this number. Telegram has temporarily blocked login. Please wait about 1 hour before trying again.'
+          error: '⚠️ Telegram has temporarily blocked this phone number due to security measures.\n\n⏰ Please wait ~1 hour before trying again.\n\n💡 Note: A previous login attempt may have failed due to a bug that has now been fixed. When you try again after the cooldown, your login should work correctly.'
         };
       }
 
@@ -1946,12 +1946,15 @@ class AccountLinker {
       });
 
       // signInWithPassword returns User object directly (not wrapped in Authorization like signIn)
-      if (result && result.id) {
-        console.log(`[2FA] Password verified successfully for user ${userId}`);
+      // CRITICAL: Check multiple possible result formats
+      const userResult = result?.user || result; // Handle both wrapped and unwrapped formats
+      
+      if (userResult && (userResult.id || result)) {
+        console.log(`[2FA] Password verified successfully for user ${userId}`, { hasUser: !!userResult, hasId: !!userResult?.id, resultType: typeof result });
         
         // CRITICAL: Validate result exists and has required properties
-        if (!result || typeof result !== 'object' || !result.id) {
-          logError(`[2FA ERROR] Invalid result object for user ${userId}:`, result);
+        if (!userResult || typeof userResult !== 'object') {
+          logError(`[2FA ERROR] Invalid result object for user ${userId}:`, { result, userResult });
           this.pendingPasswordAuth.delete(userId);
           return { success: false, error: 'Invalid response from Telegram. Please try again.' };
         }
@@ -2001,15 +2004,15 @@ class AccountLinker {
         
         console.log(`[2FA] Session string saved successfully (length: ${sessionString.length})`);
         const userIdStr = userId.toString();
-        const firstName = (result.firstName) ? result.firstName : null;
+        const firstName = (userResult.firstName) ? userResult.firstName : null;
         
         // Get phone number - always use pending phone (has + prefix) if available
-        // result.phone might not have + prefix, so we prefer pending phone
+        // userResult.phone might not have + prefix, so we prefer pending phone
         let actualPhone = phone; // Use pending phone which we know has + prefix
         if (!actualPhone || !actualPhone.startsWith('+')) {
-          // If pending phone is not available or invalid, use result.phone and ensure + prefix
-          if (result.phone) {
-            actualPhone = result.phone.startsWith('+') ? result.phone : `+${result.phone}`;
+          // If pending phone is not available or invalid, use userResult.phone and ensure + prefix
+          if (userResult.phone) {
+            actualPhone = userResult.phone.startsWith('+') ? userResult.phone : `+${userResult.phone}`;
           } else {
             throw new Error('Phone number not available from authentication result');
           }
@@ -2040,7 +2043,17 @@ class AccountLinker {
 
         return { success: true, accountId: saveResult.accountId, isActive: saveResult.isActive };
       } else {
-        return { success: false, error: 'Unexpected response from Telegram' };
+        // Log detailed error information for debugging
+        logError(`[2FA ERROR] Unexpected response format for user ${userId}:`, { 
+          result, 
+          hasResult: !!result, 
+          resultType: typeof result,
+          hasUser: !!(result?.user),
+          hasId: !!(result?.id),
+          userHasId: !!(result?.user?.id),
+          resultKeys: result ? Object.keys(result) : []
+        });
+        return { success: false, error: 'Unexpected response from Telegram. Please try linking again.' };
       }
     } catch (error) {
       // Handle AUTH_USER_CANCEL gracefully (user cancelled, not an error)
@@ -2145,6 +2158,18 @@ class AccountLinker {
 
   isPasswordRequired(userId) {
     return this.pendingPasswordAuth.has(userId);
+  }
+
+  /**
+   * Clear password attempts and cooldowns for a user
+   * This allows them to retry login immediately (useful when Telegram block expires)
+   * @param {number} userId - User ID
+   */
+  clearPasswordCooldown(userId) {
+    this.passwordAttempts.delete(userId);
+    this.rateLimitCooldowns.delete(userId);
+    console.log(`[2FA] Cleared password cooldown for user ${userId}`);
+    return { success: true, message: 'Password cooldown cleared. You can try again now.' };
   }
 
   /**

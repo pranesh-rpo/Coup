@@ -14,7 +14,7 @@ module.exports = {
     autorestart: true,              // Always restart if crashes
     max_restarts: 1000000,          // Very high number (effectively unlimited)
     min_uptime: '10s',              // Consider it stable after 10 seconds
-    restart_delay: 4000,            // Wait 4 seconds before restart
+    restart_delay: 8000,            // Wait 8 seconds before restart (increased to prevent rapid restart loops)
     exp_backoff_restart_delay: 100, // Exponential backoff minimum delay
     
     // Environment variables

@@ -462,32 +462,35 @@ function checkProcessLock() {
     await autoReplyRealtimeService.start();
     console.log('✅ Real-time auto-reply service started (2-10s delay)');
     
+    // Store interval IDs for cleanup on shutdown
+    const cleanupIntervals = [];
+    
     // Start periodic cleanup for stopped broadcasts (every hour)
-    setInterval(() => {
+    cleanupIntervals.push(setInterval(() => {
       automationService.cleanupStoppedBroadcasts();
-    }, 60 * 60 * 1000); // 1 hour
+    }, 60 * 60 * 1000)); // 1 hour
     console.log('✅ Broadcast cleanup scheduler started');
     
     // Start periodic cleanup for anti-freeze tracking (every 6 hours)
-    setInterval(() => {
+    cleanupIntervals.push(setInterval(() => {
       automationService.cleanupAntiFreezeTracking();
-    }, 6 * 60 * 60 * 1000); // 6 hours
+    }, 6 * 60 * 60 * 1000)); // 6 hours
     console.log('✅ Anti-freeze tracking cleanup scheduler started');
     
     // Start periodic cleanup for blocked users (every 12 hours)
-    setInterval(() => {
+    cleanupIntervals.push(setInterval(() => {
       automationService.cleanupBlockedUsers();
-    }, 12 * 60 * 60 * 1000); // 12 hours
+    }, 12 * 60 * 60 * 1000)); // 12 hours
     console.log('✅ Blocked users cleanup scheduler started');
     
     // Start periodic cleanup for pending verifications (every 30 minutes)
-    setInterval(() => {
+    cleanupIntervals.push(setInterval(() => {
       accountLinker.cleanupPendingVerifications();
-    }, 30 * 60 * 1000); // 30 minutes
+    }, 30 * 60 * 1000)); // 30 minutes
     console.log('✅ Pending verifications cleanup scheduler started');
     
     // Start memory monitoring (every hour)
-    setInterval(() => {
+    cleanupIntervals.push(setInterval(() => {
       const memUsage = process.memoryUsage();
       const memUsageMB = {
         rss: Math.round(memUsage.rss / 1024 / 1024),
@@ -506,8 +509,11 @@ function checkProcessLock() {
           global.gc();
         }
       }
-    }, 60 * 60 * 1000); // 1 hour
+    }, 60 * 60 * 1000)); // 1 hour
     console.log('✅ Memory monitoring started');
+    
+    // Export cleanup intervals for graceful shutdown
+    global.botCleanupIntervals = cleanupIntervals;
     
     // Notify admins of successful startup
     await adminNotifier.notifyEvent('BOT_STARTED', 'Bot started successfully', {
@@ -2561,6 +2567,19 @@ async function gracefulShutdown(signal) {
       }
     } catch (error) {
       console.error('[SHUTDOWN] Error stopping admin bot polling:', error.message);
+    }
+    
+    // Clear all cleanup intervals first
+    console.log('[SHUTDOWN] Clearing cleanup intervals...');
+    try {
+      if (global.botCleanupIntervals && Array.isArray(global.botCleanupIntervals)) {
+        global.botCleanupIntervals.forEach(intervalId => {
+          clearInterval(intervalId);
+        });
+        console.log(`[SHUTDOWN] Cleared ${global.botCleanupIntervals.length} cleanup intervals`);
+      }
+    } catch (error) {
+      console.error('[SHUTDOWN] Error clearing intervals:', error.message);
     }
     
     // Stop automation services gracefully

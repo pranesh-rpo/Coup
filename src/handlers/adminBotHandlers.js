@@ -226,17 +226,12 @@ function registerAdminCommands(bot) {
       `/payment_verify &lt;id&gt; - Verify payment\n` +
       `/payment_reject &lt;id&gt; [reason] - Reject payment\n\n` +
       `<b>👁️ Monitoring:</b>\n` +
-      `/logs - View recent logs\n` +
-      `/logs_error - View error logs only\n` +
-      `/logs_success - View success logs only\n` +
-      `/errors - View recent errors\n` +
       `/user &lt;id&gt; - Get user details\n` +
       `/account &lt;id&gt; - Get account details\n\n` +
       `<b>🤖 Auto-Reply:</b>\n` +
       `/autoreply - Show auto-reply status\n` +
       `/autoreply_refresh - Restart auto-reply service\n` +
       `/autoreply_stats - Auto-reply statistics\n` +
-      `/autoreply_logs - View auto-reply logs\n` +
       `/test_autoreply &lt;account_id&gt; - Test auto-reply\n\n` +
       `<b>🔧 Operations:</b>\n` +
       `/account_reconnect &lt;account_id&gt; - Reconnect account\n` +
@@ -405,67 +400,6 @@ function registerAdminCommands(bot) {
     }
   });
 
-  // /logs command
-  bot.onText(/\/logs$/, async (msg) => {
-    if (msg.chat.type !== 'private') return;
-    if (!isAdmin(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
-    }
-
-    try {
-      const logs = await db.query(
-        'SELECT * FROM logs ORDER BY timestamp DESC LIMIT 10'
-      );
-
-      let message = `📋 <b>Recent Logs</b> (Last 10)\n\n`;
-      logs.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        const status = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : 'ℹ️';
-        message += `${status} <b>${time}</b>\n`;
-        message += `${log.message.substring(0, 80)}${log.message.length > 80 ? '...' : ''}\n\n`;
-      });
-
-      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
-    } catch (error) {
-      // SECURITY: Sanitize error message to prevent information leakage
-      const safeErrorMessage = sanitizeErrorMessage(error, false);
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
-    }
-  });
-
-  // /errors command
-  bot.onText(/\/errors/, async (msg) => {
-    if (msg.chat.type !== 'private') return;
-    if (!isAdmin(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
-    }
-
-    try {
-      const errors = await db.query(
-        "SELECT * FROM logs WHERE status = 'error' ORDER BY timestamp DESC LIMIT 10"
-      );
-
-      if (errors.rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, '✅ No recent errors');
-        return;
-      }
-
-      let message = `❌ <b>Recent Errors</b> (Last 10)\n\n`;
-      errors.rows.forEach((error, i) => {
-        const time = new Date(error.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        message += `${i + 1}. <b>${time}</b>\n`;
-        message += `<code>${error.message.substring(0, 100)}${error.message.length > 100 ? '...' : ''}</code>\n\n`;
-      });
-
-      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
-    } catch (error) {
-      // SECURITY: Sanitize error message to prevent information leakage
-      const safeErrorMessage = sanitizeErrorMessage(error, false);
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
-    }
-  });
 
   // /user <id> command
   bot.onText(/\/user (.+)/, async (msg, match) => {
@@ -807,73 +741,6 @@ function registerAdminCommands(bot) {
     }
   });
 
-  // /logs_error command
-  bot.onText(/\/logs_error/, async (msg) => {
-    if (msg.chat.type !== 'private') return;
-    if (!isAdmin(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
-    }
-
-    try {
-      const errors = await db.query(
-        "SELECT * FROM logs WHERE status = 'error' ORDER BY timestamp DESC LIMIT 20"
-      );
-
-      if (errors.rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, '✅ No error logs found');
-        return;
-      }
-
-      let message = `❌ <b>Error Logs</b> (Last 20)\n\n`;
-      errors.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        message += `${i + 1}. <b>${time}</b>\n`;
-        message += `Account: ${log.account_id || 'N/A'}\n`;
-        message += `<code>${log.message.substring(0, 100)}${log.message.length > 100 ? '...' : ''}</code>\n\n`;
-      });
-
-      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
-    } catch (error) {
-      // SECURITY: Sanitize error message to prevent information leakage
-      const safeErrorMessage = sanitizeErrorMessage(error, false);
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
-    }
-  });
-
-  // /logs_success command
-  bot.onText(/\/logs_success/, async (msg) => {
-    if (msg.chat.type !== 'private') return;
-    if (!isAdmin(msg.from.id)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
-    }
-
-    try {
-      const logs = await db.query(
-        "SELECT * FROM logs WHERE status = 'success' ORDER BY timestamp DESC LIMIT 20"
-      );
-
-      if (logs.rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, '✅ No success logs found');
-        return;
-      }
-
-      let message = `✅ <b>Success Logs</b> (Last 20)\n\n`;
-      logs.rows.forEach((log, i) => {
-        const time = new Date(log.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        message += `${i + 1}. <b>${time}</b>\n`;
-        message += `Account: ${log.account_id || 'N/A'}\n`;
-        message += `${log.message.substring(0, 80)}${log.message.length > 80 ? '...' : ''}\n\n`;
-      });
-
-      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
-    } catch (error) {
-      // SECURITY: Sanitize error message to prevent information leakage
-      const safeErrorMessage = sanitizeErrorMessage(error, false);
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
-    }
-  });
 
   // /notify command
   bot.onText(/\/notify (.+)/, async (msg, match) => {
@@ -1225,17 +1092,12 @@ function registerAdminCommands(bot) {
         `/payment_verify &lt;id&gt; - Verify payment submission\n` +
         `/payment_reject &lt;id&gt; [reason] - Reject payment submission\n\n` +
         `<b>👁️ Monitoring:</b>\n` +
-        `/logs - View recent logs (last 10)\n` +
-        `/logs_error - View error logs only\n` +
-        `/logs_success - View success logs only\n` +
-        `/errors - View recent errors (last 10)\n` +
         `/user &lt;id&gt; - Get user details\n` +
         `/account &lt;id&gt; - Get account details\n\n` +
         `<b>🤖 Auto-Reply:</b>\n` +
         `/autoreply - Show auto-reply status for all accounts\n` +
         `/autoreply_refresh - Restart auto-reply service\n` +
         `/autoreply_stats - Detailed auto-reply statistics\n` +
-        `/autoreply_logs - View recent auto-reply activity\n` +
         `/test_autoreply &lt;account_id&gt; - Test auto-reply for account\n\n` +
         `<b>🔧 Account Operations:</b>\n` +
         `/account_reconnect &lt;account_id&gt; - Force reconnect stuck account\n` +
@@ -1470,52 +1332,6 @@ function registerAdminCommands(bot) {
       await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
     }
   });
-
-  bot.onText(/\/autoreply_logs/, async (msg) => {
-    const adminUserId = validateUserId(msg.from?.id);
-    if (!adminUserId || !isAdmin(adminUserId)) {
-      await bot.sendMessage(msg.chat.id, '❌ Unauthorized');
-      return;
-    }
-
-    try {
-      // Get recent auto-reply logs from database
-      const logs = await db.query(
-        `SELECT * FROM logs 
-         WHERE message LIKE '%AUTO_REPLY%' OR message LIKE '%auto_reply%' OR message LIKE '%Auto-Reply%'
-         ORDER BY timestamp DESC 
-         LIMIT 20`
-      );
-
-      if (logs.rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, '📭 No auto-reply logs found', { parse_mode: 'HTML' });
-        return;
-      }
-
-      let message = `📋 <b>Recent Auto-Reply Logs</b> (Last ${logs.rows.length})\n\n`;
-
-      for (const log of logs.rows) {
-        const date = new Date(log.timestamp || log.created_at || Date.now());
-        const time = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        const status = log.status === 'success' ? '✅' : log.status === 'error' ? '❌' : 'ℹ️';
-        
-        message += `${status} <b>${time}</b>\n`;
-        const logMessage = log.message || log.action || 'No message';
-        message += `   ${logMessage.substring(0, 60)}${logMessage.length > 60 ? '...' : ''}\n`;
-        message += `\n`;
-      }
-
-      message += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-      message += `💡 Use /logs for all bot logs`;
-
-      await bot.sendMessage(msg.chat.id, message, { parse_mode: 'HTML' });
-    } catch (error) {
-      console.error('[ADMIN BOT] Error in /autoreply_logs:', error);
-      const safeErrorMessage = sanitizeErrorMessage(error, false);
-      await bot.sendMessage(msg.chat.id, `❌ Error: ${safeErrorMessage}`);
-    }
-  });
-
   // Account operations commands
   bot.onText(/\/account_reconnect (.+)/, async (msg, match) => {
     const adminUserId = validateUserId(msg.from?.id);
@@ -2748,8 +2564,8 @@ function registerAdminCommands(bot) {
       }
 
       try {
-        // Extract the tar file
-        execSync(`cd "${parentDir}" && tar --no-absolute-names -xzf "${filePath}"`);
+        // Extract the tar file (without --no-absolute-names which is not supported in busybox tar)
+        execSync(`cd "${parentDir}" && tar -xzf "${filePath}"`);
 
         // Verify the data folder exists after extraction
         if (!fs.existsSync(dataDir)) {

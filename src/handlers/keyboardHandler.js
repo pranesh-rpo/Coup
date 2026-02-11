@@ -172,9 +172,8 @@ export function createGroupsMenu(groupDelayMin = null, groupDelayMax = null, bla
   return {
     reply_markup: {
       inline_keyboard: [
-        // Actions Row
+        // Actions Row - Refresh button removed (groups auto-refresh on broadcast start)
         [
-          { text: '🔄 Refresh', callback_data: 'btn_refresh_groups' },
           { text: '📋 View All', callback_data: 'btn_list_groups' }
         ],
         // Auto Join

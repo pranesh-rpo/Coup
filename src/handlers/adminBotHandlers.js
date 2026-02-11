@@ -22,72 +22,6 @@ let adminBot = null;
 let mainBot = null; // Reference to main bot for sending messages to users
 let lastAdminBroadcast = null; // Store last broadcast message
 const pendingReplaceDb = new Map(); // Track admins awaiting tar file for /replacedb
-let pollingRetryCount = 0;
-let pollingRetryTimeout = null;
-const MAX_POLLING_RETRIES = 10;
-const BASE_RETRY_DELAY = 10000; // 10 seconds base delay
-
-/**
- * Restart admin bot polling with retry logic and exponential backoff
- */
-async function restartPolling() {
-  if (!adminBot) return;
-  
-  pollingRetryCount++;
-  if (pollingRetryCount > MAX_POLLING_RETRIES) {
-    console.error('[ADMIN BOT] Max polling retries reached. Stopping retry attempts.');
-    pollingRetryTimeout = null;
-    return;
-  }
-  
-  // Exponential backoff: 10s, 20s, 40s, 80s, 160s
-  const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount - 1);
-  
-  console.log(`[ADMIN BOT] Restarting polling (attempt ${pollingRetryCount}/${MAX_POLLING_RETRIES}) in ${retryDelay / 1000}s...`);
-  
-  try {
-    adminBot.stopPolling();
-    
-    // Wait a moment before restarting
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Delete webhook before restarting polling
-    try {
-      await safeBotApiCall(
-        () => adminBot.deleteWebHook({ drop_pending_updates: false }),
-        { maxRetries: 2, bufferSeconds: 1, throwOnFailure: false }
-      );
-    } catch (webhookError) {
-      // Ignore webhook deletion errors
-    }
-    
-    // Wait a bit more before starting polling
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    try {
-      await adminBot.startPolling({ restart: true });
-      pollingRetryCount = 0; // Reset on success
-      pollingRetryTimeout = null;
-      console.log('[ADMIN BOT] Polling restarted successfully');
-    } catch (restartError) {
-      const errorMessage = restartError.message || '';
-      
-      // Check for 409 Conflict error - retry with longer delay (old instance will eventually die)
-      if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
-        console.warn(`[ADMIN BOT] ⚠️ 409 Conflict when restarting polling (attempt ${pollingRetryCount}/${MAX_POLLING_RETRIES}) - old instance may still be running, retrying...`);
-        const conflictRetryDelay = 15000; // 15 seconds between conflict retries
-        pollingRetryTimeout = setTimeout(restartPolling, conflictRetryDelay);
-        return;
-      }
-      
-      console.error('[ADMIN BOT] Failed to restart polling:', restartError);
-      pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
-    }
-  } catch (error) {
-    console.error('[ADMIN BOT] Error stopping polling:', error);
-    pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
-  }
-}
 
 /**
  * Initialize admin bot
@@ -127,136 +61,77 @@ export function initializeAdminBot(mainBotInstance = null) {
     console.log('[ADMIN BOT] Admin bot instance created');
     console.log(`[ADMIN BOT] Main bot instance ${mainBot ? 'is set' : 'is NOT set'}`);
 
-    // Enhanced error handlers with retry logic
+    // Simplified error handler - let node-telegram-bot-api handle retries
     adminBot.on('polling_error', (error) => {
       const errorMessage = error.message || '';
       const errorCode = error.code || '';
       const errorName = error.name || '';
-      const errorCause = error.cause || error.error || null;
-      const errorStack = error.stack || '';
       
       // Check for 409 Conflict error (multiple getUpdates requests)
       const isConflictError = 
         errorCode === 409 ||
         errorMessage.includes('409') ||
         errorMessage.includes('Conflict') ||
-        errorMessage.includes('terminated by other getUpdates') ||
-        errorMessage.includes('only one bot instance is running');
+        errorMessage.includes('terminated by other getUpdates');
       
-      // Check for timeout errors in various forms (direct, wrapped, or in stack)
-      // Include both ETIMEDOUT and ESOCKETTIMEDOUT
+      // Check for timeout errors - these are expected network issues
       const isTimeoutError = 
         errorCode === 'ETIMEDOUT' || 
         errorCode === 'ESOCKETTIMEDOUT' ||
-        errorName === 'RequestError' && (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('ESOCKETTIMEDOUT')) ||
+        errorName === 'RequestError' ||
         errorMessage.includes('ETIMEDOUT') || 
         errorMessage.includes('ESOCKETTIMEDOUT') ||
-        errorMessage.includes('TIMEOUT') ||
-        (errorCause && (errorCause.code === 'ETIMEDOUT' || errorCause.code === 'ESOCKETTIMEDOUT' || errorCause.message?.includes('ETIMEDOUT') || errorCause.message?.includes('ESOCKETTIMEDOUT'))) ||
-        errorStack.includes('ETIMEDOUT') ||
-        errorStack.includes('ESOCKETTIMEDOUT');
+        errorMessage.includes('TIMEOUT');
       
-      // Only log full error details if it's not a timeout (timeouts are logged separately below)
-      if (!isTimeoutError) {
-        console.error('[ADMIN BOT] Polling error:', error);
-      }
-      
-      // Handle 409 Conflict error - another instance is polling (common during redeployments)
+      // Handle 409 Conflict - log but don't retry (library will handle it)
       if (isConflictError) {
-        console.warn('[ADMIN BOT] ⚠️ 409 Conflict: Another bot instance is polling. Will retry after old instance dies.');
-
-        // Stop current polling to avoid rapid conflict loops
-        try {
-          adminBot.stopPolling();
-          console.log('[ADMIN BOT] Polling stopped due to conflict');
-        } catch (stopError) {
-          console.error('[ADMIN BOT] Error stopping polling:', stopError);
-        }
-
-        // Retry after delay - old instance will eventually stop during redeployment
-        if (pollingRetryCount < MAX_POLLING_RETRIES && !pollingRetryTimeout) {
-          const conflictRetryDelay = 15000; // 15 seconds - give old instance time to die
-          console.log(`[ADMIN BOT] Will retry polling in ${conflictRetryDelay / 1000}s (attempt ${pollingRetryCount + 1}/${MAX_POLLING_RETRIES})`);
-          pollingRetryTimeout = setTimeout(restartPolling, conflictRetryDelay);
-        } else if (pollingRetryCount >= MAX_POLLING_RETRIES) {
-          console.error('[ADMIN BOT] ❌ 409 Conflict persists after max retries. Manual restart may be needed.');
-          logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - all retries exhausted');
-        }
+        console.warn('[ADMIN BOT] ⚠️ 409 Conflict: Another instance is polling. Old instance will die automatically.');
         return;
       }
       
-      // Don't retry on certain errors (like unauthorized)
+      // Don't retry on auth errors
       if (errorMessage.includes('401') || errorMessage.includes('Unauthorized')) {
-        console.error('[ADMIN BOT] Unauthorized error - check ADMIN_BOT_TOKEN');
-        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error - Unauthorized');
+        console.error('[ADMIN BOT] ❌ Unauthorized error - check ADMIN_BOT_TOKEN');
+        logger.logError('ADMIN_BOT', null, error, 'Admin bot unauthorized');
         return;
       }
       
-      // Handle timeout errors gracefully - these are often transient network issues
+      // Handle timeout errors - log as warning only
       if (isTimeoutError) {
-        // Timeout errors are expected and handled automatically - log as warning, not error
-        console.warn(`[ADMIN BOT] Polling timeout detected (attempt ${pollingRetryCount + 1}/${MAX_POLLING_RETRIES}) - will retry automatically`);
-        // Don't log timeout errors to error log - they're expected network issues
-        // logger.logError('ADMIN_BOT', null, error, 'Admin bot polling timeout - will retry');
-      } else {
-        // Only log non-timeout errors with full details
-        console.error('[ADMIN BOT] Polling error:', error);
-        logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error');
+        console.warn('[ADMIN BOT] ⚠️ Polling timeout - library will retry automatically');
+        return;
       }
       
-      // Retry polling on other errors (including timeouts)
-      if (pollingRetryCount < MAX_POLLING_RETRIES) {
-        if (!pollingRetryTimeout) {
-          const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount);
-          pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
-        }
-      }
+      // Log other errors
+      console.error('[ADMIN BOT] Polling error:', error);
+      logger.logError('ADMIN_BOT', null, error, 'Admin bot polling error');
     });
 
     adminBot.on('error', (error) => {
       const errorMessage = error.message || '';
       const errorCode = error.code || '';
       const errorName = error.name || '';
-      const errorCause = error.cause || error.error || null;
-      const errorStack = error.stack || '';
       
-      // Check for timeout errors in various forms (direct, wrapped, or in stack)
-      // Include both ETIMEDOUT and ESOCKETTIMEDOUT
+      // Check for timeout/connection errors - expected network issues
       const isTimeoutError = 
         errorCode === 'ETIMEDOUT' || 
         errorCode === 'ESOCKETTIMEDOUT' ||
-        errorName === 'RequestError' && (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('ESOCKETTIMEDOUT')) ||
+        errorCode === 'ECONNREFUSED' ||
+        errorName === 'RequestError' ||
         errorMessage.includes('ETIMEDOUT') || 
         errorMessage.includes('ESOCKETTIMEDOUT') ||
-        errorMessage.includes('TIMEOUT') ||
-        (errorCause && (errorCause.code === 'ETIMEDOUT' || errorCause.code === 'ESOCKETTIMEDOUT' || errorCause.message?.includes('ETIMEDOUT') || errorCause.message?.includes('ESOCKETTIMEDOUT'))) ||
-        errorStack.includes('ETIMEDOUT') ||
-        errorStack.includes('ESOCKETTIMEDOUT');
-      
-      const isConnectionError = 
-        errorCode === 'ECONNREFUSED' || 
         errorMessage.includes('ECONNREFUSED') ||
-        (errorCause && errorCause.code === 'ECONNREFUSED');
+        errorMessage.includes('TIMEOUT');
       
-      // Handle timeout errors - these are often transient network issues
+      // Handle timeout/connection errors - log as warning only
       if (isTimeoutError) {
-        // Timeout errors are expected - log as warning, not error
-        console.warn('[ADMIN BOT] Request timeout detected - this is usually a transient network issue');
-        // Don't log timeout errors to error log - they're expected network issues
-        // logger.logError('ADMIN_BOT', null, error, 'Admin bot request timeout - will retry');
-      } else {
-        // Only log non-timeout errors with full details
-        console.error('[ADMIN BOT] Error:', error);
-        logger.logError('ADMIN_BOT', null, error, 'Admin bot error');
+        console.warn('[ADMIN BOT] ⚠️ Network/timeout error - library will retry automatically');
+        return;
       }
       
-      // Retry on connection errors (including timeouts)
-      if (isConnectionError || isTimeoutError) {
-        if (pollingRetryCount < MAX_POLLING_RETRIES && !pollingRetryTimeout) {
-          const retryDelay = BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount);
-          pollingRetryTimeout = setTimeout(restartPolling, retryDelay);
-        }
-      }
+      // Log other errors
+      console.error('[ADMIN BOT] Error:', error);
+      logger.logError('ADMIN_BOT', null, error, 'Admin bot error');
     });
 
     // Register admin commands
@@ -275,41 +150,24 @@ export function initializeAdminBot(mainBotInstance = null) {
         // Wait a moment before starting polling
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // Start polling with retry logic for 409 conflicts (common in Coolify redeployments)
-        const MAX_CONFLICT_RETRIES = 5;
-        const CONFLICT_RETRY_DELAY = 5000; // 5 seconds between retries
-
-        for (let attempt = 1; attempt <= MAX_CONFLICT_RETRIES; attempt++) {
-          try {
+        // Start polling - library will handle retries
+        try {
+          await adminBot.startPolling();
+          console.log('[ADMIN BOT] ✅ Polling started');
+        } catch (error) {
+          const errorMessage = error.message || '';
+          
+          if (errorMessage.includes('409') || errorMessage.includes('Conflict')) {
+            console.warn('[ADMIN BOT] ⚠️ 409 Conflict: Old instance still polling. Library will retry automatically.');
+          } else if (isFloodWaitError(error)) {
+            const waitSeconds = extractWaitTime(error);
+            console.warn(`[ADMIN BOT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s...`);
+            await waitForFloodError(error, 1);
             await adminBot.startPolling();
-            console.log('[ADMIN BOT] ✅ Polling started');
-            pollingRetryCount = 0;
-            break;
-          } catch (error) {
-            const errorMessage = error.message || '';
-
-            if (errorMessage.includes('409') || errorMessage.includes('Conflict') || errorMessage.includes('terminated by other getUpdates')) {
-              if (attempt < MAX_CONFLICT_RETRIES) {
-                console.warn(`[ADMIN BOT] ⚠️ 409 Conflict (attempt ${attempt}/${MAX_CONFLICT_RETRIES}): Old instance still polling. Retrying in ${CONFLICT_RETRY_DELAY / 1000}s...`);
-                await new Promise(resolve => setTimeout(resolve, CONFLICT_RETRY_DELAY));
-                try { await adminBot.deleteWebHook({ drop_pending_updates: false }); } catch (_) {}
-              } else {
-                console.error('[ADMIN BOT] ❌ 409 Conflict persists after all retries. Old instance may still be running.');
-                logger.logError('ADMIN_BOT', null, error, 'Admin bot polling conflict - all retries exhausted');
-              }
-            } else if (isFloodWaitError(error)) {
-              const waitSeconds = extractWaitTime(error);
-              console.warn(`[ADMIN BOT] ⚠️ Rate limited while starting polling. Waiting ${waitSeconds + 1}s...`);
-              await waitForFloodError(error, 1);
-              await adminBot.startPolling();
-              console.log('[ADMIN BOT] ✅ Polling started (after flood wait retry)');
-              pollingRetryCount = 0;
-              break;
-            } else {
-              console.error('[ADMIN BOT] Failed to start polling:', error);
-              logger.logError('ADMIN_BOT', null, error, 'Admin bot polling start failed');
-              break;
-            }
+            console.log('[ADMIN BOT] ✅ Polling started after flood wait');
+          } else {
+            console.error('[ADMIN BOT] Failed to start polling:', error);
+            logger.logError('ADMIN_BOT', null, error, 'Admin bot polling start failed');
           }
         }
       } catch (error) {

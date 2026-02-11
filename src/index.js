@@ -2058,7 +2058,11 @@ bot.on('callback_query', async (callbackQuery) => {
     } else if (data === 'btn_groups') {
       await handleGroupsButton(bot, callbackQuery);
     } else if (data === 'btn_refresh_groups') {
-      await handleRefreshGroups(bot, callbackQuery);
+      // Manual refresh removed - groups now auto-refresh when broadcast starts
+      await safeAnswerCallback(bot, callbackQuery.id, {
+        text: 'Groups are automatically refreshed when you start a broadcast! 🔄',
+        show_alert: true,
+      });
     } else if (data === 'btn_list_groups') {
       await handleListGroups(bot, callbackQuery);
     } else if (data === 'btn_auto_join_groups') {

@@ -1818,15 +1818,75 @@ class AutomationService {
       // If forward mode is disabled, we'll still use the last message but send it normally
       const forwardMessageIdToUse = useForwardMode ? lastSavedMessageId : null;
 
-      // Get all dialogs (chats) with error handling
+      // AUTOMATIC GROUP REFRESH: Get dialogs ONCE and sync to database
+      // OPTIMIZATION: Avoid calling getDialogs() twice (once in refreshGroups, once here)
+      // We get dialogs once and use them for both refresh and broadcast
       let dialogs = [];
       try {
+        console.log(`[BROADCAST] Auto-refreshing groups for account ${accountId}...`);
         dialogs = await client.getDialogs();
         if (!Array.isArray(dialogs)) {
           console.log(`[BROADCAST] getDialogs returned non-array, defaulting to empty array`);
           dialogs = [];
         }
         console.log(`[BROADCAST] Retrieved ${dialogs.length} total dialogs for account ${accountId}`);
+        
+        // Sync groups to database (inline to avoid duplicate getDialogs call)
+        try {
+          const updatesChannels = config.getUpdatesChannels();
+          const excludedUsernames = new Set();
+          for (const channelConfig of updatesChannels) {
+            const username = channelConfig.replace('@', '').toLowerCase();
+            excludedUsernames.add(username);
+          }
+          
+          const groups = dialogs.filter(dialog => {
+            if (dialog.isGroup || dialog.isChannel) {
+              const dialogUsername = (dialog.entity?.username || '').toLowerCase();
+              return !excludedUsernames.has(dialogUsername);
+            }
+            return false;
+          });
+          
+          const existingResult = await db.query('SELECT group_id FROM groups WHERE account_id = $1', [accountId]);
+          const existingGroupIds = new Set(existingResult.rows.map(r => String(r.group_id)));
+          
+          // OPTIMIZATION: Batch database operations instead of N individual queries
+          const toUpdate = [];
+          const toInsert = [];
+          
+          for (const group of groups) {
+            const groupId = group.entity.id.toString();
+            const groupTitle = (group.name || 'Unknown').substring(0, 255);
+            
+            if (existingGroupIds.has(groupId)) {
+              toUpdate.push({ groupId, groupTitle });
+            } else {
+              toInsert.push({ groupId, groupTitle });
+            }
+          }
+          
+          // Batch update existing groups
+          if (toUpdate.length > 0) {
+            await Promise.all(toUpdate.map(({ groupId, groupTitle }) =>
+              db.query('UPDATE groups SET group_title = $1, is_active = TRUE WHERE account_id = $2 AND group_id = $3', [groupTitle, accountId, groupId])
+            ));
+          }
+          
+          // Batch insert new groups
+          if (toInsert.length > 0) {
+            await Promise.all(toInsert.map(({ groupId, groupTitle }) =>
+              db.query('INSERT INTO groups (account_id, group_id, group_title, is_active, last_message_sent) VALUES ($1, $2, $3, TRUE, NULL)', [accountId, groupId, groupTitle])
+            ));
+          }
+          
+          const added = toInsert.length;
+          const updated = toUpdate.length;
+          
+          console.log(`[BROADCAST] ✅ Auto-refreshed groups: ${added} added, ${updated} updated, total: ${groups.length}`);
+        } catch (refreshError) {
+          console.log(`[BROADCAST] ⚠️ Auto-refresh groups error (non-critical): ${refreshError.message}`);
+        }
       } catch (dialogsError) {
         // Check if user deleted their Telegram account
         if (accountLinker.isUserDeletedError(dialogsError)) {

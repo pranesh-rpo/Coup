@@ -194,6 +194,10 @@ class AccountLinker {
           } catch (e) {}
         }
         this.pendingPasswordAuth.delete(userId);
+        
+        // DON'T set cooldown on auto-cleanup - user can restart login
+        // Cooldown only for actual Telegram flood errors
+        
         cleanedCount++;
       }
     }
@@ -1275,6 +1279,23 @@ class AccountLinker {
         }
       }
       
+      // CRITICAL: If user has pending password auth, clean it up before starting new login
+      // This allows users to restart the login process if they're stuck at 2FA
+      const existingPasswordAuth = this.pendingPasswordAuth.get(userId);
+      if (existingPasswordAuth) {
+        console.log(`[LINK] User ${userId} has pending 2FA auth, cleaning up to allow fresh start`);
+        if (existingPasswordAuth.client) {
+          try {
+            await existingPasswordAuth.client.disconnect();
+          } catch (e) {
+            // Ignore disconnect errors
+          }
+        }
+        this.pendingPasswordAuth.delete(userId);
+        // DON'T set cooldown here - user should be able to restart login immediately
+        // Telegram only blocks after ACTUAL password failures, not from restarting
+      }
+      
       // Check if user already has too many pending verifications (prevent abuse)
       const existingPending = this.pendingVerifications.get(userId);
       if (existingPending) {
@@ -1282,6 +1303,13 @@ class AccountLinker {
         if (age < 60000) { // Less than 1 minute old
           return { success: false, error: 'Verification already in progress. Please wait before requesting a new code.' };
         }
+        // Clean up old pending verification before starting new one
+        if (existingPending.client) {
+          try {
+            await existingPending.client.disconnect();
+          } catch (e) {}
+        }
+        this.pendingVerifications.delete(userId);
       }
       
       const stringSession = new StringSession('');
@@ -2019,9 +2047,19 @@ class AccountLinker {
       const errorMsg = error.errorMessage || error.message || '';
       if (errorMsg.includes('AUTH_USER_CANCEL') || errorMsg.includes('USER_CANCEL')) {
         console.log(`[2FA] User ${userId} cancelled password authentication`);
+        
+        // Clean up pending auth - user can restart login immediately
         this.pendingPasswordAuth.delete(userId);
+        
+        // DON'T set cooldown - Telegram allows restart after cancel
+        // Cooldown only needed for actual FLOOD errors from Telegram
+        
         // Don't increment attempts for user cancellation
-        return { success: false, error: 'AUTH_USER_CANCEL', cancelled: true };
+        return { 
+          success: false, 
+          error: 'Password authentication cancelled.', 
+          cancelled: true
+        };
       }
 
       // Check for flood wait errors and provide better error message
@@ -2056,11 +2094,23 @@ class AccountLinker {
       
       // Check if max attempts reached
       if (attemptData.attempts >= MAX_PASSWORD_ATTEMPTS) {
-        // Set cooldown period
+        // Set cooldown period for password attempts (5 minutes - shorter than before)
         attemptData.cooldownUntil = Date.now() + COOLDOWN_MS;
         this.passwordAttempts.set(userId, attemptData);
         
-        // Don't clean up - allow retry after cooldown
+        console.log(`[2FA] Max password attempts (${MAX_PASSWORD_ATTEMPTS}) reached for user ${userId}, setting ${COOLDOWN_MINUTES} minute cooldown`);
+        
+        // Clean up pending auth
+        this.pendingPasswordAuth.delete(userId);
+        if (pending && pending.client) {
+          try {
+            await pending.client.disconnect();
+          } catch (e) {
+            // Ignore disconnect errors
+          }
+        }
+        
+        // Return error with 5-minute cooldown (not 1 hour)
         return { 
           success: false, 
           error: `Maximum password attempts (${MAX_PASSWORD_ATTEMPTS}) reached. Please wait ${COOLDOWN_MINUTES} minutes before trying again.`,
@@ -2074,11 +2124,19 @@ class AccountLinker {
       // Save attempt count
       this.passwordAttempts.set(userId, attemptData);
       
+      // CRITICAL: If user has 2 failed attempts, warn them about upcoming Telegram block
+      // Telegram may start blocking after 3 failed password attempts
+      let errorMessage = error.message;
+      if (attemptData.attempts >= 2) {
+        console.log(`[2FA] User ${userId} has ${attemptData.attempts} failed password attempts - warning about potential block`);
+        errorMessage = `Incorrect password. ${remainingAttempts} attempt(s) remaining. Warning: After ${MAX_PASSWORD_ATTEMPTS} failed attempts, Telegram will block login for about 1 hour.`;
+      }
+      
       // Don't delete pendingVerifications here - allow user to retry
       // Return error with remaining attempts info
       return { 
         success: false, 
-        error: error.message,
+        error: errorMessage,
         remainingAttempts: remainingAttempts,
         attempts: attemptData.attempts
       };
@@ -2124,6 +2182,10 @@ class AccountLinker {
         }
       }
       this.pendingPasswordAuth.delete(userId);
+      
+      // DON'T set cooldown - user can restart login immediately
+      // Telegram only blocks on actual flood errors
+      
       cleaned = true;
       console.log(`[AUTH_CANCEL] Cleaned up pending password auth for user ${userId}`);
     }

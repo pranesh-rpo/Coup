@@ -508,7 +508,7 @@ class AutomationService {
    * @param {number} accountId - Account ID
    * @param {string} errorType - Type of error (blocked, banned, etc.)
    */
-  recordBanRisk(accountId, errorType) {
+  async recordBanRisk(accountId, errorType) {
     let riskTracking = this.banRiskTracking.get(accountId);
     if (!riskTracking) {
       riskTracking = {
@@ -538,7 +538,7 @@ class AutomationService {
       
       if (errorRate > 50 && riskTracking.consecutiveErrors >= 10) {
         console.error(`[BAN_RISK] ⚠️ CRITICAL: High error rate (${errorRate.toFixed(1)}%) for account ${accountId}. Pausing broadcast to prevent ban.`);
-        this.stopAllBroadcastsForAccount(accountId);
+        await this.stopAllBroadcastsForAccount(accountId);
       }
     }
     
@@ -858,7 +858,7 @@ class AutomationService {
 
     // CRITICAL: Update database flag to prevent account linking during broadcast
     try {
-      await db.query('UPDATE accounts SET is_broadcasting = 1 WHERE account_id = ?', [accountId]);
+      await db.query('UPDATE accounts SET is_broadcasting = 1 WHERE account_id = $1', [accountId]);
       console.log(`[BROADCAST] Updated is_broadcasting flag to true for account ${accountId}`);
     } catch (dbError) {
       logError(`[BROADCAST ERROR] Failed to update is_broadcasting flag:`, dbError);
@@ -890,8 +890,9 @@ class AutomationService {
       } else {
         // Broadcast was stopped before we could set timeout, clear it
         clearTimeout(timeoutId);
+        this.pendingStarts.delete(broadcastKey);
         console.log(`[BROADCAST] Broadcast stopped before scheduling completed, cleared timeout for account ${accountId}`);
-        return;
+        return { success: false, error: 'Broadcast was stopped before it could start' };
       }
       
       // NOW send initial message (this may take time, but next cycle is already scheduled)
@@ -1346,7 +1347,7 @@ class AutomationService {
 
       // CRITICAL: Update database flag to allow account linking again
       try {
-        await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+        await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
         console.log(`[BROADCAST] Updated is_broadcasting flag to false for account ${accountId}`);
       } catch (dbError) {
         logError(`[BROADCAST ERROR] Failed to update is_broadcasting flag:`, dbError);
@@ -1377,7 +1378,7 @@ class AutomationService {
         // Try to update database flag even on error
         if (accountId) {
           try {
-            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
           } catch (dbError) {
             // Ignore - already in error state
           }
@@ -1420,7 +1421,7 @@ class AutomationService {
       // Reset DB flag so accounts don't stay stuck as "broadcasting"
       if (broadcast.accountId) {
         try {
-          await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [broadcast.accountId]);
+          await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [broadcast.accountId]);
         } catch (dbError) {
           // Ignore - shutting down
         }
@@ -3123,7 +3124,7 @@ class AutomationService {
           }
           
           // CRITICAL: Record ban risk for any error
-          this.recordBanRisk(accountId, errorReason || 'error');
+          await this.recordBanRisk(accountId, errorReason || 'error');
           
           // Enhanced error logging with full error details
           const errorGroupName = group.name || 'Unknown Group';
@@ -3170,7 +3171,7 @@ class AutomationService {
           
           if (isBotBlocked) {
             console.log(`[BOT_BLOCKED] User blocked the bot for group "${groupName}". Marking as inactive.`);
-            this.recordBanRisk(accountId, 'blocked');
+            await this.recordBanRisk(accountId, 'blocked');
             if (groupId) {
               await groupService.markGroupInactive(accountId, groupId);
             }
@@ -3705,7 +3706,7 @@ class AutomationService {
           if (!accountLinker.isLinked(userId)) {
             console.log(`[BROADCAST_RESTORE] User ${userId} is not linked, skipping account ${accountId}`);
             // Reset flag since account is not linked
-            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
             failed++;
             continue;
           }
@@ -3766,7 +3767,7 @@ class AutomationService {
               const errorMsg = restoreResult?.error || 'Unknown error';
               console.log(`[BROADCAST_RESTORE] ❌ Failed to restore broadcast for user ${userId}, account ${accountId}: ${errorMsg}`);
               // Reset flag if restore failed
-              await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+              await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
               failed++;
             }
           } catch (startError) {
@@ -3775,7 +3776,7 @@ class AutomationService {
             logError(`[BROADCAST_RESTORE] startBroadcast error:`, startError);
             // Reset flag on error
             try {
-              await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+              await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
             } catch (dbError) {
               // Ignore database errors
             }
@@ -3786,7 +3787,7 @@ class AutomationService {
           logError(`[BROADCAST_RESTORE] Error restoring broadcast:`, error);
           // Reset flag on error
           try {
-            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = ?', [accountId]);
+            await db.query('UPDATE accounts SET is_broadcasting = 0 WHERE account_id = $1', [accountId]);
           } catch (dbError) {
             // Ignore database errors
           }

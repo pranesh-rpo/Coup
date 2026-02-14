@@ -60,7 +60,7 @@ class ConfigService {
         capResetDate: row.cap_reset_date,
         quietStart: row.quiet_start,
         quietEnd: row.quiet_end,
-        autoMention: row.auto_mention || false,
+        autoMention: row.auto_mention === 1,
         mentionCount: [1, 3, 5].includes(row.mention_count) ? row.mention_count : 5,
         groupDelayMin: row.group_delay_min,
         groupDelayMax: row.group_delay_max,
@@ -170,9 +170,8 @@ class ConfigService {
    */
   async setQuietHours(accountId, startTime, endTime) {
     try {
-      // SQLite uses ? placeholders
       await db.query(
-        'UPDATE accounts SET quiet_start = ?, quiet_end = ?, updated_at = CURRENT_TIMESTAMP WHERE account_id = ?',
+        'UPDATE accounts SET quiet_start = $1, quiet_end = $2, updated_at = CURRENT_TIMESTAMP WHERE account_id = $3',
         [startTime, endTime, accountId]
       );
       
@@ -365,16 +364,22 @@ class ConfigService {
       const currentMinute = istTime.getMinutes();
       const currentTimeMinutes = currentHour * 60 + currentMinute;
       
-      const [startHour, startMinute] = settings.quietStart.split(':').map(Number);
-      const [endHour, endMinute] = settings.quietEnd.split(':').map(Number);
+      const startParts = settings.quietStart.split(':');
+      const endParts = settings.quietEnd.split(':');
+      if (startParts.length < 2 || endParts.length < 2) return false;
+
+      const [startHour, startMinute] = startParts.map(Number);
+      const [endHour, endMinute] = endParts.map(Number);
+      if (isNaN(startHour) || isNaN(startMinute) || isNaN(endHour) || isNaN(endMinute)) return false;
+
       const startTimeMinutes = startHour * 60 + startMinute;
       const endTimeMinutes = endHour * 60 + endMinute;
-      
+
       // Handle quiet hours spanning midnight
       if (startTimeMinutes > endTimeMinutes) {
         return currentTimeMinutes >= startTimeMinutes || currentTimeMinutes <= endTimeMinutes;
       }
-      
+
       return currentTimeMinutes >= startTimeMinutes && currentTimeMinutes <= endTimeMinutes;
     } catch (error) {
       logger.logError('CONFIG', accountId, error, 'Failed to check quiet hours');
@@ -389,11 +394,10 @@ class ConfigService {
    */
   async getSchedule(accountId) {
     try {
-      // SQLite uses ? placeholders and 0/1 for booleans
       const result = await db.query(
-        `SELECT * FROM schedules 
-         WHERE account_id = ? AND is_active = 1 
-         ORDER BY id DESC 
+        `SELECT * FROM schedules
+         WHERE account_id = $1 AND is_active = 1
+         ORDER BY id DESC
          LIMIT 1`,
         [accountId]
       );
@@ -445,16 +449,16 @@ class ConfigService {
         return { success: false, error: 'Maximum interval must be between minimum interval and 60 minutes' };
       }
 
-      // Deactivate existing schedules (SQLite uses ? placeholders and 0/1 for booleans)
+      // Deactivate existing schedules
       await db.query(
-        'UPDATE schedules SET is_active = 0 WHERE account_id = ?',
+        'UPDATE schedules SET is_active = 0 WHERE account_id = $1',
         [accountId]
       );
 
-      // Insert new schedule (SQLite uses ? placeholders and 0/1 for booleans)
+      // Insert new schedule
       await db.query(
         `INSERT INTO schedules (account_id, start_time, end_time, min_interval, max_interval, schedule_type, is_active)
-         VALUES (?, ?, ?, ?, ?, 'normal', 1)`,
+         VALUES ($1, $2, $3, $4, $5, 'normal', 1)`,
         [accountId, startTime, endTime, minInterval, maxInterval]
       );
 
@@ -473,9 +477,8 @@ class ConfigService {
    */
   async clearSchedule(accountId) {
     try {
-      // SQLite uses ? placeholders and 0/1 for booleans
       await db.query(
-        'UPDATE schedules SET is_active = 0 WHERE account_id = ?',
+        'UPDATE schedules SET is_active = 0 WHERE account_id = $1',
         [accountId]
       );
 
@@ -508,9 +511,14 @@ class ConfigService {
       // Parse schedule times (format: HH:MM:SS or HH:MM)
       const startTimeStr = schedule.startTime.toString();
       const endTimeStr = schedule.endTime.toString();
-      const [startHour, startMinute] = startTimeStr.split(':').map(Number);
-      const [endHour, endMinute] = endTimeStr.split(':').map(Number);
-      
+      const startParts = startTimeStr.split(':');
+      const endParts = endTimeStr.split(':');
+      if (startParts.length < 2 || endParts.length < 2) return true;
+
+      const [startHour, startMinute] = startParts.map(Number);
+      const [endHour, endMinute] = endParts.map(Number);
+      if (isNaN(startHour) || isNaN(startMinute) || isNaN(endHour) || isNaN(endMinute)) return true;
+
       const startTimeMinutes = startHour * 60 + startMinute;
       const endTimeMinutes = endHour * 60 + endMinute;
 

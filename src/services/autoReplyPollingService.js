@@ -27,11 +27,11 @@ class AutoReplyPollingService {
     // Stop existing polling if any
     this.stopPolling(accountId);
 
-    // Use randomized polling interval (30-60 seconds) to avoid detection patterns
-    // IMPORTANT: 3-5s polling creates ~600+ reconnections/hour which triggers Telegram's anti-abuse
-    // 30-60s reduces this to ~60-120/hour which is much safer for account health
+    // Use randomized polling interval (2-5 minutes) to avoid detection patterns
+    // CRITICAL: Short intervals create too many reconnections which triggers Telegram's anti-abuse
+    // 2-5 minute intervals are much safer for account health and prevent freezing/banning
     const getRandomPollInterval = () => {
-      return Math.floor(Math.random() * (60000 - 30000 + 1)) + 30000; // 30-60 seconds
+      return Math.floor(Math.random() * (300000 - 120000 + 1)) + 120000; // 2-5 minutes
     };
 
     const scheduleNext = () => {
@@ -47,7 +47,7 @@ class AutoReplyPollingService {
 
     // Start the polling loop
     scheduleNext();
-    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (randomized interval: 30-60s)`);
+    console.log(`[AUTO_REPLY_POLL] Started polling for account ${accountId} (randomized interval: 2-5 minutes)`);
 
     // Check immediately on start (with a small delay to avoid instant connection)
     setTimeout(async () => {
@@ -155,7 +155,7 @@ class AutoReplyPollingService {
         const me = await client.getMe();
         let dialogs = [];
         try {
-          dialogs = await client.getDialogs({ limit: 15 }); // Check recent dialogs (reduced from 50 to minimize API load)
+          dialogs = await client.getDialogs({ limit: 30 }); // Check recent dialogs for better coverage
         } catch (dialogsError) {
           // Check if it's a session revocation error (AUTH_KEY_UNREGISTERED or SESSION_REVOKED)
           const errorMessage = dialogsError.message || dialogsError.toString() || '';

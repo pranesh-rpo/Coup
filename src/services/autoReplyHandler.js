@@ -32,7 +32,7 @@ class AutoReplyHandler {
     this.lastMessageSent = new Map();
     
     // Minimum delay between messages from same account (anti-detection)
-    this.MIN_MESSAGE_INTERVAL = 3000; // 3 seconds minimum between messages
+    this.MIN_MESSAGE_INTERVAL = 5000; // 5 seconds minimum between messages for better safety
     
     // Cleanup interval ID for periodic cleanup
     this.cleanupIntervalId = null;
@@ -380,12 +380,12 @@ class AutoReplyHandler {
    * Get random delay between min and max seconds (in milliseconds)
    * Adds jitter to avoid predictable patterns
    */
-  getRandomDelay(minSeconds = 3, maxSeconds = 10) {
+  getRandomDelay(minSeconds = 5, maxSeconds = 15) {
     const minMs = minSeconds * 1000;
     const maxMs = maxSeconds * 1000;
-    // Add some jitter for more natural behavior
+    // Add more jitter for more natural behavior
     const baseDelay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-    const jitter = Math.floor(Math.random() * 500); // 0-500ms jitter
+    const jitter = Math.floor(Math.random() * 2000); // 0-2000ms jitter for more randomness
     return baseDelay + jitter;
   }
 
@@ -515,8 +515,8 @@ class AutoReplyHandler {
         }
 
         // Always add random delay (even in immediate mode) to avoid detection
-        // Human-like behavior: 2-8 seconds for polling, 3-10 seconds for event-driven
-        const delay = immediate ? this.getRandomDelay(2, 8) : this.getRandomDelay(3, 10);
+        // Human-like behavior: 5-15 seconds for polling, 5-15 seconds for event-driven
+        const delay = immediate ? this.getRandomDelay(5, 15) : this.getRandomDelay(5, 15);
         if (immediate) {
           console.log(`[AUTO_REPLY] Scheduling DM auto-reply for account ${accountId} in ${delay}ms (${delay/1000}s) - polling mode with human-like delay`);
         } else {
@@ -664,8 +664,8 @@ class AutoReplyHandler {
         }
 
         // Always add random delay (even in immediate mode) to avoid detection
-        // Human-like behavior: 2-8 seconds for polling, 3-10 seconds for event-driven
-        const delay = immediate ? this.getRandomDelay(2, 8) : this.getRandomDelay(3, 10);
+        // Human-like behavior: 5-15 seconds for polling, 5-15 seconds for event-driven
+        const delay = immediate ? this.getRandomDelay(5, 15) : this.getRandomDelay(5, 15);
         const triggerType = isMentioned && isReplyToAccount ? 'mention + reply' : 
                            isMentioned ? 'mention (tagged/pinged)' : 
                            'reply to account message';

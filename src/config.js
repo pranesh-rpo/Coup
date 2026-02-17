@@ -73,32 +73,31 @@ export const config = {
   autoBreakDuration: 3.27, // hours before taking a break
   autoBreakLength: 53, // minutes break duration
   
-  // Anti-Freeze Security Settings - Aggressive settings to prevent bans
+  // Anti-Freeze Security Settings - Removed all hard limits and caps
   antiFreeze: {
-    // Minimum delay between messages (milliseconds) - INCREASED for safety
-    minDelayBetweenMessages: parseInt(process.env.MIN_DELAY_BETWEEN_MESSAGES, 10) || 5000, // 5 seconds (was 2)
-    // Maximum delay between messages (milliseconds) - INCREASED for safety
-    maxDelayBetweenMessages: parseInt(process.env.MAX_DELAY_BETWEEN_MESSAGES, 10) || 10000, // 10 seconds (was 5)
+    // Minimum delay between messages (milliseconds) - configurable via env
+    minDelayBetweenMessages: parseInt(process.env.MIN_DELAY_BETWEEN_MESSAGES, 10) || 8000, // 8 seconds default for safety
+    // Maximum delay between messages (milliseconds) - configurable via env
+    maxDelayBetweenMessages: parseInt(process.env.MAX_DELAY_BETWEEN_MESSAGES, 10) || 15000, // 15 seconds default for safety
     // Randomize group order to avoid patterns
     randomizeOrder: true,
-    // Add random jitter to cycle timing (±10%)
-    cycleJitterPercent: 10,
+    // Add random jitter to cycle timing (±15% for more natural behavior)
+    cycleJitterPercent: 15,
     // Progressive delay multiplier on rate limit (multiplies base delay)
-    rateLimitDelayMultiplier: 3, // Increased from 2
+    rateLimitDelayMultiplier: 4, // Increased from 3 for better safety
     // Maximum delay when rate limited (milliseconds)
-    maxRateLimitDelay: 120000, // 120 seconds (increased from 60)
-    // Batch size before taking a break - REDUCED for safety
-    batchSize: parseInt(process.env.BATCH_SIZE, 10) || 25, // 25 groups (was 50)
-    // Break duration after batch (milliseconds) - INCREASED for safety
-    batchBreakDuration: parseInt(process.env.BATCH_BREAK_DURATION, 10) || 60000, // 60 seconds (was 30)
-    // Maximum messages per minute globally (safety limit)
-    maxMessagesPerMinute: parseInt(process.env.MAX_MESSAGES_PER_MINUTE, 10) || 20, // Max 20 messages/minute
-    // Maximum messages per hour globally (safety limit) - REDUCED for ban prevention
-    maxMessagesPerHour: parseInt(process.env.MAX_MESSAGES_PER_HOUR, 10) || 300, // Max 300 messages/hour (reduced from 500)
+    maxRateLimitDelay: 180000, // 180 seconds (3 minutes) for better flood wait handling
+    // Batch size before taking a break - NO LIMIT, user controls via settings
+    batchSize: parseInt(process.env.BATCH_SIZE, 10) || 999999, // No batch limit
+    // Break duration after batch (milliseconds) - only used if batch size set
+    batchBreakDuration: parseInt(process.env.BATCH_BREAK_DURATION, 10) || 90000, // 90 seconds if batching used
+    // Maximum messages per minute globally - NO LIMIT, only flood wait handling
+    maxMessagesPerMinute: parseInt(process.env.MAX_MESSAGES_PER_MINUTE, 10) || 999999, // No limit
+    // Maximum messages per hour globally - NO LIMIT, only flood wait handling
+    maxMessagesPerHour: parseInt(process.env.MAX_MESSAGES_PER_HOUR, 10) || 999999, // No limit
     // Per-group cooldown period (milliseconds) - prevent sending to same group too frequently
-    perGroupCooldown: parseInt(process.env.PER_GROUP_COOLDOWN, 10) || 300000, // 5 minutes between messages to same group
-    // Maximum messages per day per account (configurable, safe default)
-    // Daily cap enforcement removed - this value is now only used for display purposes
+    perGroupCooldown: parseInt(process.env.PER_GROUP_COOLDOWN, 10) || 600000, // 10 minutes between messages to same group (increased for safety)
+    // Maximum messages per day per account - NO LIMIT ENFORCED
     maxMessagesPerDay: parseInt(process.env.MAX_MESSAGES_PER_DAY, 10) || 999999, // No limit enforced
   },
   

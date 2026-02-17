@@ -209,6 +209,8 @@ class AutomationService {
   
   /**
    * Check if we can send a message based on global rate limits
+   * NOTE: Hard limits removed - only returns tracking info for monitoring
+   * Actual rate limiting is handled by Telegram's flood wait responses
    * @param {number} accountId - Account ID
    * @returns {Object} { canSend: boolean, waitTime: number, reason: string }
    */
@@ -222,9 +224,12 @@ class AutomationService {
       return { canSend: false, waitTime: 0, reason: 'Invalid account ID' };
     }
     
-    // Check messages per minute with improved calculation
+    // NO HARD LIMITS - only check if limits are explicitly set via env vars
+    // This allows Telegram's own rate limiting to be the primary control
+    
+    // Check messages per minute ONLY if explicitly configured (not default 999999)
     const messagesLastMinute = tracking.messages.filter(ts => now - ts < 60000);
-    if (messagesLastMinute.length >= maxMessagesPerMinute) {
+    if (maxMessagesPerMinute < 999999 && messagesLastMinute.length >= maxMessagesPerMinute) {
       // Calculate wait time more accurately
       if (messagesLastMinute.length > 0) {
         const oldestMessageInMinute = Math.min(...messagesLastMinute);
@@ -232,21 +237,14 @@ class AutomationService {
         return {
           canSend: false,
           waitTime: waitTime,
-          reason: `Rate limit: ${messagesLastMinute.length}/${maxMessagesPerMinute} messages per minute`
-        };
-      } else {
-        // Fallback if array is somehow empty
-        return {
-          canSend: false,
-          waitTime: 60000,
-          reason: `Rate limit: ${maxMessagesPerMinute} messages per minute exceeded`
+          reason: `Custom rate limit: ${messagesLastMinute.length}/${maxMessagesPerMinute} messages per minute`
         };
       }
     }
     
-    // Check messages per hour with improved calculation
+    // Check messages per hour ONLY if explicitly configured (not default 999999)
     const messagesLastHour = tracking.messages.filter(ts => now - ts < 3600000);
-    if (messagesLastHour.length >= maxMessagesPerHour) {
+    if (maxMessagesPerHour < 999999 && messagesLastHour.length >= maxMessagesPerHour) {
       // Calculate wait time more accurately
       if (messagesLastHour.length > 0) {
         const oldestMessageInHour = Math.min(...messagesLastHour);
@@ -254,18 +252,12 @@ class AutomationService {
         return {
           canSend: false,
           waitTime: waitTime,
-          reason: `Rate limit: ${messagesLastHour.length}/${maxMessagesPerHour} messages per hour`
-        };
-      } else {
-        // Fallback if array is somehow empty
-        return {
-          canSend: false,
-          waitTime: 3600000,
-          reason: `Rate limit: ${maxMessagesPerHour} messages per hour exceeded`
+          reason: `Custom rate limit: ${messagesLastHour.length}/${maxMessagesPerHour} messages per hour`
         };
       }
     }
     
+    // No hard limits - let Telegram's flood wait handle rate limiting
     return { canSend: true, waitTime: 0, reason: null };
   }
   
